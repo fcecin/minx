@@ -1,0 +1,7 @@
+file(GLOB subdirectories LIST_DIRECTORIES true *)
+foreach(subdir ${subdirectories})
+    if(IS_DIRECTORY "${subdir}" AND EXISTS "${subdir}/CMakeLists.txt")
+        message(STATUS "Build example: ${subdir}")
+        add_subdirectory(${subdir})
+    endif()
+endforeach()
