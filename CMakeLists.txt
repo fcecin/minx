@@ -1,7 +1,6 @@
 # This CMake project will only produce the build/libminx.a static library.
 # examples/ have their own build system that depends on this.
 
-# This is the minimum CMake version for cryptopp-cmake. Ubuntu 24.04 has CMake 3.28.3.
 cmake_minimum_required(VERSION 3.21)
 
 project(minx)
@@ -18,22 +17,7 @@ find_package(Threads)
 # Boost (from system)
 
 set(Boost_USE_STATIC_LIBS ON)
-find_package(Boost 1.83.0 REQUIRED COMPONENTS chrono filesystem program_options system thread nowide)
-
-# Crypto++ via cryptopp-cmake
-# This just builds whatever is the most recent Crypto++ release according to cryptopp-cmake master.
-# There is no good reason to ever use anything other than the newest Crypto++ available, but if there
-# is some problem, just change the GIT_TAG below to use a specific version of cryptopp-cmake.
-
-FetchContent_Declare(
-  cryptopp-cmake
-  GIT_REPOSITORY https://github.com/abdes/cryptopp-cmake.git
-  GIT_TAG        master
-)
-
-set(CRYPTOPP_BUILD_TESTING OFF CACHE BOOL "Disable building Crypto++ tests" FORCE)
-
-FetchContent_MakeAvailable(cryptopp-cmake)
+find_package(Boost 1.83.0 REQUIRED COMPONENTS system)
 
 # RandomX (librandomx.a)
 
@@ -65,21 +49,21 @@ file(GLOB CORE_CPP "src/*.cpp")
 
 add_library(minxlib STATIC ${CORE_CPP})
 
+target_compile_definitions(minxlib PRIVATE BOOST_ASIO_HEADER_ONLY)
+
 target_include_directories(minxlib
 PUBLIC
+  ${logkv_SOURCE_DIR}/include
+  ${randomx_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${Boost_INCLUDE_DIRS}
-  ${cryptopp-cmake_SOURCE_DIR}/cryptopp
-  ${randomx_SOURCE_DIR}/src
-  ${logkv_SOURCE_DIR}/include
 )
 
 target_link_libraries(minxlib
 PUBLIC
-  ${Boost_LIBRARIES}
-  Threads::Threads
-  cryptopp::cryptopp
   randomx
+PRIVATE
+  Threads::Threads
 )
 
 set_target_properties(minxlib PROPERTIES OUTPUT_NAME "minx")
