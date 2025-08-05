@@ -30,6 +30,17 @@ inline void hashToBytes(Bytes& dest, const Hash& src, bool upper = false) {
                    upper);
 }
 
+inline std::string hashToBinaryString(const minx::Hash& hash) {
+  std::string binaryString;
+  binaryString.reserve(256);
+  for (const auto& byte : hash) {
+    for (int i = 7; i >= 0; --i) {
+      binaryString += ((byte >> i) & 1) ? '1' : '0';
+    }
+  }
+  return binaryString;
+}
+
 struct SecureHashHasher {
   std::size_t operator()(const std::array<unsigned char, 32>& arr) const {
     size_t hash_value;
@@ -47,7 +58,7 @@ inline int getDifficulty(const Hash& hash) {
       int leading_zeros_in_byte = 0;
       uint8_t mask = 0x80;
       while ((byte & mask) == 0) {
-        leading_zeros_in_byte++;
+        ++leading_zeros_in_byte;
         mask >>= 1;
       }
       difficulty += leading_zeros_in_byte;

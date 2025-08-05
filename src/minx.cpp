@@ -323,8 +323,10 @@ bool Minx::destroyVM(const Hash& key) {
   return true;
 }
 
-std::optional<MinxProveWork>
-Minx::proveWork(const Hash& myKey, const Hash& targetKey, int difficulty) {
+std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
+                                             const Hash& targetKey,
+                                             int difficulty, int numThreads,
+                                             int maxVMs) {
   std::shared_ptr<PoWEngine> engine_ptr;
   {
     std::lock_guard lock(vmsMutex_);
@@ -336,33 +338,65 @@ Minx::proveWork(const Hash& myKey, const Hash& targetKey, int difficulty) {
   if (!engine_ptr || !engine_ptr->isReady()) {
     return std::nullopt;
   }
-  randomx_vm* vm = engine_ptr->getVM();
-  uint64_t nonce = 0;
-  while (true) {
-    const auto p1 = std::chrono::system_clock::now();
-    const uint64_t time =
-      std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch())
-        .count();
-    std::vector<uint8_t> input_buffer;
-    input_buffer.reserve(sizeof(Hash) + sizeof(uint64_t) * 2);
-    input_buffer.insert(input_buffer.end(), myKey.begin(), myKey.end());
-    const uint64_t time_be = boost::endian::native_to_big(time);
-    const uint8_t* time_bytes = reinterpret_cast<const uint8_t*>(&time_be);
-    input_buffer.insert(input_buffer.end(), time_bytes,
-                        time_bytes + sizeof(time));
-    const uint64_t nonce_be = boost::endian::native_to_big(nonce);
-    const uint8_t* nonce_bytes = reinterpret_cast<const uint8_t*>(&nonce_be);
-    input_buffer.insert(input_buffer.end(), nonce_bytes,
-                        nonce_bytes + sizeof(nonce));
-    Hash solution_hash;
-    randomx_calculate_hash(vm, input_buffer.data(), input_buffer.size(),
-                           solution_hash.data());
-    if (getDifficulty(solution_hash) >= difficulty) {
-      return MinxProveWork{0, 0, myKey, time, nonce, solution_hash, {}};
-    }
-    ++nonce;
+  std::atomic<bool> solution_found = false;
+  std::atomic<uint64_t> nonce_counter = 0;
+  std::optional<MinxProveWork> result;
+  std::mutex result_mutex;
+  if (numThreads <= 0) {
+    numThreads = std::max(std::thread::hardware_concurrency(),
+                          static_cast<unsigned int>(1));
   }
-  return std::nullopt;
+  std::vector<std::thread> threads;
+  threads.reserve(numThreads);
+  for (size_t i = 0; i < numThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      randomx_vm* vm = engine_ptr->getVM(i);
+      if (!vm) {
+        return;
+      }
+      while (!solution_found.load(std::memory_order_relaxed)) {
+        const auto p1 = std::chrono::system_clock::now();
+        const uint64_t time = std::chrono::duration_cast<std::chrono::seconds>(
+                                p1.time_since_epoch())
+                                .count();
+        uint64_t nonce = nonce_counter.fetch_add(1, std::memory_order_relaxed);
+        std::vector<uint8_t> input_buffer;
+        input_buffer.reserve(sizeof(Hash) + sizeof(uint64_t) * 2);
+        input_buffer.insert(input_buffer.end(), myKey.begin(), myKey.end());
+        const uint64_t time_be = boost::endian::native_to_big(time);
+        const uint8_t* time_bytes = reinterpret_cast<const uint8_t*>(&time_be);
+        input_buffer.insert(input_buffer.end(), time_bytes,
+                            time_bytes + sizeof(time));
+        const uint64_t nonce_be = boost::endian::native_to_big(nonce);
+        const uint8_t* nonce_bytes =
+          reinterpret_cast<const uint8_t*>(&nonce_be);
+        input_buffer.insert(input_buffer.end(), nonce_bytes,
+                            nonce_bytes + sizeof(nonce));
+        Hash solution_hash;
+        randomx_calculate_hash(vm, input_buffer.data(), input_buffer.size(),
+                               solution_hash.data());
+        if (getDifficulty(solution_hash) >= difficulty) {
+          bool already_found =
+            solution_found.exchange(true, std::memory_order_acq_rel);
+          if (!already_found) {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            result.emplace(
+              MinxProveWork{0, 0, myKey, time, nonce, solution_hash, {}});
+          }
+          break;
+        }
+      }
+    });
+  }
+  for (auto& t : threads) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  if (maxVMs > 0) {
+    engine_ptr->resizeVMs(maxVMs);
+  }
+  return result;
 }
 
 void Minx::banAddress(const IPAddr& addr) { ipFilter_.reportIP(addr); }

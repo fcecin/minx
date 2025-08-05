@@ -52,12 +52,12 @@ int main() {
       std::cout << "✅ Server: Received INIT from "
                 << addr.address().to_string() << ":" << addr.port()
                 << std::endl;
-      minx::MinxInitAck ack_msg = {.version = 0,
-                                   .password = 12345, // any non-zero value works
-                                   .difficulty =
-                                     minx_instance_->getMinimumDifficulty(),
-                                   .skey = skey_,
-                                   .data = {}};
+      minx::MinxInitAck ack_msg = {
+        .version = 0,
+        .password = 12345, // any non-zero value works
+        .difficulty = minx_instance_->getMinimumDifficulty(),
+        .skey = skey_,
+        .data = {}};
       minx_instance_->sendInitAck(addr, ack_msg);
       std::cout << "  -> Server: Sent INIT_ACK." << std::endl;
     }
@@ -105,11 +105,14 @@ int main() {
       std::cout << "  -> Client: VM is ready." << std::endl;
 
       // 3. Now that the VM is ready, prove the work.
+      int numThreads = std::max(std::thread::hardware_concurrency(),
+                                static_cast<unsigned int>(1));
       std::cout << "  -> Client: Mining PoW for server's key with difficulty "
-                << (int)msg.difficulty << "..." << std::endl;
+                << (int)msg.difficulty << " using " << numThreads
+                << " threads..." << std::endl;
       auto start_time = std::chrono::steady_clock::now();
-      auto pow_template_opt =
-        minx_instance_->proveWork(my_ckey_, msg.skey, msg.difficulty);
+      auto pow_template_opt = minx_instance_->proveWork(
+        my_ckey_, msg.skey, msg.difficulty, numThreads);
       auto end_time = std::chrono::steady_clock::now();
 
       if (!pow_template_opt) {
@@ -117,7 +120,6 @@ int main() {
         return;
       }
 
-      // ... continue with sending the PROVE_WORK message as before ...
       const auto& pow_template = *pow_template_opt;
       minx::MinxProveWork final_pow_msg = {.version = 0,
                                            .password = msg.password,
@@ -144,6 +146,9 @@ int main() {
       std::cout << "  -> Client: Mined and sent PROVE_WORK; nonce = "
                 << final_pow_msg.nonce
                 << ", diff = " << minx::getDifficulty(final_pow_msg.solution)
+                << std::endl;
+      std::cout << "    -> Solution: " << final_pow_msg.solution << " (binary: "
+                << minx::hashToBinaryString(final_pow_msg.solution) << ")"
                 << std::endl;
       std::cout << "    -> Mining Time: " << total_duration_ms.count() << " ms"
                 << std::endl;

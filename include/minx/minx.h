@@ -368,12 +368,18 @@ public:
    * @param myKey The key that gets the credit for the hashing work.
    * @param targetKey The RandomX VM key to mine a hash for.
    * @param difficulty The minimum difficulty for the solution.
+   * @param numThreads Number of threads to use for mining; default is 1. A
+   * value of 0 means `std::hardware_concurrency`.
+   * @param maxVms Maximum number of RandomX VMs to keep in memory after mining;
+   * default is 1 (one VM needs to be allocated per thread requested). A value
+   * of 0 means keeping all VMs already allocated.
    * @return Proof-of-Work template message with the mined solution (but without
    * `version`, `password`, and `data`), or an empty optional if VM not found or
    * is not ready.
    */
   std::optional<MinxProveWork> proveWork(const Hash& myKey,
-                                         const Hash& targetKey, int difficulty);
+                                         const Hash& targetKey, int difficulty,
+                                         int numThreads = 1, int maxVMs = 1);
 
   /**
    * Add an IP address pattern to the IP filter.
