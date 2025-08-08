@@ -11,7 +11,35 @@ using SockAddr = boost::asio::ip::udp::endpoint;
 using IPAddr = boost::asio::ip::address;
 using IOContext = boost::asio::io_context;
 using Bytes = logkv::Bytes;
-using Hash = std::array<uint8_t, 32>;
+
+constexpr size_t HASH_SIZE = 32;
+
+/**
+ * A serializable std::array<uint8_t, 32> for logkv::Store.
+ */
+class Hash : public std::array<uint8_t, HASH_SIZE> {
+public:
+  using std::array<uint8_t, HASH_SIZE>::array;
+  constexpr Hash(const std::array<unsigned char, HASH_SIZE>& other) {
+    std::copy(other.begin(), other.end(), begin());
+  }
+  bool empty() const {
+    return std::all_of(this->begin(), this->end(),
+                       [](uint8_t i) { return i == 0; });
+  }
+  size_t serialize(char* dest, size_t size) const {
+    if (size >= HASH_SIZE) {
+      std::memcpy(dest, data(), HASH_SIZE);
+    }
+    return HASH_SIZE;
+  }
+  size_t deserialize(const char* src, size_t size) {
+    if (size >= HASH_SIZE) {
+      std::memcpy(data(), src, HASH_SIZE);
+    }
+    return HASH_SIZE;
+  }
+};
 
 inline void bytesToHash(Hash& dest, const Bytes& src) {
   if (src.size() != 64) {
@@ -42,7 +70,7 @@ inline std::string hashToBinaryString(const minx::Hash& hash) {
 }
 
 struct SecureHashHasher {
-  std::size_t operator()(const std::array<unsigned char, 32>& arr) const {
+  std::size_t operator()(const std::array<unsigned char, HASH_SIZE>& arr) const {
     size_t hash_value;
     std::memcpy(&hash_value, arr.data(), sizeof(size_t));
     return hash_value;
@@ -69,6 +97,10 @@ inline int getDifficulty(const Hash& hash) {
 }
 
 } // namespace minx
+
+namespace std {
+inline void swap(minx::Hash& lhs, minx::Hash& rhs) noexcept { lhs.swap(rhs); }
+} // namespace std
 
 inline std::ostream& operator<<(std::ostream& os, const minx::Hash& hash) {
   os << std::hex << std::setfill('0');
