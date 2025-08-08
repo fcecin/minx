@@ -1,17 +1,14 @@
 #ifndef _MINXPOWENGINE_H_
 #define _MINXPOWENGINE_H_
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <mutex>
-#include <randomx.h>
 #include <span>
-#include <stdexcept>
-#include <string>
 #include <thread>
 #include <vector>
+
+#include <randomx.h>
 
 /**
  * PoWEngine state.

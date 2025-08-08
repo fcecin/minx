@@ -1,11 +1,7 @@
 #include <minx/minx.h>
 
-#include <atomic>
-#include <boost/asio.hpp>
-#include <chrono>
-#include <iostream>
 #include <random>
-#include <thread>
+#include <iostream>
 
 minx::Hash generateRandomHash() {
   minx::Hash hash;

@@ -2,20 +2,19 @@
 #define _MINX_H_
 
 #include <array>
-#include <deque>
-#include <iostream>
 #include <map>
-#include <memory>
+#include <deque>
 #include <queue>
 #include <shared_mutex>
 #include <unordered_set>
 
 #include <randomx.h>
 
-#include <minx/bucketcache.h>
-#include <minx/ipfilter.h>
-#include <minx/powengine.h>
+#include <minx/buffer.h>
 #include <minx/types.h>
+#include <minx/bucketcache.h>
+#include <minx/powengine.h>
+#include <minx/ipfilter.h>
 
 namespace minx {
 
@@ -164,7 +163,7 @@ private:
   // thread pool or just use the io_context_
   // - don't allocate new buffers for serializing each outgoing message
   // - remove handlerCount_ & enable_shared_from_this for a MinxImpl
-  std::array<char, 0x10000> buffer_;
+  ArrayBuffer<0x10000> buffer_;
   MinxListener* listener_ = nullptr;
   IOContext* io_context_ = nullptr;
   std::unique_ptr<boost::asio::strand<IOContext::executor_type>> strand_;
@@ -189,7 +188,7 @@ private:
   std::thread workerThread_;
   std::atomic<bool> stopWorker_ = false;
 
-  std::deque<std::pair<MinxProveWork, SockAddr>> work_;
+  std::queue<std::pair<MinxProveWork, SockAddr>> work_;
   std::mutex workMutex_;
 
   uint8_t minDiff_ = 1;
@@ -204,6 +203,8 @@ private:
   IPFilter ipFilter_;
 
   std::atomic<uint64_t> lastError_;
+
+  void doSocketSend(const SockAddr& addr, const std::shared_ptr<minx::Buffer>& buf);
 
   void receive();
 

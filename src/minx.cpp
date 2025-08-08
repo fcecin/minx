@@ -1,9 +1,8 @@
-#include <boost/endian/conversion.hpp>
 #include <minx/minx.h>
-#include <random>
-#include <sstream>
 
 namespace minx {
+
+const size_t HASH_INPUT_SIZE = sizeof(minx::Hash) + sizeof(uint64_t) * 2;
 
 template <typename T> class AtomicDec {
 public:
@@ -20,6 +19,7 @@ Minx::Minx(MinxListener* listener, int randomXThreads, uint64_t spendSlotSize)
   if (!listener_) {
     throw std::runtime_error("listener cannot be nullptr");
   }
+  buffer_.setSize(0x10000);
   workerThread_ = std::thread(&Minx::workerLoop, this);
 }
 
@@ -67,90 +67,60 @@ void Minx::closeSocket() {
 }
 
 void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
-  std::shared_lock lock(socketStateMutex_);
-  if (!socket_) {
-    throw std::runtime_error("no socket");
-  }
-  auto buf = std::make_shared<std::vector<uint8_t>>();
-  buf->push_back(MINX_INIT);
-  buf->push_back(msg.version);
-  buf->insert(buf->end(), msg.data.data(), msg.data.data() + msg.data.size());
-  socket_->async_send_to(boost::asio::buffer(*buf), addr,
-                         boost::asio::detached);
+  auto buf =
+    std::make_shared<minx::VectorBuffer>(1 + MinxInit::SIZE + msg.data.size());
+  buf->putByte(MINX_INIT);
+  buf->putByte(msg.version);
+  buf->putBytes(msg.data);
+  doSocketSend(addr, buf);
 }
 
 void Minx::sendInitAck(const SockAddr& addr, const MinxInitAck& msg) {
-  std::shared_lock lock(socketStateMutex_);
-  if (!socket_) {
-    throw std::runtime_error("no socket");
-  }
-  auto buf = std::make_shared<std::vector<uint8_t>>();
-  buf->push_back(MINX_INIT_ACK);
-  buf->push_back(msg.version);
-  const uint64_t password_be = boost::endian::native_to_big(msg.password);
-  const uint8_t* p_password = reinterpret_cast<const uint8_t*>(&password_be);
-  buf->insert(buf->end(), p_password, p_password + sizeof(password_be));
+  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxInitAck::SIZE +
+                                                  msg.data.size());
+  buf->putByte(MINX_INIT_ACK);
+  buf->putByte(msg.version);
+  buf->putUint64(msg.password);
   if (msg.password > 0) {
     passwords_.put(msg.password, addr.address());
   }
-  buf->insert(buf->end(), msg.skey.begin(), msg.skey.end());
-  buf->push_back(msg.difficulty);
-  buf->insert(buf->end(), msg.data.data(), msg.data.data() + msg.data.size());
-  socket_->async_send_to(boost::asio::buffer(*buf), addr,
-                         boost::asio::detached);
+  buf->putByteArray(msg.skey);
+  buf->putByte(msg.difficulty);
+  buf->putBytes(msg.data);
+  doSocketSend(addr, buf);
 }
 
 void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
-  std::shared_lock lock(socketStateMutex_);
-  if (!socket_) {
-    throw std::runtime_error("no socket");
-  }
-  auto buf = std::make_shared<std::vector<uint8_t>>();
-  buf->push_back(MINX_PROVE_WORK);
-  buf->push_back(msg.version);
-  const uint64_t password_be = boost::endian::native_to_big(msg.password);
-  const uint8_t* p_password = reinterpret_cast<const uint8_t*>(&password_be);
-  buf->insert(buf->end(), p_password, p_password + sizeof(password_be));
-  buf->insert(buf->end(), msg.ckey.begin(), msg.ckey.end());
-  const uint64_t time_be = boost::endian::native_to_big(msg.time);
-  const uint8_t* p_time = reinterpret_cast<const uint8_t*>(&time_be);
-  buf->insert(buf->end(), p_time, p_time + sizeof(time_be));
-  const uint64_t nonce_be = boost::endian::native_to_big(msg.nonce);
-  const uint8_t* p_nonce = reinterpret_cast<const uint8_t*>(&nonce_be);
-  buf->insert(buf->end(), p_nonce, p_nonce + sizeof(nonce_be));
-  buf->insert(buf->end(), msg.solution.begin(), msg.solution.end());
-  buf->insert(buf->end(), msg.data.data(), msg.data.data() + msg.data.size());
-  socket_->async_send_to(boost::asio::buffer(*buf), addr,
-                         boost::asio::detached);
+  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxProveWork::SIZE +
+                                                  msg.data.size());
+  buf->putByte(MINX_PROVE_WORK);
+  buf->putByte(msg.version);
+  buf->putUint64(msg.password);
+  buf->putByteArray(msg.ckey);
+  buf->putUint64(msg.time);
+  buf->putUint64(msg.nonce);
+  buf->putByteArray(msg.solution);
+  buf->putBytes(msg.data);
+  doSocketSend(addr, buf);
 }
 
 void Minx::sendApplication(const SockAddr& addr, const Bytes& data,
                            const uint8_t code) {
-  std::shared_lock lock(socketStateMutex_);
-  if (!socket_) {
-    throw std::runtime_error("no socket");
-  }
   if (code > MINX_APPLICATION_MAX) {
     throw std::runtime_error("invalid application message code");
   }
-  auto buf = std::make_shared<std::vector<uint8_t>>();
-  buf->push_back(code);
-  buf->insert(buf->end(), data.data(), data.data() + data.size());
-  socket_->async_send_to(boost::asio::buffer(*buf), addr,
-                         boost::asio::detached);
+  auto buf = std::make_shared<minx::VectorBuffer>(1 + data.size());
+  buf->putByte(code);
+  buf->putBytes(data);
+  doSocketSend(addr, buf);
 }
 
 void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
-  std::shared_lock lock(socketStateMutex_);
-  if (!socket_) {
-    throw std::runtime_error("no socket");
-  }
-  auto buf = std::make_shared<std::vector<uint8_t>>();
-  buf->push_back(MINX_EXTENSION);
-  buf->push_back(0x0);
-  buf->insert(buf->end(), data.data(), data.data() + data.size());
-  socket_->async_send_to(boost::asio::buffer(*buf), addr,
-                         boost::asio::detached);
+  auto buf = std::make_shared<minx::VectorBuffer>(2 + data.size());
+  buf->putByte(MINX_EXTENSION);
+  buf->putByte(0x0);
+  buf->putBytes(data);
+  doSocketSend(addr, buf);
 }
 
 void Minx::verifyPoWs(const size_t limit) {
@@ -210,7 +180,7 @@ void Minx::verifyPoWs(const size_t limit) {
         break;
       }
       work_item_opt.emplace(std::move(work_.front()));
-      work_.pop_front();
+      work_.pop();
     }
 
     MinxProveWork& work_item = work_item_opt->first;
@@ -242,22 +212,13 @@ void Minx::verifyPoWs(const size_t limit) {
       }
     }
 
-    std::vector<uint8_t> input_buffer;
-    input_buffer.reserve(sizeof(Hash) + sizeof(uint64_t) * 2);
-    input_buffer.insert(input_buffer.end(), work_item.ckey.begin(),
-                        work_item.ckey.end());
-    const uint64_t time_be = boost::endian::native_to_big(work_item.time);
-    const uint8_t* time_bytes = reinterpret_cast<const uint8_t*>(&time_be);
-    input_buffer.insert(input_buffer.end(), time_bytes,
-                        time_bytes + sizeof(time_be));
-    const uint64_t nonce_be = boost::endian::native_to_big(work_item.nonce);
-    const uint8_t* nonce_bytes = reinterpret_cast<const uint8_t*>(&nonce_be);
-    input_buffer.insert(input_buffer.end(), nonce_bytes,
-                        nonce_bytes + sizeof(nonce_be));
-
+    minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
+    input_buffer.putByteArray(work_item.ckey);
+    input_buffer.putUint64(work_item.time);
+    input_buffer.putUint64(work_item.nonce);
     Hash calculated_hash;
-    randomx_calculate_hash(vm, input_buffer.data(), input_buffer.size(),
-                           calculated_hash.data());
+    randomx_calculate_hash(vm, input_buffer.getBackingSpan().data(),
+                           input_buffer.getSize(), calculated_hash.data());
 
     if (calculated_hash == work_item.solution) {
       spend_[slot_index].insert(work_item.solution);
@@ -360,21 +321,15 @@ std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
                                 p1.time_since_epoch())
                                 .count();
         uint64_t nonce = nonce_counter.fetch_add(1, std::memory_order_relaxed);
-        std::vector<uint8_t> input_buffer;
-        input_buffer.reserve(sizeof(Hash) + sizeof(uint64_t) * 2);
-        input_buffer.insert(input_buffer.end(), myKey.begin(), myKey.end());
-        const uint64_t time_be = boost::endian::native_to_big(time);
-        const uint8_t* time_bytes = reinterpret_cast<const uint8_t*>(&time_be);
-        input_buffer.insert(input_buffer.end(), time_bytes,
-                            time_bytes + sizeof(time));
-        const uint64_t nonce_be = boost::endian::native_to_big(nonce);
-        const uint8_t* nonce_bytes =
-          reinterpret_cast<const uint8_t*>(&nonce_be);
-        input_buffer.insert(input_buffer.end(), nonce_bytes,
-                            nonce_bytes + sizeof(nonce));
+
+        minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
+        input_buffer.putByteArray(myKey);
+        input_buffer.putUint64(time);
+        input_buffer.putUint64(nonce);
         Hash solution_hash;
-        randomx_calculate_hash(vm, input_buffer.data(), input_buffer.size(),
-                               solution_hash.data());
+        randomx_calculate_hash(vm, input_buffer.getBackingSpan().data(),
+                               input_buffer.getSize(), solution_hash.data());
+
         if (getDifficulty(solution_hash) >= difficulty) {
           bool already_found =
             solution_found.exchange(true, std::memory_order_acq_rel);
@@ -401,10 +356,21 @@ std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
 
 void Minx::banAddress(const IPAddr& addr) { ipFilter_.reportIP(addr); }
 
+void Minx::doSocketSend(const SockAddr& addr,
+                        const std::shared_ptr<minx::Buffer>& buf) {
+  std::shared_lock lock(socketStateMutex_);
+  if (!socket_) {
+    throw std::runtime_error("no socket");
+  }
+  socket_->async_send_to(
+    buf->getAsioBufferToRead(), addr,
+    [buf](const boost::system::error_code&, std::size_t) {});
+}
+
 void Minx::receive() {
   ++handlerCount_;
   socket_->async_receive_from(
-    boost::asio::buffer(buffer_), remoteAddr_,
+    buffer_.getAsioBufferToWrite(), remoteAddr_,
     boost::asio::bind_executor(*strand_,
                                std::bind_front(&Minx::onReceive, this)));
 }
@@ -424,8 +390,9 @@ void Minx::onReceive(const boost::system::error_code& error,
     } else {
       // process message
       // note that this calls application callbacks (listener_)
-      code = buffer_[0];
-      const char* p = buffer_.data();
+      buffer_.setSize(bytes_transferred);
+      buffer_.setReadPos(0);
+      code = buffer_.getByte();
 
       switch (code) {
       case MINX_INIT: {
@@ -434,13 +401,8 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_INIT;
           break;
         }
-
-        const uint8_t version = p[sizeof(code)];
-        Bytes data;
-        if (bytes_transferred > bytes_expected) {
-          data.assign(&p[2], bytes_transferred - bytes_expected);
-        }
-
+        const uint8_t version = buffer_.getByte();
+        Bytes data = buffer_.getRemainingBytes();
         MinxInit msg{version, data};
         listener_->incomingInit(remoteAddr_, msg);
         break;
@@ -452,32 +414,16 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-
-        const uint8_t version = p[sizeof(code)];
+        const uint8_t version = buffer_.getByte();
         const uint8_t engine_id = version & 0x0F;
         if (engine_id != 0x0) {
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-
-        size_t offset = sizeof(code) + sizeof(version);
-
-        uint64_t password_be;
-        memcpy(&password_be, &p[offset], sizeof(password_be));
-        const uint64_t password = boost::endian::big_to_native(password_be);
-        offset += sizeof(password);
-
-        Hash skey;
-        memcpy(skey.data(), &p[offset], sizeof(skey));
-        offset += sizeof(skey);
-
-        const uint8_t difficulty = p[offset];
-        offset += sizeof(difficulty);
-
-        Bytes data;
-        if (bytes_transferred > offset) {
-          data.assign(&p[offset], bytes_transferred - offset);
-        }
+        const uint64_t password = buffer_.getUint64();
+        Hash skey = buffer_.getByteArray<sizeof(skey)>();
+        const uint8_t difficulty = buffer_.getByte();
+        Bytes data = buffer_.getRemainingBytes();
         MinxInitAck msg{version, password, difficulty, skey, data};
         listener_->incomingInitAck(remoteAddr_, msg);
         break;
@@ -489,44 +435,18 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_PROVE_WORK;
           break;
         }
-
-        const uint8_t version = p[sizeof(code)];
+        const uint8_t version = buffer_.getByte();
         const uint8_t engine_id = version & 0x0F;
         if (engine_id != 0x0) {
           lastError_ = MINX_ERROR_BAD_PROVE_WORK;
           break;
         }
-
-        size_t offset = sizeof(code) + sizeof(version);
-
-        uint64_t password_be;
-        memcpy(&password_be, &p[offset], sizeof(password_be));
-        uint64_t password = boost::endian::big_to_native(password_be);
-        offset += sizeof(password);
-
-        Hash ckey;
-        memcpy(ckey.data(), &p[offset], sizeof(ckey));
-        offset += sizeof(ckey);
-
-        uint64_t time_be;
-        memcpy(&time_be, &p[offset], sizeof(time_be));
-        const uint64_t time = boost::endian::big_to_native(time_be);
-        offset += sizeof(time);
-
-        uint64_t nonce_be;
-        memcpy(&nonce_be, &p[offset], sizeof(nonce_be));
-        const uint64_t nonce = boost::endian::big_to_native(nonce_be);
-        offset += sizeof(nonce);
-
-        Hash solution;
-        memcpy(solution.data(), &p[offset], sizeof(solution));
-        offset += sizeof(solution);
-
-        Bytes data;
-        if (bytes_transferred > offset) {
-          data.assign(&p[offset], bytes_transferred - offset);
-        }
-
+        const uint64_t password = buffer_.getUint64();
+        Hash ckey = buffer_.getByteArray<sizeof(ckey)>();
+        const uint64_t time = buffer_.getUint64();
+        const uint64_t nonce = buffer_.getUint64();
+        Hash solution = buffer_.getByteArray<sizeof(solution)>();
+        Bytes data = buffer_.getRemainingBytes();
         bool password_matched = false;
         if (password > 0) {
           auto ip_opt = passwords_.get(password);
@@ -535,18 +455,16 @@ void Minx::onReceive(const boost::system::error_code& error,
             password_matched = true;
           }
         }
-
         if (!password_matched) {
           if (!listener_->isConnected(remoteAddr_)) {
             lastError_ = MINX_ERROR_NOT_CONNECTED;
             break;
           }
         }
-
         MinxProveWork msg{version, password, ckey, time, nonce, solution, data};
         {
           std::lock_guard lock(workMutex_);
-          work_.push_back({std::move(msg), remoteAddr_});
+          work_.push({std::move(msg), remoteAddr_});
         }
         break;
       }
@@ -558,21 +476,15 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_EXTENSION;
           break;
         }
-        version = p[sizeof(code)];
-        Bytes data;
-        if (bytes_transferred > bytes_expected) {
-          data.assign(&p[bytes_expected], bytes_transferred - bytes_expected);
-        }
+        version = buffer_.getByte();
+        Bytes data = buffer_.getRemainingBytes();
         listener_->incomingExtension(remoteAddr_, data);
         break;
       }
 
       default: {
         // Any other code is an APPLICATION message code [0x00, 0xFB]
-        Bytes data;
-        if (bytes_transferred > sizeof(code)) {
-          data.assign(&p[sizeof(code)], bytes_transferred - sizeof(code));
-        }
+        Bytes data = buffer_.getRemainingBytes();
         listener_->incomingApplication(remoteAddr_, code, data);
       } break;
       }
