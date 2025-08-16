@@ -94,43 +94,43 @@ void Minx::closeSocket() {
 void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
   auto buf =
     std::make_shared<minx::VectorBuffer>(1 + MinxInit::SIZE + msg.data.size());
-  buf->putByte(MINX_INIT);
-  buf->putByte(msg.version);
-  buf->putUint64(msg.cpassword);
+  buf->put<uint8_t>(MINX_INIT);
+  buf->put(msg.version);
+  buf->put(msg.cpassword);
   if (msg.cpassword > 0) {
     allocatePassword(msg.cpassword, addr.address());
   }
-  buf->putBytes(msg.data);
+  buf->put(msg.data.span());
   doSocketSend(addr, buf);
 }
 
 void Minx::sendInitAck(const SockAddr& addr, const MinxInitAck& msg) {
   auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxInitAck::SIZE +
                                                   msg.data.size());
-  buf->putByte(MINX_INIT_ACK);
-  buf->putByte(msg.version);
-  buf->putUint64(msg.cpassword);
-  buf->putUint64(msg.spassword);
+  buf->put<uint8_t>(MINX_INIT_ACK);
+  buf->put(msg.version);
+  buf->put(msg.cpassword);
+  buf->put(msg.spassword);
   if (msg.spassword > 0) {
     allocatePassword(msg.spassword, addr.address());
   }
-  buf->putByteArray(msg.skey);
-  buf->putByte(msg.difficulty);
-  buf->putBytes(msg.data);
+  buf->put(msg.skey);
+  buf->put(msg.difficulty);
+  buf->put(msg.data.span());
   doSocketSend(addr, buf);
 }
 
 void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
   auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxProveWork::SIZE +
                                                   msg.data.size());
-  buf->putByte(MINX_PROVE_WORK);
-  buf->putByte(msg.version);
-  buf->putUint64(msg.spassword);
-  buf->putByteArray(msg.ckey);
-  buf->putUint64(msg.time);
-  buf->putUint64(msg.nonce);
-  buf->putByteArray(msg.solution);
-  buf->putBytes(msg.data);
+  buf->put<uint8_t>(MINX_PROVE_WORK);
+  buf->put(msg.version);
+  buf->put(msg.spassword);
+  buf->put(msg.ckey);
+  buf->put(msg.time);
+  buf->put(msg.nonce);
+  buf->put(msg.solution);
+  buf->put(msg.data.span());
   doSocketSend(addr, buf);
 }
 
@@ -140,16 +140,16 @@ void Minx::sendApplication(const SockAddr& addr, const Bytes& data,
     throw std::runtime_error("invalid application message code");
   }
   auto buf = std::make_shared<minx::VectorBuffer>(1 + data.size());
-  buf->putByte(code);
-  buf->putBytes(data);
+  buf->put(code);
+  buf->put(data.span());
   doSocketSend(addr, buf);
 }
 
 void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
   auto buf = std::make_shared<minx::VectorBuffer>(2 + data.size());
-  buf->putByte(MINX_EXTENSION);
-  buf->putByte(0x0);
-  buf->putBytes(data);
+  buf->put<uint8_t>(MINX_EXTENSION);
+  buf->put<uint8_t>(0x0);
+  buf->put(data.span());
   doSocketSend(addr, buf);
 }
 
@@ -243,9 +243,9 @@ void Minx::verifyPoWs(const size_t limit) {
     }
 
     minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
-    input_buffer.putByteArray(work_item.ckey);
-    input_buffer.putUint64(work_item.time);
-    input_buffer.putUint64(work_item.nonce);
+    input_buffer.put(work_item.ckey);
+    input_buffer.put(work_item.time);
+    input_buffer.put(work_item.nonce);
     Hash calculated_hash;
     randomx_calculate_hash(vm, input_buffer.getBackingSpan().data(),
                            input_buffer.getSize(), calculated_hash.data());
@@ -353,9 +353,9 @@ std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
         uint64_t nonce = nonce_counter.fetch_add(1, std::memory_order_relaxed);
 
         minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
-        input_buffer.putByteArray(myKey);
-        input_buffer.putUint64(time);
-        input_buffer.putUint64(nonce);
+        input_buffer.put(myKey);
+        input_buffer.put(time);
+        input_buffer.put(nonce);
         Hash solution_hash;
         randomx_calculate_hash(vm, input_buffer.getBackingSpan().data(),
                                input_buffer.getSize(), solution_hash.data());
@@ -422,7 +422,7 @@ void Minx::onReceive(const boost::system::error_code& error,
       // note that this calls application callbacks (listener_)
       buffer_.setSize(bytes_transferred);
       buffer_.setReadPos(0);
-      code = buffer_.getByte();
+      code = buffer_.get<uint8_t>();
 
       switch (code) {
       case MINX_INIT: {
@@ -431,8 +431,8 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_INIT;
           break;
         }
-        const uint8_t version = buffer_.getByte();
-        const uint64_t cpassword = buffer_.getUint64();
+        const uint8_t version = buffer_.get<uint8_t>();
+        const uint64_t cpassword = buffer_.get<uint64_t>();
         Bytes data = buffer_.getRemainingBytes();
         MinxInit msg{version, cpassword, data};
         listener_->incomingInit(remoteAddr_, msg);
@@ -445,20 +445,20 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-        const uint8_t version = buffer_.getByte();
+        const uint8_t version = buffer_.get<uint8_t>();
         const uint8_t engine_id = version & 0x0F;
         if (engine_id != 0x0) {
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-        const uint64_t cpassword = buffer_.getUint64();
+        const uint64_t cpassword = buffer_.get<uint64_t>();
         if (cpassword == 0 || !spendPassword(cpassword, remoteAddr_.address())) {
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-        const uint64_t spassword = buffer_.getUint64();
-        Hash skey = buffer_.getByteArray<sizeof(skey)>();
-        const uint8_t difficulty = buffer_.getByte();
+        const uint64_t spassword = buffer_.get<uint64_t>();
+        Hash skey = buffer_.get<Hash>();
+        const uint8_t difficulty = buffer_.get<uint8_t>();
         Bytes data = buffer_.getRemainingBytes();
         MinxInitAck msg{version, cpassword, spassword, difficulty, skey, data};
         listener_->incomingInitAck(remoteAddr_, msg);
@@ -471,17 +471,17 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_PROVE_WORK;
           break;
         }
-        const uint8_t version = buffer_.getByte();
+        const uint8_t version = buffer_.get<uint8_t>();
         const uint8_t engine_id = version & 0x0F;
         if (engine_id != 0x0) {
           lastError_ = MINX_ERROR_BAD_PROVE_WORK;
           break;
         }
-        const uint64_t spassword = buffer_.getUint64();
-        Hash ckey = buffer_.getByteArray<sizeof(ckey)>();
-        const uint64_t time = buffer_.getUint64();
-        const uint64_t nonce = buffer_.getUint64();
-        Hash solution = buffer_.getByteArray<sizeof(solution)>();
+        const uint64_t spassword = buffer_.get<uint64_t>();
+        Hash ckey = buffer_.get<Hash>();
+        const uint64_t time = buffer_.get<uint64_t>();
+        const uint64_t nonce = buffer_.get<uint64_t>();
+        Hash solution = buffer_.get<Hash>();
         Bytes data = buffer_.getRemainingBytes();
         bool password_matched = spassword > 0 && spendPassword(spassword, remoteAddr_.address());
         if (!password_matched) {
@@ -506,7 +506,7 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_EXTENSION;
           break;
         }
-        version = buffer_.getByte();
+        version = buffer_.get<uint8_t>();
         Bytes data = buffer_.getRemainingBytes();
         listener_->incomingExtension(remoteAddr_, data);
         break;

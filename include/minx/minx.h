@@ -22,7 +22,7 @@ namespace minx {
 /**
  * MINX message code.
  */
-enum {
+enum minx_code_t : uint8_t {
   MINX_APPLICATION_MIN = 0x00,
   MINX_APPLICATION_MAX = 0xFB,
   MINX_APPLICATION_DEFAULT = MINX_APPLICATION_MAX,
