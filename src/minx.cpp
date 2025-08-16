@@ -44,6 +44,19 @@ uint64_t Minx::generatePassword() {
   }
 }
 
+void Minx::allocatePassword(uint64_t password, const IPAddr& addr) {
+  passwords_.put(password, addr);
+}
+
+bool Minx::spendPassword(uint64_t password, const IPAddr& addr) {
+  auto ip_opt = passwords_.get(password);
+  if (ip_opt && ip_opt.value() == addr) {
+    passwords_.erase(password);
+    return true;
+  }
+  return false;
+}
+
 void Minx::openSocket(IOContext& ioc, const SockAddr& addr) {
   std::lock_guard lock(socketStateMutex_);
   if (socket_) {
@@ -85,7 +98,7 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
   buf->putByte(msg.version);
   buf->putUint64(msg.cpassword);
   if (msg.cpassword > 0) {
-    passwords_.put(msg.cpassword, addr.address());
+    allocatePassword(msg.cpassword, addr.address());
   }
   buf->putBytes(msg.data);
   doSocketSend(addr, buf);
@@ -99,7 +112,7 @@ void Minx::sendInitAck(const SockAddr& addr, const MinxInitAck& msg) {
   buf->putUint64(msg.cpassword);
   buf->putUint64(msg.spassword);
   if (msg.spassword > 0) {
-    passwords_.put(msg.spassword, addr.address());
+    allocatePassword(msg.spassword, addr.address());
   }
   buf->putByteArray(msg.skey);
   buf->putByte(msg.difficulty);
@@ -439,16 +452,10 @@ void Minx::onReceive(const boost::system::error_code& error,
           break;
         }
         const uint64_t cpassword = buffer_.getUint64();
-        if (!cpassword) {
+        if (cpassword == 0 || !spendPassword(cpassword, remoteAddr_.address())) {
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-        auto ip_opt = passwords_.get(cpassword);
-        if (!ip_opt || ip_opt.value() != remoteAddr_.address()) {
-          lastError_ = MINX_ERROR_BAD_INIT_ACK;
-          break;
-        }
-        passwords_.erase(cpassword);
         const uint64_t spassword = buffer_.getUint64();
         Hash skey = buffer_.getByteArray<sizeof(skey)>();
         const uint8_t difficulty = buffer_.getByte();
@@ -476,14 +483,7 @@ void Minx::onReceive(const boost::system::error_code& error,
         const uint64_t nonce = buffer_.getUint64();
         Hash solution = buffer_.getByteArray<sizeof(solution)>();
         Bytes data = buffer_.getRemainingBytes();
-        bool password_matched = false;
-        if (spassword > 0) {
-          auto ip_opt = passwords_.get(spassword);
-          if (ip_opt && ip_opt.value() == remoteAddr_.address()) {
-            passwords_.erase(spassword);
-            password_matched = true;
-          }
-        }
+        bool password_matched = spassword > 0 && spendPassword(spassword, remoteAddr_.address());
         if (!password_matched) {
           if (!listener_->isConnected(remoteAddr_)) {
             lastError_ = MINX_ERROR_NOT_CONNECTED;

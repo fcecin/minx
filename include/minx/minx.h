@@ -298,6 +298,22 @@ public:
   uint64_t generatePassword();
 
   /**
+   * Store a redeemable password ticket for a remote host.
+   * @param password The password ticket to allocate.
+   * @param addr The host address to associate with the password ticket.
+   */
+  void allocatePassword(uint64_t password, const IPAddr& addr);
+
+  /**
+   * Check for a redeemable password ticket from a remote host.
+   * @param password The password ticket to check.
+   * @param addr The host address associated with the password ticket.
+   * @return `true` if a match was found and the password ticket was consumed,
+   * `false` otherwise.
+   */
+  bool spendPassword(uint64_t password, const IPAddr& addr);
+
+  /**
    * Open the UDP socket if one was not previously opened.
    * The `boost::asio::io_context` is externally-provided, which allows the
    * client full control of network processing (threaded vs single-thread, etc).
