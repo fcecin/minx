@@ -100,7 +100,7 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
   if (msg.cpassword > 0) {
     allocatePassword(msg.cpassword, addr.address());
   }
-  buf->put(msg.data.span());
+  buf->put(logkv::bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -116,7 +116,7 @@ void Minx::sendInitAck(const SockAddr& addr, const MinxInitAck& msg) {
   }
   buf->put(msg.skey);
   buf->put(msg.difficulty);
-  buf->put(msg.data.span());
+  buf->put(logkv::bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -130,7 +130,7 @@ void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
   buf->put(msg.time);
   buf->put(msg.nonce);
   buf->put(msg.solution);
-  buf->put(msg.data.span());
+  buf->put(logkv::bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -141,7 +141,7 @@ void Minx::sendApplication(const SockAddr& addr, const Bytes& data,
   }
   auto buf = std::make_shared<minx::VectorBuffer>(1 + data.size());
   buf->put(code);
-  buf->put(data.span());
+  buf->put(logkv::bytesAsSpan(data));
   doSocketSend(addr, buf);
 }
 
@@ -149,7 +149,7 @@ void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
   auto buf = std::make_shared<minx::VectorBuffer>(2 + data.size());
   buf->put<uint8_t>(MINX_EXTENSION);
   buf->put<uint8_t>(0x0);
-  buf->put(data.span());
+  buf->put(logkv::bytesAsSpan(data));
   doSocketSend(addr, buf);
 }
 

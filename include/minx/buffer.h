@@ -62,7 +62,7 @@ public:
 
   logkv::Bytes getRemainingBytes() {
     logkv::Bytes result(getRemainingBytesCount());
-    get(result.span());
+    get(logkv::bytesAsSpan(result));
     return result;
   }
 
