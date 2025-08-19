@@ -50,8 +50,8 @@ int main() {
                 << std::endl;
       minx::MinxInitAck ack_msg = {
         .version = 0,
-        .cpassword = msg.cpassword,
-        .spassword = minx_instance_->generatePassword(),
+        .gpassword = minx_instance_->generatePassword(),
+        .spassword = msg.gpassword,
         .difficulty = minx_instance_->getMinimumDifficulty(),
         .skey = skey_,
         .data = {}};
@@ -119,7 +119,8 @@ int main() {
 
       const auto& pow_template = *pow_template_opt;
       minx::MinxProveWork final_pow_msg = {.version = 0,
-                                           .spassword = msg.spassword,
+                                           .gpassword = 0,
+                                           .spassword = msg.gpassword,
                                            .ckey = pow_template.ckey,
                                            .time = pow_template.time,
                                            .nonce = pow_template.nonce,
@@ -201,7 +202,7 @@ int main() {
   // 4. Start the Handshake
   // ========================
   minx::MinxInit init_msg = {
-    .version = 0, .cpassword = client_minx.generatePassword(), .data = {}};
+    .version = 0, .gpassword = client_minx.generatePassword(), .data = {}};
   client_minx.sendInit(server_addr, init_msg);
   std::cout << "  -> Client: Sent INIT." << std::endl;
 

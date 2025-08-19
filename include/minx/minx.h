@@ -50,33 +50,33 @@ enum {
 /**
  * INIT message.
  * @var MinxInit::version Sender's MINX version.
- * @var MinxInit::cpassword Socket address proof ticket for INIT_ACK.
+ * @var MinxInit::gpassword Generated ticket to store at receiver.
  * @var MinxInit::data Application-specific data.
  */
 struct MinxInit {
   const uint8_t version;
-  const uint64_t cpassword;
+  const uint64_t gpassword;
   Bytes data;
-  static constexpr size_t SIZE = sizeof(version) + sizeof(cpassword);
+  static constexpr size_t SIZE = sizeof(version) + sizeof(gpassword);
 };
 
 /**
  * INIT_ACK message.
  * @var MinxInitAck::version Sender's MINX version.
- * @var MinxInitAck::cpassword Socket address proof ticket from INIT.
- * @var MinxInitAck::spassword Socket address proof ticket for PROVE_WORK.
+ * @var MinxInitAck::gpassword Generated ticket to store at receiver.
+ * @var MinxInitAck::spassword Forwarded ticket to spend at receiver.
  * @var MinxInitAck::difficulty Minimum solution difficulty for PROVE_WORK.
  * @var MinxInitAck::skey Server public key for the RandomX miner VM.
  * @var MinxInitAck::data Application-specific data.
  */
 struct MinxInitAck {
   const uint8_t version;
-  const uint64_t cpassword;
+  const uint64_t gpassword;
   const uint64_t spassword;
   const uint8_t difficulty;
   Hash skey;
   Bytes data;
-  static constexpr size_t SIZE = sizeof(version) + sizeof(cpassword) +
+  static constexpr size_t SIZE = sizeof(version) + sizeof(gpassword) +
                                  sizeof(spassword) + sizeof(difficulty) +
                                  sizeof(skey);
 };
@@ -84,7 +84,8 @@ struct MinxInitAck {
 /**
  * PROVE_WORK message.
  * @var MinxProveWork::version Sender's MINX version.
- * @var MinxProveWork::spassword Socket address proof ticket from INIT_ACK.
+ * @var MinxProveWork::gpassword Generated ticket to store at receiver.
+ * @var MinxProveWork::spassword Forwarded ticket to spend at receiver.
  * @var MinxProveWork::ckey Client public key that gets credit for the solution.
  * @var MinxProveWork::time Solution seconds since epoch.
  * @var MinxProveWork::nonce Solution nonce.
@@ -93,15 +94,16 @@ struct MinxInitAck {
  */
 struct MinxProveWork {
   const uint8_t version;
+  const uint64_t gpassword;
   const uint64_t spassword;
   Hash ckey;
   const uint64_t time;
   const uint64_t nonce;
   Hash solution;
   Bytes data;
-  static constexpr size_t SIZE = sizeof(version) + sizeof(spassword) +
-                                 sizeof(ckey) + sizeof(time) + sizeof(nonce) +
-                                 sizeof(solution);
+  static constexpr size_t SIZE =
+    sizeof(version) + sizeof(gpassword) + sizeof(spassword) + sizeof(ckey) +
+    sizeof(time) + sizeof(nonce) + sizeof(solution);
 };
 
 /**

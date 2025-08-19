@@ -96,9 +96,9 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
     std::make_shared<minx::VectorBuffer>(1 + MinxInit::SIZE + msg.data.size());
   buf->put<uint8_t>(MINX_INIT);
   buf->put(msg.version);
-  buf->put(msg.cpassword);
-  if (msg.cpassword > 0) {
-    allocatePassword(msg.cpassword, addr.address());
+  buf->put(msg.gpassword);
+  if (msg.gpassword > 0) {
+    allocatePassword(msg.gpassword, addr.address());
   }
   buf->put(logkv::bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
@@ -109,11 +109,11 @@ void Minx::sendInitAck(const SockAddr& addr, const MinxInitAck& msg) {
                                                   msg.data.size());
   buf->put<uint8_t>(MINX_INIT_ACK);
   buf->put(msg.version);
-  buf->put(msg.cpassword);
-  buf->put(msg.spassword);
-  if (msg.spassword > 0) {
-    allocatePassword(msg.spassword, addr.address());
+  buf->put(msg.gpassword);
+  if (msg.gpassword > 0) {
+    allocatePassword(msg.gpassword, addr.address());
   }
+  buf->put(msg.spassword);
   buf->put(msg.skey);
   buf->put(msg.difficulty);
   buf->put(logkv::bytesAsSpan(msg.data));
@@ -125,6 +125,10 @@ void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
                                                   msg.data.size());
   buf->put<uint8_t>(MINX_PROVE_WORK);
   buf->put(msg.version);
+  buf->put(msg.gpassword);
+  if (msg.gpassword > 0) {
+    allocatePassword(msg.gpassword, addr.address());
+  }
   buf->put(msg.spassword);
   buf->put(msg.ckey);
   buf->put(msg.time);
@@ -366,7 +370,7 @@ std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
           if (!already_found) {
             std::lock_guard<std::mutex> lock(result_mutex);
             result.emplace(
-              MinxProveWork{0, 0, myKey, time, nonce, solution_hash, {}});
+              MinxProveWork{0, 0, 0, myKey, time, nonce, solution_hash, {}});
           }
           break;
         }
@@ -432,9 +436,9 @@ void Minx::onReceive(const boost::system::error_code& error,
           break;
         }
         const uint8_t version = buffer_.get<uint8_t>();
-        const uint64_t cpassword = buffer_.get<uint64_t>();
+        const uint64_t gpassword = buffer_.get<uint64_t>();
         Bytes data = buffer_.getRemainingBytes();
-        MinxInit msg{version, cpassword, data};
+        MinxInit msg{version, gpassword, data};
         listener_->incomingInit(remoteAddr_, msg);
         break;
       }
@@ -451,16 +455,17 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-        const uint64_t cpassword = buffer_.get<uint64_t>();
-        if (cpassword == 0 || !spendPassword(cpassword, remoteAddr_.address())) {
+        const uint64_t gpassword = buffer_.get<uint64_t>();
+        const uint64_t spassword = buffer_.get<uint64_t>();
+        if (spassword == 0 ||
+            !spendPassword(spassword, remoteAddr_.address())) {
           lastError_ = MINX_ERROR_BAD_INIT_ACK;
           break;
         }
-        const uint64_t spassword = buffer_.get<uint64_t>();
         Hash skey = buffer_.get<Hash>();
         const uint8_t difficulty = buffer_.get<uint8_t>();
         Bytes data = buffer_.getRemainingBytes();
-        MinxInitAck msg{version, cpassword, spassword, difficulty, skey, data};
+        MinxInitAck msg{version, gpassword, spassword, difficulty, skey, data};
         listener_->incomingInitAck(remoteAddr_, msg);
         break;
       }
@@ -477,21 +482,23 @@ void Minx::onReceive(const boost::system::error_code& error,
           lastError_ = MINX_ERROR_BAD_PROVE_WORK;
           break;
         }
+        const uint64_t gpassword = buffer_.get<uint64_t>();
         const uint64_t spassword = buffer_.get<uint64_t>();
         Hash ckey = buffer_.get<Hash>();
         const uint64_t time = buffer_.get<uint64_t>();
         const uint64_t nonce = buffer_.get<uint64_t>();
         Hash solution = buffer_.get<Hash>();
         Bytes data = buffer_.getRemainingBytes();
-        bool password_matched = spassword > 0 && spendPassword(spassword, remoteAddr_.address());
+        bool password_matched =
+          spassword > 0 && spendPassword(spassword, remoteAddr_.address());
         if (!password_matched) {
           if (!listener_->isConnected(remoteAddr_)) {
             lastError_ = MINX_ERROR_NOT_CONNECTED;
             break;
           }
         }
-        MinxProveWork msg{version, spassword, ckey, time,
-                          nonce,   solution,  data};
+        MinxProveWork msg{version, gpassword, spassword, ckey,
+                          time,    nonce,     solution,  data};
         {
           std::lock_guard lock(workMutex_);
           work_.push({std::move(msg), remoteAddr_});

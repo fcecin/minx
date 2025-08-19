@@ -52,7 +52,7 @@ The remainder of the datagram is the message, which depends on `CODE`. Below is 
 Asks the receiver to start verification of the sender's IP address.
 
 - `uint8_t VERSION`: Implementation identifier.
-- `uint64_t CPASSWORD`: A non-zero random value, or zero if no password allocated for whatever reason. Whether the value is associated with the receiver's IP address and for how long the value is kept are up to the implementation.
+- `uint64_t GPASSWORD`: A non-zero random value, or zero if no password allocated for whatever reason. Whether the value is associated with the receiver's IP address and for how long the value is kept are up to the implementation.
 - `uint8_t[] DATA`: If present, data for the MINX implementation or the application.
 
 ### INIT_ACK (`0xFD`)
@@ -60,8 +60,8 @@ Asks the receiver to start verification of the sender's IP address.
 Optional answer to an `INIT` message. Receiver assumes that its `VERSION` informed by the previous `INIT` message is supported by the sender.
 
 - `uint8_t VERSION`: Implementation identifier.
-- `uint64_t CPASSWORD`: The same `CPASSWORD` value from the `INIT` message that is being replied to. Whether an older but unspent `CPASSWORD` value is accepted is implementation-defined.
-- `uint64_t SPASSWORD`: A non-zero random value, or zero if no password allocated for whatever reason. Whether the value is associated with the receiver's IP address and for how long the value is kept are up to the implementation.
+- `uint64_t GPASSWORD`: A non-zero random value, or zero if no password allocated for whatever reason. Whether the value is associated with the receiver's IP address and for how long the value is kept are up to the implementation.
+- `uint64_t SPASSWORD`: The `GPASSWORD` value from the `INIT` message that is being replied to. Whether an older but unspent `GPASSWORD` value is accepted is implementation-defined.
 - `uint8_t[] ENGINE_DATA`: If present, data for the MINX implementation or the application.
 
 If `ENGINE_ID` is `0x0`, `ENGINE_DATA` has the following format:
@@ -75,7 +75,8 @@ If `ENGINE_ID` is `0x0`, `ENGINE_DATA` has the following format:
 A message that presents a PoW solution for a PoW puzzle.
 
 - `uint8_t VERSION`: Implementation identifier.
-- `uint64_t SPASSWORD`: The `SPASSWORD` value received in the most recent `INIT_ACK` message, or zero if none. Whether an older but unspent `SPASSWORD` value is accepted is implementation-defined.
+- `uint64_t GPASSWORD`: A non-zero random value, or zero if no password allocated for whatever reason. Whether the value is associated with the receiver's IP address and for how long the value is kept are up to the implementation.
+- `uint64_t SPASSWORD`: The `GPASSWORD` value received in the most recent `INIT_ACK` message (or a `GPASSWORD` value that was obtained in some other way from the peer and is not yet spent), or zero if none. Whether an older but unspent `GPASSWORD` value is accepted is implementation-defined.
 - `uint8_t[] POW_DATA`: The PoW data packet for the PoW engine to process.
 
 The `POW_DATA` data packet's format depends on the value of `ENGINE_ID`.
