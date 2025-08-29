@@ -43,20 +43,20 @@ int main() {
 
     bool isConnected(const minx::SockAddr& addr) override { return false; }
 
-    void incomingInit(const minx::SockAddr& addr,
-                      const minx::MinxInit& msg) override {
-      std::cout << "✅ Server: Received INIT from "
+    void incomingGetInfo(const minx::SockAddr& addr,
+                      const minx::MinxGetInfo& msg) override {
+      std::cout << "✅ Server: Received GET_INFO from "
                 << addr.address().to_string() << ":" << addr.port()
                 << std::endl;
-      minx::MinxInitAck ack_msg = {
+      minx::MinxInfo ack_msg = {
         .version = 0,
         .gpassword = minx_instance_->generatePassword(),
         .spassword = msg.gpassword,
         .difficulty = minx_instance_->getMinimumDifficulty(),
         .skey = skey_,
         .data = {}};
-      minx_instance_->sendInitAck(addr, ack_msg);
-      std::cout << "  -> Server: Sent INIT_ACK." << std::endl;
+      minx_instance_->sendInfo(addr, ack_msg);
+      std::cout << "  -> Server: Sent INFO." << std::endl;
     }
 
     void incomingProveWork(const minx::SockAddr& addr,
@@ -83,9 +83,9 @@ int main() {
 
     void setMinxInstance(minx::Minx* instance) { minx_instance_ = instance; }
 
-    void incomingInitAck(const minx::SockAddr& addr,
-                         const minx::MinxInitAck& msg) override {
-      std::cout << "✅ Client: Received INIT_ACK from server." << std::endl;
+    void incomingInfo(const minx::SockAddr& addr,
+                         const minx::MinxInfo& msg) override {
+      std::cout << "✅ Client: Received INFO from server." << std::endl;
       std::cout << "  -> Server key: " << msg.skey << std::endl;
       std::cout << "  -> Generated password: " << msg.spassword << std::endl;
 
@@ -201,10 +201,9 @@ int main() {
 
   // 4. Start the Handshake
   // ========================
-  minx::MinxInit init_msg = {
-    .version = 0, .gpassword = client_minx.generatePassword(), .data = {}};
-  client_minx.sendInit(server_addr, init_msg);
-  std::cout << "  -> Client: Sent INIT." << std::endl;
+  const minx::MinxGetInfo init_msg = {0, client_minx.generatePassword(), {}};
+  client_minx.sendGetInfo(server_addr, init_msg);
+  std::cout << "  -> Client: Sent GET_INFO." << std::endl;
 
   // 5. Run the Event Loop
   // =====================

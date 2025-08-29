@@ -24,10 +24,12 @@ namespace minx {
  */
 enum minx_code_t : uint8_t {
   MINX_APPLICATION_MIN = 0x00,
-  MINX_APPLICATION_MAX = 0xFB,
+  MINX_APPLICATION_MAX = 0xF9,
   MINX_APPLICATION_DEFAULT = MINX_APPLICATION_MAX,
-  MINX_INIT = 0xFC,
-  MINX_INIT_ACK = 0xFD,
+  MINX_INIT = 0xFA,
+  MINX_MESSAGE = 0xFB,
+  MINX_GET_INFO = 0xFC,
+  MINX_INFO = 0xFD,
   MINX_PROVE_WORK = 0xFE,
   MINX_EXTENSION = 0xFF
 };
@@ -37,14 +39,16 @@ enum minx_code_t : uint8_t {
  */
 enum {
   MINX_ERROR_LOW_DIFF = 0x01,
-  MINX_ERROR_BAD_INIT = 0x02,
-  MINX_ERROR_BAD_INIT_ACK = 0x03,
+  MINX_ERROR_BAD_GET_INFO = 0x02,
+  MINX_ERROR_BAD_INFO = 0x03,
   MINX_ERROR_BAD_PROVE_WORK = 0x04,
   MINX_ERROR_BAD_EXTENSION = 0x05,
   MINX_ERROR_NOT_CONNECTED = 0x06,
   MINX_ERROR_DOUBLE_SPEND = 0x07,
   MINX_ERROR_UNTIMELY_POW = 0x08,
-  MINX_ERROR_MISMATCHED_POW = 0x09
+  MINX_ERROR_MISMATCHED_POW = 0x09,
+  MINX_ERROR_BAD_INIT = 0x0A,
+  MINX_ERROR_BAD_MESSAGE = 0x0B
 };
 
 /**
@@ -61,15 +65,37 @@ struct MinxInit {
 };
 
 /**
- * INIT_ACK message.
- * @var MinxInitAck::version Sender's MINX version.
- * @var MinxInitAck::gpassword Generated ticket to store at receiver.
- * @var MinxInitAck::spassword Forwarded ticket to spend at receiver.
- * @var MinxInitAck::difficulty Minimum solution difficulty for PROVE_WORK.
- * @var MinxInitAck::skey Server public key for the RandomX miner VM.
- * @var MinxInitAck::data Application-specific data.
+ * MESSAGE message.
+ * @var MinxMessage::version Sender's MINX version.
+ * @var MinxMessage::gpassword Generated ticket to store at receiver.
+ * @var MinxMessage::spassword Forwarded ticket to spend at receiver.
+ * @var MinxMessage::data Application-specific data.
  */
-struct MinxInitAck {
+struct MinxMessage {
+  const uint8_t version;
+  const uint64_t gpassword;
+  const uint64_t spassword;
+  Bytes data;
+  static constexpr size_t SIZE =
+    sizeof(version) + sizeof(gpassword) + sizeof(spassword);
+};
+
+/**
+ * GET_INFO message.
+ * Same format as the INIT message.
+ */
+struct MinxGetInfo: MinxInit {};
+
+/**
+ * INFO message.
+ * @var MinxInfo::version Sender's MINX version.
+ * @var MinxInfo::gpassword Generated ticket to store at receiver.
+ * @var MinxInfo::spassword Forwarded ticket to spend at receiver.
+ * @var MinxInfo::difficulty Minimum solution difficulty for PROVE_WORK.
+ * @var MinxInfo::skey Server public key for the RandomX miner VM.
+ * @var MinxInfo::data Application-specific data.
+ */
+struct MinxInfo {
   const uint8_t version;
   const uint64_t gpassword;
   const uint64_t spassword;
@@ -128,11 +154,25 @@ public:
   virtual void incomingInit(const SockAddr& addr, const MinxInit& msg) {}
 
   /**
-   * Receive INIT_ACK message.
+   * Receive MESSAGE message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingInitAck(const SockAddr& addr, const MinxInitAck& msg) {}
+  virtual void incomingMessage(const SockAddr& addr, const MinxMessage& msg) {}
+
+  /**
+   * Receive GET_INFO message.
+   * @param addr Remote UDP socket sender address.
+   * @param msg The MINX message.
+   */
+  virtual void incomingGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {}
+
+  /**
+   * Receive INFO message.
+   * @param addr Remote UDP socket sender address.
+   * @param msg The MINX message.
+   */
+  virtual void incomingInfo(const SockAddr& addr, const MinxInfo& msg) {}
 
   /**
    * Receive PROVE_WORK message with a validated work item.
@@ -144,6 +184,13 @@ public:
                                  const int difficulty) {}
 
   /**
+   * Receive EXTENSION message.
+   * @param addr Remote UDP socket sender address.
+   * @param data Extension data.
+   */
+  virtual void incomingExtension(const SockAddr& addr, const Bytes& data) {}
+
+  /**
    * Receive APPLICATION message.
    * @param addr Remote UDP socket sender address.
    * @param code The specific application message code.
@@ -151,13 +198,6 @@ public:
    */
   virtual void incomingApplication(const SockAddr& addr, const uint8_t code,
                                    const Bytes& data) {}
-
-  /**
-   * Receive EXTENSION message.
-   * @param addr Remote UDP socket sender address.
-   * @param data Extension data.
-   */
-  virtual void incomingExtension(const SockAddr& addr, const Bytes& data) {}
 };
 
 /**
@@ -338,11 +378,25 @@ public:
   void sendInit(const SockAddr& addr, const MinxInit& msg);
 
   /**
-   * Send INIT_ACK message.
+   * Send MESSAGE message.
    * @param addr Remote UDP socket receiver address.
    * @param msg The MINX message.
    */
-  void sendInitAck(const SockAddr& addr, const MinxInitAck& msg);
+  void sendMessage(const SockAddr& addr, const MinxMessage& msg);
+
+  /**
+   * Send GET_INFO message.
+   * @param addr Remote UDP socket receiver address.
+   * @param msg The MINX message.
+   */
+  void sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg);
+
+  /**
+   * Send INFO message.
+   * @param addr Remote UDP socket receiver address.
+   * @param msg The MINX message.
+   */
+  void sendInfo(const SockAddr& addr, const MinxInfo& msg);
 
   /**
    * Send PROVE_WORK message.
@@ -352,6 +406,13 @@ public:
   void sendProveWork(const SockAddr& addr, const MinxProveWork& msg);
 
   /**
+   * Send EXTENSION message.
+   * @param addr Remote UDP socket receiver address.
+   * @param data Extension data.
+   */
+  void sendExtension(const SockAddr& addr, const Bytes& data);
+
+  /**
    * Send APPLICATION message.
    * @param addr Remote UDP socket receiver address.
    * @param data Application-specific data.
@@ -359,13 +420,6 @@ public:
    */
   void sendApplication(const SockAddr& addr, const Bytes& data,
                        const uint8_t code = MINX_APPLICATION_DEFAULT);
-
-  /**
-   * Send EXTENSION message.
-   * @param addr Remote UDP socket receiver address.
-   * @param data Extension data.
-   */
-  void sendExtension(const SockAddr& addr, const Bytes& data);
 
   /**
    * Verify any pending incoming PoWs.

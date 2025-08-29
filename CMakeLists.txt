@@ -16,6 +16,9 @@ find_package(Threads)
 
 # Boost (from system)
 
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 NEW)
+endif()
 set(Boost_USE_STATIC_LIBS ON)
 find_package(Boost 1.83.0 REQUIRED COMPONENTS system)
 

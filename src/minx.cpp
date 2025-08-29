@@ -104,10 +104,37 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
   doSocketSend(addr, buf);
 }
 
-void Minx::sendInitAck(const SockAddr& addr, const MinxInitAck& msg) {
-  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxInitAck::SIZE +
+void Minx::sendMessage(const SockAddr& addr, const MinxMessage& msg) {
+  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxMessage::SIZE +
                                                   msg.data.size());
-  buf->put<uint8_t>(MINX_INIT_ACK);
+  buf->put<uint8_t>(MINX_MESSAGE);
+  buf->put(msg.version);
+  buf->put(msg.gpassword);
+  if (msg.gpassword > 0) {
+    allocatePassword(msg.gpassword, addr.address());
+  }
+  buf->put(msg.spassword);
+  buf->put(logkv::bytesAsSpan(msg.data));
+  doSocketSend(addr, buf);
+}
+
+void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
+  auto buf =
+    std::make_shared<minx::VectorBuffer>(1 + MinxGetInfo::SIZE + msg.data.size());
+  buf->put<uint8_t>(MINX_GET_INFO);
+  buf->put(msg.version);
+  buf->put(msg.gpassword);
+  if (msg.gpassword > 0) {
+    allocatePassword(msg.gpassword, addr.address());
+  }
+  buf->put(logkv::bytesAsSpan(msg.data));
+  doSocketSend(addr, buf);
+}
+
+void Minx::sendInfo(const SockAddr& addr, const MinxInfo& msg) {
+  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxInfo::SIZE +
+                                                  msg.data.size());
+  buf->put<uint8_t>(MINX_INFO);
   buf->put(msg.version);
   buf->put(msg.gpassword);
   if (msg.gpassword > 0) {
@@ -443,30 +470,64 @@ void Minx::onReceive(const boost::system::error_code& error,
         break;
       }
 
-      case MINX_INIT_ACK: {
-        size_t bytes_expected = sizeof(code) + MinxInitAck::SIZE;
+      case MINX_MESSAGE: {
+        size_t bytes_expected = sizeof(code) + MinxMessage::SIZE;
         if (bytes_transferred < bytes_expected) {
-          lastError_ = MINX_ERROR_BAD_INIT_ACK;
+          lastError_ = MINX_ERROR_BAD_MESSAGE;
+          break;
+        }
+        const uint8_t version = buffer_.get<uint8_t>();
+        const uint64_t gpassword = buffer_.get<uint64_t>();
+        const uint64_t spassword = buffer_.get<uint64_t>();
+        if (spassword == 0 ||
+            !spendPassword(spassword, remoteAddr_.address())) {
+          lastError_ = MINX_ERROR_BAD_MESSAGE;
+          break;
+        }
+        Bytes data = buffer_.getRemainingBytes();
+        MinxMessage msg{version, gpassword, spassword, data};
+        listener_->incomingMessage(remoteAddr_, msg);
+        break;
+      }
+
+      case MINX_GET_INFO: {
+        size_t bytes_expected = sizeof(code) + MinxGetInfo::SIZE;
+        if (bytes_transferred < bytes_expected) {
+          lastError_ = MINX_ERROR_BAD_GET_INFO;
+          break;
+        }
+        const uint8_t version = buffer_.get<uint8_t>();
+        const uint64_t gpassword = buffer_.get<uint64_t>();
+        Bytes data = buffer_.getRemainingBytes();
+        MinxGetInfo msg{version, gpassword, data};
+        listener_->incomingGetInfo(remoteAddr_, msg);
+        break;
+      }
+
+      case MINX_INFO: {
+        size_t bytes_expected = sizeof(code) + MinxInfo::SIZE;
+        if (bytes_transferred < bytes_expected) {
+          lastError_ = MINX_ERROR_BAD_INFO;
           break;
         }
         const uint8_t version = buffer_.get<uint8_t>();
         const uint8_t engine_id = version & 0x0F;
         if (engine_id != 0x0) {
-          lastError_ = MINX_ERROR_BAD_INIT_ACK;
+          lastError_ = MINX_ERROR_BAD_INFO;
           break;
         }
         const uint64_t gpassword = buffer_.get<uint64_t>();
         const uint64_t spassword = buffer_.get<uint64_t>();
         if (spassword == 0 ||
             !spendPassword(spassword, remoteAddr_.address())) {
-          lastError_ = MINX_ERROR_BAD_INIT_ACK;
+          lastError_ = MINX_ERROR_BAD_INFO;
           break;
         }
         Hash skey = buffer_.get<Hash>();
         const uint8_t difficulty = buffer_.get<uint8_t>();
         Bytes data = buffer_.getRemainingBytes();
-        MinxInitAck msg{version, gpassword, spassword, difficulty, skey, data};
-        listener_->incomingInitAck(remoteAddr_, msg);
+        MinxInfo msg{version, gpassword, spassword, difficulty, skey, data};
+        listener_->incomingInfo(remoteAddr_, msg);
         break;
       }
 
