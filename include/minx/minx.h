@@ -464,16 +464,21 @@ public:
    * @param difficulty The minimum difficulty for the solution.
    * @param numThreads Number of threads to use for mining; default is 1. A
    * value of 0 means `std::hardware_concurrency`.
+   * @param startNonce Starting nonce value for solution search (default: 0).
+   * @param maxIters Maximum number of solutions to try; if zero, will try until
+   * a solution is found.
    * @param maxVms Maximum number of RandomX VMs to keep in memory after mining;
    * default is 1 (one VM needs to be allocated per thread requested). A value
    * of 0 means keeping all VMs already allocated.
-   * @return Proof-of-Work template message with the mined solution (but without
-   * `version`, `password`, and `data`), or an empty optional if VM not found or
-   * is not ready.
+   * @return Proof-of-Work template message with the mined solution, or an empty
+   * optional if the solution was not found in `maxIters` iterations.
+   * @throws std::runtime_error if VM not found or is not ready.
    */
   std::optional<MinxProveWork> proveWork(const Hash& myKey, const Hash& hdata,
                                          const Hash& targetKey, int difficulty,
-                                         int numThreads = 1, int maxVMs = 1);
+                                         int numThreads = 1,
+                                         uint64_t startNonce = 0,
+                                         uint64_t maxIters = 0, int maxVMs = 1);
 
   /**
    * Add an IP address pattern to the IP filter.

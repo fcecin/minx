@@ -349,7 +349,8 @@ bool Minx::destroyVM(const Hash& key) {
 
 std::optional<MinxProveWork>
 Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
-                int difficulty, int numThreads, int maxVMs) {
+                int difficulty, int numThreads, uint64_t startNonce,
+                uint64_t maxIters, int maxVMs) {
   std::shared_ptr<PoWEngine> engine_ptr;
   {
     std::lock_guard lock(vmsMutex_);
@@ -358,11 +359,20 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
       engine_ptr = it->second;
     }
   }
-  if (!engine_ptr || !engine_ptr->isReady()) {
-    return std::nullopt;
+  if (!engine_ptr) {
+    throw std::runtime_error("VM not found");
+  }
+  if (!engine_ptr->isReady()) {
+    throw std::runtime_error("VM not ready");
   }
   std::atomic<bool> solution_found = false;
-  std::atomic<uint64_t> nonce_counter = 0;
+  std::atomic<uint64_t> nonce_counter = startNonce;
+  uint64_t maxNonce;
+  if (maxIters > 0) {
+    maxNonce = startNonce + maxIters;
+  } else {
+    maxNonce = std::numeric_limits<uint64_t>::max();
+  }
   std::optional<MinxProveWork> result;
   std::mutex result_mutex;
   if (numThreads <= 0) {
@@ -377,12 +387,17 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
       if (!vm) {
         return;
       }
-      while (!solution_found.load(std::memory_order_relaxed)) {
+      while (true) {
+        uint64_t nonce = nonce_counter.fetch_add(1, std::memory_order_relaxed);
+        if (solution_found.load(std::memory_order_relaxed) ||
+            nonce >= maxNonce) {
+          break;
+        }
+
         const auto p1 = std::chrono::system_clock::now();
         const uint64_t time = std::chrono::duration_cast<std::chrono::seconds>(
                                 p1.time_since_epoch())
                                 .count();
-        uint64_t nonce = nonce_counter.fetch_add(1, std::memory_order_relaxed);
 
         minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
         input_buffer.put(myKey);
