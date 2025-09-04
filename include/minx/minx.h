@@ -84,7 +84,7 @@ struct MinxMessage {
  * GET_INFO message.
  * Same format as the INIT message.
  */
-struct MinxGetInfo: MinxInit {};
+struct MinxGetInfo : MinxInit {};
 
 /**
  * INFO message.
@@ -113,6 +113,7 @@ struct MinxInfo {
  * @var MinxProveWork::gpassword Generated ticket to store at receiver.
  * @var MinxProveWork::spassword Forwarded ticket to spend at receiver.
  * @var MinxProveWork::ckey Client public key that gets credit for the solution.
+ * @var MinxProveWork::hdata Secure hash over `data` (provided by application).
  * @var MinxProveWork::time Solution seconds since epoch.
  * @var MinxProveWork::nonce Solution nonce.
  * @var MinxProveWork::solution RandomX hash over ckey,time,nonce for skey VM.
@@ -123,13 +124,14 @@ struct MinxProveWork {
   const uint64_t gpassword;
   const uint64_t spassword;
   Hash ckey;
+  Hash hdata;
   const uint64_t time;
   const uint64_t nonce;
   Hash solution;
   Bytes data;
   static constexpr size_t SIZE =
     sizeof(version) + sizeof(gpassword) + sizeof(spassword) + sizeof(ckey) +
-    sizeof(time) + sizeof(nonce) + sizeof(solution);
+    sizeof(hdata) + sizeof(time) + sizeof(nonce) + sizeof(solution);
 };
 
 /**
@@ -457,6 +459,7 @@ public:
   /**
    * Mine a RandomX hash (synchronous).
    * @param myKey The key that gets the credit for the hashing work.
+   * @param hdata Application-defined component of the PoW puzzle.
    * @param targetKey The RandomX VM key to mine a hash for.
    * @param difficulty The minimum difficulty for the solution.
    * @param numThreads Number of threads to use for mining; default is 1. A
@@ -468,7 +471,7 @@ public:
    * `version`, `password`, and `data`), or an empty optional if VM not found or
    * is not ready.
    */
-  std::optional<MinxProveWork> proveWork(const Hash& myKey,
+  std::optional<MinxProveWork> proveWork(const Hash& myKey, const Hash& hdata,
                                          const Hash& targetKey, int difficulty,
                                          int numThreads = 1, int maxVMs = 1);
 

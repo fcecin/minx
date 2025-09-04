@@ -118,17 +118,18 @@ The `POW_DATA` data packet's format depends on the value of `ENGINE_ID`.
 If `ENGINE_ID` is `0x0` (the default engine), `POW_DATA` has the following format:
 
 - `uint8_t[32] CKEY`: A 256-bit secure hash over some cryptographic public key controlled by the sender (or the public key itself, if it happens to be 256 bits long); part of the PoW puzzle.
+- `uint8_t[32] HDATA`: Application-defined 256-bit value that is part of the PoW puzzle; can be used to store a 256-bit secure hash computed over `DATA`.
 - `uint64_t TIME`: Timestamp of the PoW puzzle.
 - `uint64_t NONCE`: PoW puzzle nonce.
-- `uint8_t[32] SOLUTION`: RandomX hash over the concatenation of `CKEY`, `TIME`, `NONCE`.
+- `uint8_t[32] SOLUTION`: RandomX hash over the concatenation of `CKEY`, `HDATA`, `TIME`, `NONCE`.
 
 The protocol does not specify an acknowledgement or return message for `PROVE_WORK`. Such a facility can be provided by the application or a protocol extension. For example, the application can choose to check for some kind of credit balance at the remote node and just keep resubmitting proofs until it increases. Or the application can just blindly resubmit `PROVE_WORK` datagrams a certain number of times, or resort to recent proof resubmission if other operations are denied due to a lack of credit. In any case, the receiver should generally not penalise the sender for a double-spend attempt, since looking up `SOLUTION` against a record of previously spent solutions should be a fast operation.
 
 The receiver is responsible for detecting solutions that are correct but that need to be rejected because the puzzle difficulty is not high enough to justify tracking its solution.
 
-MINX does not specify a cryptographic signature for `PROVE_WORK` messages, as there isn't a fundamental need to authenticate any of its fields. The solution cannot be stolen, since the solution is bound to `CKEY`. As for impersonating a `CKEY` for griefing, this is prevented if the application does not penalize a `CKEY` for an invalid request (as an attacker might as well just generate disposable keypairs) and instead relies on MINX's sender address filters.
+MINX does not specify a cryptographic signature for `PROVE_WORK` messages, as there isn't a fundamental need to authenticate any of its fields. The solution cannot be stolen, since the solution is bound to `CKEY`. As for impersonating a `CKEY` for griefing, that is prevented if the application does not penalize a `CKEY` for an invalid request (as an attacker might as well just generate disposable keypairs) and instead relies on MINX's sender address filters.
 
-If the application has any need for cryptography or any other kind of expensive verification or decoding, it can make use of it in the `DATA` field. For example, the `DATA` field can have a cryptographic signature over the entire message, or it can contain a short encrypted message. In that case, the application can defend itself from any kind of replay or spam attack in the `DATA` field by first ensuring that the provided PoW solution is valid. The PoW double-spend check also filters regular duplicate packets.
+The `HDATA` field is part of the PoW puzzle and is free to use by the application. For example, the application can bind `DATA` to `SOLUTION` by computing a 256-bit secure hash over `DATA` and relaying it via `HDATA`. In that case, the application can defend itself from spam attacks in the `DATA` field by first ensuring that the provided PoW solution is valid. The hash function to be used, hash computation and verification are left to the application. The PoW double-spend check also filters regular duplicate packets, so a secure hash over `DATA` in `HDATA` also prevents `DATA` replay attacks.
 
 If the application finds the message to be spam, the sender address can be penalized.
 

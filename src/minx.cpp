@@ -2,7 +2,7 @@
 
 namespace minx {
 
-const size_t HASH_INPUT_SIZE = sizeof(minx::Hash) + sizeof(uint64_t) * 2;
+const size_t HASH_INPUT_SIZE = sizeof(minx::Hash) * 2 + sizeof(uint64_t) * 2;
 
 template <typename T> class AtomicDec {
 public:
@@ -119,8 +119,8 @@ void Minx::sendMessage(const SockAddr& addr, const MinxMessage& msg) {
 }
 
 void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
-  auto buf =
-    std::make_shared<minx::VectorBuffer>(1 + MinxGetInfo::SIZE + msg.data.size());
+  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxGetInfo::SIZE +
+                                                  msg.data.size());
   buf->put<uint8_t>(MINX_GET_INFO);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -132,8 +132,8 @@ void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
 }
 
 void Minx::sendInfo(const SockAddr& addr, const MinxInfo& msg) {
-  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxInfo::SIZE +
-                                                  msg.data.size());
+  auto buf =
+    std::make_shared<minx::VectorBuffer>(1 + MinxInfo::SIZE + msg.data.size());
   buf->put<uint8_t>(MINX_INFO);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -158,6 +158,7 @@ void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
   }
   buf->put(msg.spassword);
   buf->put(msg.ckey);
+  buf->put(msg.hdata);
   buf->put(msg.time);
   buf->put(msg.nonce);
   buf->put(msg.solution);
@@ -275,6 +276,7 @@ void Minx::verifyPoWs(const size_t limit) {
 
     minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
     input_buffer.put(work_item.ckey);
+    input_buffer.put(work_item.hdata);
     input_buffer.put(work_item.time);
     input_buffer.put(work_item.nonce);
     Hash calculated_hash;
@@ -345,10 +347,9 @@ bool Minx::destroyVM(const Hash& key) {
   return true;
 }
 
-std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
-                                             const Hash& targetKey,
-                                             int difficulty, int numThreads,
-                                             int maxVMs) {
+std::optional<MinxProveWork>
+Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
+                int difficulty, int numThreads, int maxVMs) {
   std::shared_ptr<PoWEngine> engine_ptr;
   {
     std::lock_guard lock(vmsMutex_);
@@ -385,6 +386,7 @@ std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
 
         minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
         input_buffer.put(myKey);
+        input_buffer.put(hdata);
         input_buffer.put(time);
         input_buffer.put(nonce);
         Hash solution_hash;
@@ -396,8 +398,8 @@ std::optional<MinxProveWork> Minx::proveWork(const Hash& myKey,
             solution_found.exchange(true, std::memory_order_acq_rel);
           if (!already_found) {
             std::lock_guard<std::mutex> lock(result_mutex);
-            result.emplace(
-              MinxProveWork{0, 0, 0, myKey, time, nonce, solution_hash, {}});
+            result.emplace(MinxProveWork{
+              0, 0, 0, myKey, hdata, time, nonce, solution_hash, {}});
           }
           break;
         }
@@ -546,6 +548,7 @@ void Minx::onReceive(const boost::system::error_code& error,
         const uint64_t gpassword = buffer_.get<uint64_t>();
         const uint64_t spassword = buffer_.get<uint64_t>();
         Hash ckey = buffer_.get<Hash>();
+        Hash hdata = buffer_.get<Hash>();
         const uint64_t time = buffer_.get<uint64_t>();
         const uint64_t nonce = buffer_.get<uint64_t>();
         Hash solution = buffer_.get<Hash>();
@@ -558,7 +561,7 @@ void Minx::onReceive(const boost::system::error_code& error,
             break;
           }
         }
-        MinxProveWork msg{version, gpassword, spassword, ckey,
+        MinxProveWork msg{version, gpassword, spassword, ckey, hdata,
                           time,    nonce,     solution,  data};
         {
           std::lock_guard lock(workMutex_);

@@ -109,7 +109,7 @@ int main() {
                 << " threads..." << std::endl;
       auto start_time = std::chrono::steady_clock::now();
       auto pow_template_opt = minx_instance_->proveWork(
-        my_ckey_, msg.skey, msg.difficulty, numThreads);
+        my_ckey_, {}, msg.skey, msg.difficulty, numThreads);
       auto end_time = std::chrono::steady_clock::now();
 
       if (!pow_template_opt) {
