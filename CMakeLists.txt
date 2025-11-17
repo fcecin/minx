@@ -78,3 +78,12 @@ option(MINX_BUILD_EXAMPLES "Build examples" ON)
 if(MINX_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+
+# minx tests
+
+option(MINX_BUILD_TESTS "Build unit tests" ON)
+
+if(MINX_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

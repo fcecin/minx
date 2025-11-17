@@ -440,15 +440,24 @@ public:
    * example, dropping old buckets or inserting new buckets. This method must be
    * called before `verifyPoWs` (and `replayPoW` calls if they are not called
    * right after the Minx constructor).
+   * @param epochSecs Current time in seconds since epoch to use as the current
+   * time. If `0` (default), get the current time from the system clock.
+   * @return Earliest time in seconds since epoch that can be stored in the
+   * double-spend cache. Earlier solution times are too old and won't be
+   * spendable at all in any case. The application can safely delete any
+   * persisted PoWs older than this.
    */
-  void updatePoWDoubleSpendCache();
+  uint64_t updatePoWDoubleSpendCache(uint64_t epochSecs = 0);
 
   /**
    * Replay a persisted PoW solution into the double-spend cache.
    * @param time The persisted MinxProveWork::time field.
    * @param solution The persisted MinxProveWork::solution field.
+   * @return `true` if replay was successful, `false` if the given time
+   * falls outside of the cache or the solution was already present
+   * (double-spend).
    */
-  void replayPoW(const uint64_t time, const Hash& solution);
+  bool replayPoW(const uint64_t time, const Hash& solution);
 
   /**
    * Verify any pending incoming PoWs.

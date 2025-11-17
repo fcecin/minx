@@ -28,7 +28,10 @@ Minx::Minx(MinxListener* listener, int randomXThreads, uint64_t spendSlotSize)
 
 Minx::~Minx() {
   closeSocket();
-  stopWorker_.store(true);
+  {
+    std::lock_guard lock(queueMutex_);
+    stopWorker_.store(true);
+  }
   queueCondVar_.notify_one();
   if (workerThread_.joinable()) {
     workerThread_.join();
@@ -181,41 +184,49 @@ void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
   doSocketSend(addr, buf);
 }
 
-void Minx::updatePoWDoubleSpendCache() {
+uint64_t Minx::updatePoWDoubleSpendCache(uint64_t epochSecs) {
   std::lock_guard lock(verifyPoWsMutex_);
-  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                     std::chrono::system_clock::now().time_since_epoch())
-                     .count();
+  uint64_t now = epochSecs;
+  if (!now) {
+    now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+  }
   const uint64_t current_slot_time = (now / spendSlotSize_) * spendSlotSize_;
-  if (current_slot_time < spendBaseTime_ ||
-      current_slot_time >= spendBaseTime_ + spend_.size() * spendSlotSize_) {
+  const uint64_t target_base_time = current_slot_time - spendSlotSize_;
+  if (target_base_time < spendBaseTime_ ||
+      target_base_time >= spendBaseTime_ + (spend_.size() * spendSlotSize_)) {
     spend_.clear();
-    spendBaseTime_ = current_slot_time;
+    spendBaseTime_ = target_base_time;
+    spend_.emplace_back();
     spend_.emplace_back();
     spend_.emplace_back();
   } else {
-    const size_t current_slot_idx =
-      (current_slot_time - spendBaseTime_) / spendSlotSize_;
-    if (current_slot_idx == spend_.size() - 1) {
+    const uint64_t next_slot_time = current_slot_time + spendSlotSize_;
+    size_t needed_idx = (next_slot_time - spendBaseTime_) / spendSlotSize_;
+    while (spend_.size() <= needed_idx) {
       spend_.emplace_back();
     }
+    while (spendBaseTime_ < target_base_time) {
+      if (!spend_.empty()) {
+        spend_.pop_front();
+      }
+      spendBaseTime_ += spendSlotSize_;
+    }
   }
-  while (spend_.size() > 2) {
-    spend_.pop_front();
-    spendBaseTime_ += spendSlotSize_;
-  }
+  return spendBaseTime_;
 }
 
-void Minx::replayPoW(const uint64_t time, const Hash& solution) {
+bool Minx::replayPoW(const uint64_t time, const Hash& solution) {
   std::lock_guard lock(verifyPoWsMutex_);
   if (time < spendBaseTime_) {
-    return;
+    return false;
   }
   size_t slot_index = (time - spendBaseTime_) / spendSlotSize_;
   if (slot_index >= spend_.size()) {
-    return;
+    return false;
   }
-  spend_[slot_index].insert(solution);
+  return spend_[slot_index].insert(solution).second;
 }
 
 void Minx::verifyPoWs(const size_t limit) {
@@ -649,8 +660,11 @@ void Minx::workerLoop() {
       queueCondVar_.wait(lock, [this] {
         return !pendingInitializations_.empty() || stopWorker_;
       });
-      if (stopWorker_ && pendingInitializations_.empty()) {
+      if (stopWorker_) {
         return;
+      }
+      if (pendingInitializations_.empty()) {
+        continue;
       }
       keyToInitialize = pendingInitializations_.front();
       pendingInitializations_.pop();
