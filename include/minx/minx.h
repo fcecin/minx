@@ -178,6 +178,8 @@ public:
 
   /**
    * Receive PROVE_WORK message with a validated work item.
+   * Application should persist `msg.time` and `msg.solution` in a double-spend
+   * database for fault-tolerance (assuming the server key is kept the same).
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    * @param difficulty Precomputed difficulty.
@@ -208,17 +210,23 @@ public:
 class Minx {
 private:
   // TODO:
+  // - add parallel verifyPoWs support
   // - use multiple buffer_ & remoteAddr_ to receive
   // - move packet processing outside of onReceive(); either to an internal
   // thread pool or just use the io_context_
-  // - don't allocate new buffers for serializing each outgoing message
   // - remove handlerCount_ & enable_shared_from_this for a MinxImpl
-  ArrayBuffer<0x10000> buffer_;
+  static constexpr size_t MAX_UDP_BYTES = 0x10000;
+  static constexpr size_t SEND_BUFFER_POOL_MAX_SIZE = 256;
+
+  ArrayBuffer<MAX_UDP_BYTES> buffer_;
   MinxListener* listener_ = nullptr;
   IOContext* io_context_ = nullptr;
   std::unique_ptr<boost::asio::strand<IOContext::executor_type>> strand_;
   std::atomic<uint64_t> handlerCount_ = 0;
   std::shared_mutex socketStateMutex_;
+
+  std::mutex sendBufferPoolMutex_;
+  std::vector<std::shared_ptr<minx::Buffer>> sendBufferPool_;
 
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
   SockAddr remoteAddr_;
@@ -257,6 +265,10 @@ private:
   std::mutex genMutex_;
   std::mt19937_64 gen_;
   std::uniform_int_distribution<uint64_t> genDistrib_;
+
+  std::shared_ptr<minx::Buffer> acquireSendBuffer();
+
+  void releaseSendBuffer(std::shared_ptr<minx::Buffer> buf);
 
   void doSocketSend(const SockAddr& addr,
                     const std::shared_ptr<minx::Buffer>& buf);
@@ -424,8 +436,25 @@ public:
                        const uint8_t code = MINX_APPLICATION_DEFAULT);
 
   /**
+   * Checks if the double-spend cache's bucket list should be updated by, for
+   * example, dropping old buckets or inserting new buckets. This method must be
+   * called before `verifyPoWs` (and `replayPoW` calls if they are not called
+   * right after the Minx constructor).
+   */
+  void updatePoWDoubleSpendCache();
+
+  /**
+   * Replay a persisted PoW solution into the double-spend cache.
+   * @param time The persisted MinxProveWork::time field.
+   * @param solution The persisted MinxProveWork::solution field.
+   */
+  void replayPoW(const uint64_t time, const Hash& solution);
+
+  /**
    * Verify any pending incoming PoWs.
    * Pending PoWs are only verified after the VM for our key is ready.
+   * @param limit Maximum number of PoW hashes to validate in this call, or `0`
+   * to validate all pending PoW hashes.
    */
   void verifyPoWs(const size_t limit = 0);
 

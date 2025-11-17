@@ -212,6 +212,7 @@ int main() {
     server_ioc.poll();
     client_ioc.poll();
 
+    server_minx.updatePoWDoubleSpendCache();
     server_minx.verifyPoWs();
 
     lastError = server_minx.getLastError();

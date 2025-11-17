@@ -23,6 +23,7 @@ Minx::Minx(MinxListener* listener, int randomXThreads, uint64_t spendSlotSize)
   }
   buffer_.setSize(0x10000);
   workerThread_ = std::thread(&Minx::workerLoop, this);
+  updatePoWDoubleSpendCache();
 }
 
 Minx::~Minx() {
@@ -92,8 +93,7 @@ void Minx::closeSocket() {
 }
 
 void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
-  auto buf =
-    std::make_shared<minx::VectorBuffer>(1 + MinxInit::SIZE + msg.data.size());
+  auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_INIT);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -105,8 +105,7 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
 }
 
 void Minx::sendMessage(const SockAddr& addr, const MinxMessage& msg) {
-  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxMessage::SIZE +
-                                                  msg.data.size());
+  auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_MESSAGE);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -119,8 +118,7 @@ void Minx::sendMessage(const SockAddr& addr, const MinxMessage& msg) {
 }
 
 void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
-  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxGetInfo::SIZE +
-                                                  msg.data.size());
+  auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_GET_INFO);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -132,8 +130,7 @@ void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
 }
 
 void Minx::sendInfo(const SockAddr& addr, const MinxInfo& msg) {
-  auto buf =
-    std::make_shared<minx::VectorBuffer>(1 + MinxInfo::SIZE + msg.data.size());
+  auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_INFO);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -148,8 +145,7 @@ void Minx::sendInfo(const SockAddr& addr, const MinxInfo& msg) {
 }
 
 void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
-  auto buf = std::make_shared<minx::VectorBuffer>(1 + MinxProveWork::SIZE +
-                                                  msg.data.size());
+  auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_PROVE_WORK);
   buf->put(msg.version);
   buf->put(msg.gpassword);
@@ -171,18 +167,55 @@ void Minx::sendApplication(const SockAddr& addr, const Bytes& data,
   if (code > MINX_APPLICATION_MAX) {
     throw std::runtime_error("invalid application message code");
   }
-  auto buf = std::make_shared<minx::VectorBuffer>(1 + data.size());
+  auto buf = acquireSendBuffer();
   buf->put(code);
   buf->put(logkv::bytesAsSpan(data));
   doSocketSend(addr, buf);
 }
 
 void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
-  auto buf = std::make_shared<minx::VectorBuffer>(2 + data.size());
+  auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_EXTENSION);
   buf->put<uint8_t>(0x0);
   buf->put(logkv::bytesAsSpan(data));
   doSocketSend(addr, buf);
+}
+
+void Minx::updatePoWDoubleSpendCache() {
+  std::lock_guard lock(verifyPoWsMutex_);
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+  const uint64_t current_slot_time = (now / spendSlotSize_) * spendSlotSize_;
+  if (current_slot_time < spendBaseTime_ ||
+      current_slot_time >= spendBaseTime_ + spend_.size() * spendSlotSize_) {
+    spend_.clear();
+    spendBaseTime_ = current_slot_time;
+    spend_.emplace_back();
+    spend_.emplace_back();
+  } else {
+    const size_t current_slot_idx =
+      (current_slot_time - spendBaseTime_) / spendSlotSize_;
+    if (current_slot_idx == spend_.size() - 1) {
+      spend_.emplace_back();
+    }
+  }
+  while (spend_.size() > 2) {
+    spend_.pop_front();
+    spendBaseTime_ += spendSlotSize_;
+  }
+}
+
+void Minx::replayPoW(const uint64_t time, const Hash& solution) {
+  std::lock_guard lock(verifyPoWsMutex_);
+  if (time < spendBaseTime_) {
+    return;
+  }
+  size_t slot_index = (time - spendBaseTime_) / spendSlotSize_;
+  if (slot_index >= spend_.size()) {
+    return;
+  }
+  spend_[slot_index].insert(solution);
 }
 
 void Minx::verifyPoWs(const size_t limit) {
@@ -196,43 +229,14 @@ void Minx::verifyPoWs(const size_t limit) {
     }
     key = key_;
   }
-  std::shared_ptr<PoWEngine> engine_ptr;
-  {
-    std::lock_guard lock(vmsMutex_);
-    auto it = vms_.find(key);
-    if (it != vms_.end()) {
-      engine_ptr = it->second;
-    }
-  }
+  std::shared_ptr<PoWEngine> engine_ptr = getVM(key);
   if (!engine_ptr || !engine_ptr->isReady()) {
     return;
   }
   randomx_vm* vm = engine_ptr->getVM();
-
-  {
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-    const uint64_t current_slot_time = (now / spendSlotSize_) * spendSlotSize_;
-    if (current_slot_time < spendBaseTime_ ||
-        current_slot_time >= spendBaseTime_ + spend_.size() * spendSlotSize_) {
-      spend_.clear();
-      spendBaseTime_ = current_slot_time;
-      spend_.emplace_back();
-      spend_.emplace_back();
-    } else {
-      const size_t current_slot_idx =
-        (current_slot_time - spendBaseTime_) / spendSlotSize_;
-      if (current_slot_idx == spend_.size() - 1) {
-        spend_.emplace_back();
-      }
-    }
-    while (spend_.size() > 2) {
-      spend_.pop_front();
-      spendBaseTime_ += spendSlotSize_;
-    }
+  if (!vm) { // never happens
+    throw std::runtime_error("verifyPoWs() got randomx_vm* nullptr");
   }
-
   size_t verified_count = 0;
   while (limit == 0 || verified_count < limit) {
     std::optional<std::pair<MinxProveWork, SockAddr>> work_item_opt;
@@ -434,6 +438,26 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
 
 void Minx::banAddress(const IPAddr& addr) { ipFilter_.reportIP(addr); }
 
+std::shared_ptr<minx::Buffer> Minx::acquireSendBuffer() {
+  std::unique_lock lock(sendBufferPoolMutex_);
+  if (!sendBufferPool_.empty()) {
+    auto buf = std::move(sendBufferPool_.back());
+    sendBufferPool_.pop_back();
+    lock.unlock();
+    buf->clear();
+    return buf;
+  }
+  lock.unlock();
+  return std::make_shared<minx::VectorBuffer>(MAX_UDP_BYTES);
+}
+
+void Minx::releaseSendBuffer(std::shared_ptr<minx::Buffer> buf) {
+  std::lock_guard lock(sendBufferPoolMutex_);
+  if (sendBufferPool_.size() < SEND_BUFFER_POOL_MAX_SIZE) {
+    sendBufferPool_.push_back(std::move(buf));
+  }
+}
+
 void Minx::doSocketSend(const SockAddr& addr,
                         const std::shared_ptr<minx::Buffer>& buf) {
   std::shared_lock lock(socketStateMutex_);
@@ -442,7 +466,9 @@ void Minx::doSocketSend(const SockAddr& addr,
   }
   socket_->async_send_to(
     buf->getAsioBufferToRead(), addr,
-    [buf](const boost::system::error_code&, std::size_t) {});
+    [this, buf](const boost::system::error_code&, std::size_t) {
+      this->releaseSendBuffer(buf);
+    });
 }
 
 void Minx::receive() {
