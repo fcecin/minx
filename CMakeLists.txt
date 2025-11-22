@@ -1,5 +1,5 @@
 # This CMake project will only produce the build/libminx.a static library.
-# examples/ have their own build system that depends on this.
+# examples/ and tests/ have their own build system that depends on this.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include(FetchContent)
+
+# If no network connection, just use cached FetchContent deps
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
 # Threads
 

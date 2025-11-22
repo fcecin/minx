@@ -77,6 +77,10 @@ public:
     s_ = s;
   }
 
+  void setSizeToCapacity() {
+    s_ = buf_.size();
+  }
+
   size_t getWritePos() const { return w_; }
 
   void setWritePos(size_t w) {

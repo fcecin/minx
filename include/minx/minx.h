@@ -48,7 +48,8 @@ enum {
   MINX_ERROR_UNTIMELY_POW = 0x08,
   MINX_ERROR_MISMATCHED_POW = 0x09,
   MINX_ERROR_BAD_INIT = 0x0A,
-  MINX_ERROR_BAD_MESSAGE = 0x0B
+  MINX_ERROR_BAD_MESSAGE = 0x0B,
+  MINX_ERROR_UNEXPECTED = 0xFF
 };
 
 /**
@@ -210,36 +211,58 @@ public:
 class Minx {
 private:
   // TODO:
-  // - add parallel verifyPoWs support
-  // - use multiple buffer_ & remoteAddr_ to receive
-  // - move packet processing outside of onReceive(); either to an internal
-  // thread pool or just use the io_context_
   // - remove handlerCount_ & enable_shared_from_this for a MinxImpl
-  static constexpr size_t MAX_UDP_BYTES = 0x10000;
-  static constexpr size_t SEND_BUFFER_POOL_MAX_SIZE = 256;
 
-  ArrayBuffer<MAX_UDP_BYTES> buffer_;
-  MinxListener* listener_ = nullptr;
-  IOContext* io_context_ = nullptr;
-  std::unique_ptr<boost::asio::strand<IOContext::executor_type>> strand_;
-  std::atomic<uint64_t> handlerCount_ = 0;
-  std::shared_mutex socketStateMutex_;
+  // Protocols implemented on Minx shouldn't push the total packet size over the
+  // guaranteed IPv6 MTU of 1280 bytes in any case. All incoming packets with
+  // size exactly MAX_UDP_BYTES are assumed to be truncated and are dropped
+  // (an application should not be generating packets of size anywhere near
+  // MAX_UDP_BYTES anyway).
+  static constexpr size_t MAX_UDP_BYTES = 2048;
+  static constexpr size_t SEND_BUFFER_POOL_MAX_SIZE = 256;
+  static constexpr size_t RECV_BUFFER_ARRAY_SIZE = 16384;
+
+  struct RecvSlot {
+    SockAddr remoteAddr_;
+    bool busy_ = false;
+  };
+  using RecvBuffersInfo = std::array<RecvSlot, RECV_BUFFER_ARRAY_SIZE>;
+  using RecvBuffers = std::array<ArrayBuffer<MAX_UDP_BYTES>, RECV_BUFFER_ARRAY_SIZE>;
+
+  std::unique_ptr<RecvBuffers> recvBuffers_;
+  RecvBuffersInfo recvBuffersInfo_;
+  std::mutex recvBuffersMutex_;
+  size_t recvBuffersIndex_ = 0;
 
   std::mutex sendBufferPoolMutex_;
   std::vector<std::shared_ptr<minx::Buffer>> sendBufferPool_;
 
+  MinxListener* listener_ = nullptr;
+
+  std::shared_mutex socketStateMutex_;
+
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
-  SockAddr remoteAddr_;
+
+  IOContext* netIO_ = nullptr;
+  std::unique_ptr<boost::asio::strand<IOContext::executor_type>> netIOStrand_;
+  std::atomic<uint64_t> netIOHandlerCount_ = 0;
+  std::unique_ptr<boost::asio::steady_timer> netIORetryTimer_;
+
+  IOContext* taskIO_ = nullptr;
+  std::atomic<uint64_t> taskIOHandlerCount_ = 0;
+  std::unique_ptr<boost::asio::executor_work_guard<IOContext::executor_type>>
+    taskIOWorkGuard_;
 
   Hash key_;
   bool keySet_ = false;
   std::mutex keyMutex_;
 
-  std::map<Hash, std::shared_ptr<PoWEngine>> vms_;
-  std::mutex vmsMutex_;
+  std::map<Hash, std::shared_ptr<PoWEngine>> engines_;
+  std::mutex enginesMutex_;
 
   std::atomic<bool> useDataset_ = true;
-  int randomXThreads_;
+  int randomXInitThreads_;
+  int randomXVMsToKeep_;
   std::queue<Hash> pendingInitializations_;
   std::mutex queueMutex_;
   std::condition_variable queueCondVar_;
@@ -251,7 +274,7 @@ private:
 
   uint8_t minDiff_ = 1;
 
-  std::mutex verifyPoWsMutex_; // also protects spend_
+  std::shared_mutex spendMutex_;
   uint64_t spendSlotSize_;
   uint64_t spendBaseTime_ = 0;
   std::deque<std::unordered_set<Hash, SecureHashHasher>> spend_;
@@ -275,8 +298,10 @@ private:
 
   void receive();
 
-  void onReceive(const boost::system::error_code& error,
-                 size_t bytes_transferred);
+  void onReceivePacket(size_t bufIndex, const boost::system::error_code& error,
+                       size_t bytes_transferred);
+
+  void onProcessPacket(size_t slotIndex, size_t bytes_transferred);
 
   void workerLoop();
 
@@ -284,13 +309,16 @@ public:
   /**
    * Constructor.
    * @param listener The `MinxListener` to use.
-   * @param randomXThreads Number of threads to use when initializing a RandomX
-   * dataset (if less than 1, will use thread::hardware_concurrency()).
+   * @param randomXInitThreads Number of threads to use when initializing a
+   * RandomX dataset (if less than 1, will use thread::hardware_concurrency()).
    * @param spendSlotSize Duration of each double-spend time slot in seconds
    * (default: 1 hour).
+   * @param randomXVmsToKeep Maximum number of internal `randomx_vm` objects to
+   * keep inside each Minx::getPoWEngine() (if less than 1, will use
+   * thread::hardware_concurrency * 2).
    */
-  Minx(MinxListener* listener, int randomXThreads = 0,
-       uint64_t spendSlotSize = 60 * 60);
+  Minx(MinxListener* listener, int randomXInitThreads = 0,
+       uint64_t spendSlotSize = 60 * 60, int randomXVmsToKeep = 0);
 
   /**
    * Destructor.
@@ -371,13 +399,17 @@ public:
 
   /**
    * Open the UDP socket if one was not previously opened.
-   * The `boost::asio::io_context` is externally-provided, which allows the
-   * client full control of network processing (threaded vs single-thread, etc).
-   * @param ioc The `boost::asio::io_context` to use.
+   * The `boost::asio::io_context` objects are externally-provided, which gives
+   * the client full control over threading.
+   * NOTE: Using more than one thread to run `netIO` currently makes no sense
+   * since all operations (send, receive) are serialized using a strand.
+   * NOTE: Threads running `taskIO` can invoke the `MinxListener` callbacks.
    * @param sockaddr The local IP address and port to bind to.
+   * @param netIO The `boost::asio::io_context` for a net recv/send thread.
+   * @param taskIO The `boost::asio::io_context` for message processing threads.
    * @throws A runtime exception on any error.
    */
-  void openSocket(IOContext& ioc, const SockAddr& addr);
+  void openSocket(const SockAddr& addr, IOContext& netIO, IOContext& taskIO);
 
   /**
    * Close the UDP socket if one was previously opened.
@@ -447,7 +479,7 @@ public:
    * spendable at all in any case. The application can safely delete any
    * persisted PoWs older than this.
    */
-  uint64_t updatePoWDoubleSpendCache(uint64_t epochSecs = 0);
+  uint64_t updatePoWSpendCache(uint64_t epochSecs = 0);
 
   /**
    * Replay a persisted PoW solution into the double-spend cache.
@@ -460,39 +492,43 @@ public:
   bool replayPoW(const uint64_t time, const Hash& solution);
 
   /**
-   * Verify any pending incoming PoWs.
-   * Pending PoWs are only verified after the VM for our key is ready.
+   * Verify any pending incoming PoWs (can be called by multiple threads).
+   * Pending PoWs are only verified after the server key's PoWEngine is ready.
    * @param limit Maximum number of PoW hashes to validate in this call, or `0`
    * to validate all pending PoW hashes.
+   * @return If zero or greater, number of PoW verification jobs performed,
+   * otherwise a temporary error occurred (no PoWEngine, or engine not ready).
    */
-  void verifyPoWs(const size_t limit = 0);
+  int verifyPoWs(const size_t limit = 0);
 
   /**
-   * Create a RandomX VM (asynchronous).
-   * @param key The RandomX VM key.
+   * Create a RandomX PoWEngine (asynchronous).
+   * @param key The RandomX PoWEngine key.
    */
-  void createVM(const Hash& key);
+  void createPoWEngine(const Hash& key);
 
   /**
-   * Get a RandomX VM.
-   * @param key The RandomX VM key.
+   * Get a RandomX PoWEngine.
+   * A PoWEngine is a wrapper for the RandomX dataset and cache, and it can
+   * allocate multiple `randomx_vm` objects to provide multithreaded hashing.
+   * @param key The RandomX PoWEngine key.
    */
-  std::shared_ptr<PoWEngine> getVM(const Hash& key);
+  std::shared_ptr<PoWEngine> getPoWEngine(const Hash& key);
 
   /**
-   * Check if a RandomX VM exists and is ready or throw on any failure.
-   * @param key The RandomX VM key.
-   * @return `true` if the VM exists and is ready, `false` otherwise.
-   * @throws `runtime_error` if VM state is Error or Aborted.
+   * Check if a RandomX PoWEngine exists and is ready or throw on any failure.
+   * @param key The RandomX PowEngine key.
+   * @return `true` if the PowEngine exists and is ready, `false` otherwise.
+   * @throws `runtime_error` if PoWEngine state is Error or Aborted.
    */
-  bool checkVM(const Hash& key);
+  bool checkPoWEngine(const Hash& key);
 
   /**
-   * Destroy a RandomX VM.
-   * @param key The RandomX VM key.
-   * @return `true` if the VM was found and deleted, `false` otherwise.
+   * Destroy a RandomX PoWEngine.
+   * @param key The RandomX PoWEngine key.
+   * @return `true` if the PoWEngine was found and deleted, `false` otherwise.
    */
-  bool destroyVM(const Hash& key);
+  bool destroyPoWEngine(const Hash& key);
 
   /**
    * Mine a RandomX hash (synchronous).
@@ -505,9 +541,6 @@ public:
    * @param startNonce Starting nonce value for solution search (default: 0).
    * @param maxIters Maximum number of solutions to try; if zero, will try until
    * a solution is found.
-   * @param maxVms Maximum number of RandomX VMs to keep in memory after mining;
-   * default is 1 (one VM needs to be allocated per thread requested). A value
-   * of 0 means keeping all VMs already allocated.
    * @return Proof-of-Work template message with the mined solution, or an empty
    * optional if the solution was not found in `maxIters` iterations.
    * @throws std::runtime_error if VM not found or is not ready.
@@ -516,7 +549,7 @@ public:
                                          const Hash& targetKey, int difficulty,
                                          int numThreads = 1,
                                          uint64_t startNonce = 0,
-                                         uint64_t maxIters = 0, int maxVMs = 1);
+                                         uint64_t maxIters = 0);
 
   /**
    * Add an IP address pattern to the IP filter.

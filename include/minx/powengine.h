@@ -21,18 +21,63 @@ enum class PoWEngineState {
 };
 
 /**
+ * Lifetime wrapper for a single RandomX VM.
+ */
+class RandomXVM {
+public:
+  RandomXVM(randomx_vm* vm) : vm_(vm) {
+    if (!vm_) {
+      throw std::runtime_error(
+        "RandomXVM cannot be constructed from a randomx_vm* nullptr");
+    }
+  }
+  ~RandomXVM() {
+    randomx_destroy_vm(vm_);
+    vm_ = nullptr;
+  }
+  randomx_vm* vm() { return vm_; }
+
+private:
+  randomx_vm* vm_;
+};
+
+/**
+ * Lifetime wrapper for a RandomXVM being PoWEngine::releaseVM()'d back into the
+ * VM pool. Pending releasers will block the PoWEngine destructor.
+ */
+class PoWEngine;
+class RandomXVMReleaser {
+public:
+  RandomXVMReleaser(PoWEngine* powEngine, std::shared_ptr<RandomXVM> rxvmSptr);
+  ~RandomXVMReleaser();
+  randomx_vm* vm() { return rxvmSptr_ ? rxvmSptr_->vm() : nullptr; }
+
+private:
+  PoWEngine* powEngine_;
+  std::shared_ptr<RandomXVM> rxvmSptr_;
+};
+
+/**
  * RandomX cache, dataset, and VMs for a given key.
  */
 class PoWEngine {
 public:
-  explicit PoWEngine(std::span<const uint8_t> key, bool full_mem = true)
-      : is_full_mem_(full_mem), key_(key.begin(), key.end()) {}
+  explicit PoWEngine(std::span<const uint8_t> key, bool full_mem = true,
+                     int vmsToKeep = 256)
+      : is_full_mem_(full_mem), key_(key.begin(), key.end()) {
+    vmsToKeep_ = vmsToKeep;
+    if (vmsToKeep_ < 1) {
+      vmsToKeep = std::thread::hardware_concurrency() * 2;
+    }
+  }
 
   ~PoWEngine() {
-    destruction_requested_.store(true, std::memory_order_release);
-    while (state_.load(std::memory_order_acquire) ==
-           PoWEngineState::Initializing) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    destruction_requested_ = true;
+    while (state_ == PoWEngineState::Initializing) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (pendingReleasers_ > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     cleanup();
   }
@@ -58,14 +103,14 @@ public:
     if (!state_.compare_exchange_strong(expected,
                                         PoWEngineState::Initializing)) {
       while (getState() == PoWEngineState::Initializing) {
-        if (destruction_requested_.load(std::memory_order_acquire))
+        if (destruction_requested_)
           break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
       return isReady();
     }
     try {
-      if (destruction_requested_.load(std::memory_order_acquire)) {
+      if (destruction_requested_) {
         throw std::runtime_error("Initialization aborted before start.");
       }
       randomx_flags flags = randomx_get_flags();
@@ -109,26 +154,24 @@ public:
           throw;
         }
       }
-      if (destruction_requested_.load(std::memory_order_acquire)) {
+      if (destruction_requested_) {
         throw std::runtime_error(
           "Initialization aborted after dataset creation.");
       }
-      randomx_vm* initial_vm = randomx_create_vm(flags, cache_, dataset_);
-      if (initial_vm == nullptr)
-        throw std::runtime_error("Failed to create initial RandomX VM");
-      vms_.push_back(initial_vm);
-      state_.store(PoWEngineState::Ready, std::memory_order_release);
+      auto rxvmSptr = acquireVM();
+      releaseVM(rxvmSptr);
+      state_ = PoWEngineState::Ready;
       return true;
     } catch (const std::runtime_error& e) {
       error_message_ = e.what();
-      state_.store(PoWEngineState::Error, std::memory_order_release);
+      state_ = PoWEngineState::Error;
       cleanup();
       return false;
     }
   }
 
   PoWEngineState getState() const {
-    return state_.load(std::memory_order_acquire);
+    return state_;
   }
 
   bool isReady() const { return getState() == PoWEngineState::Ready; }
@@ -137,7 +180,17 @@ public:
 
   std::string getErrorMessage() const { return error_message_; }
 
-  randomx_vm* getVM(size_t index = 0) {
+  RandomXVMReleaser getVM() {
+    std::shared_ptr<RandomXVM> rxvmSptr;
+    try {
+      rxvmSptr = acquireVM();
+    } catch (const std::runtime_error& e) {
+      // rxvmSptr will be empty if failed to allocate randomx_vm*
+    }
+    return RandomXVMReleaser(this, rxvmSptr);
+  }
+
+  std::shared_ptr<RandomXVM> acquireVM() {
     if (!isReady()) {
       return nullptr;
     }
@@ -145,53 +198,56 @@ public:
     if (is_full_mem_) {
       flags |= RANDOMX_FLAG_FULL_MEM;
     }
-    std::lock_guard<std::mutex> lock(vms_mutex_);
-    while (index >= vms_.size()) {
-      randomx_vm* vm = randomx_create_vm(flags, cache_, dataset_);
-      if (vm == nullptr) {
-        throw std::runtime_error("Failed to create RandomX VM at index " +
-                                 std::to_string(vms_.size()));
-      }
-      vms_.push_back(vm);
+    std::unique_lock lock(vmPoolMutex_);
+    if (vmPool_.size() > 1024) {
+      throw std::runtime_error("Too many RandomX VMs were created for the same "
+                               "PoWEngine (this is likely a bug)");
     }
-    return vms_[index];
+    if (!vmPool_.empty()) {
+      auto rxvmSptr = std::move(vmPool_.back());
+      vmPool_.pop_back();
+      lock.unlock();
+      return rxvmSptr;
+    }
+    lock.unlock();
+    randomx_vm* rxvmPtr = randomx_create_vm(flags, cache_, dataset_);
+    if (rxvmPtr == nullptr) {
+      throw std::runtime_error("Failed to allocate a new RandomX VM");
+    }
+    return std::make_shared<RandomXVM>(rxvmPtr);
   }
 
-  void resizeVMs(size_t count) {
-    if (!isReady()) {
+  void releaseVM(std::shared_ptr<RandomXVM> rxvmSptr) {
+    if (!rxvmSptr)
       return;
-    }
-    std::lock_guard<std::mutex> lock(vms_mutex_);
-    if (count < vms_.size()) {
-      for (size_t i = count; i < vms_.size(); ++i) {
-        if (vms_[i] != nullptr) {
-          randomx_destroy_vm(vms_[i]);
-        }
-      }
-      vms_.resize(count);
+    std::lock_guard lock(vmPoolMutex_);
+    if (vmPool_.size() < vmsToKeep_) {
+      vmPool_.push_back(std::move(rxvmSptr));
     }
   }
 
 private:
   randomx_cache* cache_ = nullptr;
   randomx_dataset* dataset_ = nullptr;
-  std::vector<randomx_vm*> vms_;
-  std::mutex vms_mutex_;
 
   bool is_full_mem_ = false;
   std::vector<uint8_t> key_;
+
+  std::vector<std::shared_ptr<RandomXVM>> vmPool_;
+  std::mutex vmPoolMutex_;
+  int vmsToKeep_ = 0;
+
   std::atomic<PoWEngineState> state_ = PoWEngineState::Uninitialized;
   std::atomic<bool> destruction_requested_ = false;
   std::string error_message_;
 
+  friend class RandomXVMReleaser;
+  std::atomic<int64_t> pendingReleasers_ = 0;
+
   void cleanup() {
     {
-      std::lock_guard<std::mutex> lock(vms_mutex_);
-      for (randomx_vm* vm : vms_) {
-        if (vm)
-          randomx_destroy_vm(vm);
-      }
-      vms_.clear();
+      std::lock_guard<std::mutex> lock(vmPoolMutex_);
+      vmPool_.clear();
     }
     if (dataset_)
       randomx_release_dataset(dataset_);
@@ -204,10 +260,10 @@ private:
   }
 
   void move_from(PoWEngine&& other) {
-    std::lock_guard<std::mutex> lock(other.vms_mutex_);
+    std::lock_guard<std::mutex> lock(other.vmPoolMutex_);
     cache_ = other.cache_;
     dataset_ = other.dataset_;
-    vms_ = std::move(other.vms_);
+    vmPool_ = std::move(other.vmPool_);
     is_full_mem_ = other.is_full_mem_;
     key_ = std::move(other.key_);
     error_message_ = std::move(other.error_message_);

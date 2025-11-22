@@ -10,6 +10,4 @@ target_link_libraries(minxtests
   Boost::unit_test_framework
 )
 
-target_compile_definitions(minxtests PRIVATE "BOOST_TEST_MODULE=MinxTestSuite")
-
 add_test(NAME MinxTests COMMAND minxtests)

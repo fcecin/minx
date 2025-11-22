@@ -21,8 +21,10 @@ int main() {
 
   // 1. Setup Network and Listeners
   // ===================================
-  minx::IOContext server_ioc;
-  minx::IOContext client_ioc;
+  minx::IOContext server_net_ioc;
+  minx::IOContext server_task_ioc;
+  minx::IOContext client_net_ioc;
+  minx::IOContext client_task_ioc;
 
   minx::SockAddr server_addr(boost::asio::ip::address::from_string("127.0.0.1"),
                              8000);
@@ -44,17 +46,17 @@ int main() {
     bool isConnected(const minx::SockAddr& addr) override { return false; }
 
     void incomingGetInfo(const minx::SockAddr& addr,
-                      const minx::MinxGetInfo& msg) override {
+                         const minx::MinxGetInfo& msg) override {
       std::cout << "✅ Server: Received GET_INFO from "
                 << addr.address().to_string() << ":" << addr.port()
                 << std::endl;
-      minx::MinxInfo ack_msg = {
-        .version = 0,
-        .gpassword = minx_instance_->generatePassword(),
-        .spassword = msg.gpassword,
-        .difficulty = minx_instance_->getMinimumDifficulty(),
-        .skey = skey_,
-        .data = {}};
+      minx::MinxInfo ack_msg = {.version = 0,
+                                .gpassword = minx_instance_->generatePassword(),
+                                .spassword = msg.gpassword,
+                                .difficulty =
+                                  minx_instance_->getMinimumDifficulty(),
+                                .skey = skey_,
+                                .data = {}};
       minx_instance_->sendInfo(addr, ack_msg);
       std::cout << "  -> Server: Sent INFO." << std::endl;
     }
@@ -84,7 +86,7 @@ int main() {
     void setMinxInstance(minx::Minx* instance) { minx_instance_ = instance; }
 
     void incomingInfo(const minx::SockAddr& addr,
-                         const minx::MinxInfo& msg) override {
+                      const minx::MinxInfo& msg) override {
       std::cout << "✅ Client: Received INFO from server." << std::endl;
       std::cout << "  -> Server key: " << msg.skey << std::endl;
       std::cout << "  -> Generated password: " << msg.spassword << std::endl;
@@ -93,10 +95,10 @@ int main() {
       std::cout << "  -> Client: Creating VM for server's key (this may take a "
                    "moment)..."
                 << std::endl;
-      minx_instance_->createVM(msg.skey);
+      minx_instance_->createPoWEngine(msg.skey);
 
       // 2. Wait for the client's worker thread to finish initializing the VM.
-      while (!minx_instance_->checkVM(msg.skey)) {
+      while (!minx_instance_->checkPoWEngine(msg.skey)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
       std::cout << "  -> Client: VM is ready." << std::endl;
@@ -172,11 +174,11 @@ int main() {
   client_listener.setMinxInstance(&client_minx);
 
   try {
-    server_minx.openSocket(server_ioc, server_addr);
+    server_minx.openSocket(server_addr, server_net_ioc, server_task_ioc);
     std::cout << "  -> Server socket opened on "
               << server_addr.address().to_string() << ":" << server_addr.port()
               << std::endl;
-    client_minx.openSocket(client_ioc, client_addr);
+    client_minx.openSocket(client_addr, client_net_ioc, client_task_ioc);
     std::cout << "  -> Client socket opened on "
               << client_addr.address().to_string() << ":" << client_addr.port()
               << std::endl;
@@ -189,12 +191,11 @@ int main() {
   // ========================
   server_minx.setMinimumDifficulty(10);
   server_minx.setServerKey(server_key);
-  server_minx.createVM(server_key);
   std::cout
     << "  -> Server: Key set. Creating RandomX VM (this may take a moment)..."
     << std::endl;
-
-  while (!server_minx.checkVM(server_key)) {
+  server_minx.createPoWEngine(server_key);
+  while (!server_minx.checkPoWEngine(server_key)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   std::cout << "  -> Server: VM is ready." << std::endl;
@@ -209,23 +210,22 @@ int main() {
   // =====================
   uint64_t lastError, cLastError;
   while (!testFinished) {
-    server_ioc.poll();
-    client_ioc.poll();
-
-    server_minx.updatePoWDoubleSpendCache();
+    server_net_ioc.poll();
+    client_net_ioc.poll();
+    server_task_ioc.poll();
+    client_task_ioc.poll();
+    server_minx.updatePoWSpendCache();
     server_minx.verifyPoWs();
-
     lastError = server_minx.getLastError();
     if (lastError) {
       std::cout << "ERROR (server): " << lastError << std::endl;
       break;
     }
     cLastError = client_minx.getLastError();
-    if (lastError) {
+    if (cLastError) {
       std::cout << "ERROR (client): " << cLastError << std::endl;
       break;
     }
-
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
