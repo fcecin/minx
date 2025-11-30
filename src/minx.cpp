@@ -250,6 +250,86 @@ bool Minx::replayPoW(const uint64_t time, const Hash& solution) {
   return spend_[slot_index].insert(solution).second;
 }
 
+uint64_t Minx::filterPoW(const MinxProveWork& msg, const int difficulty) {
+  if (difficulty < minDiff_) {
+    return MINX_ERROR_LOW_DIFF;
+  }
+
+  bool forceSpendCacheUpdate = false;
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+  {
+    std::shared_lock lock(spendMutex_);
+    if (msg.time < spendBaseTime_ || msg.time > now + 5 * 60) {
+      return MINX_ERROR_UNTIMELY_POW;
+    }
+    size_t slot_index = (msg.time - spendBaseTime_) / spendSlotSize_;
+    if (slot_index >= spend_.size()) {
+      // Maybe the spend cache just needs updating
+      forceSpendCacheUpdate = true;
+    } else {
+      if (spend_[slot_index].count(msg.solution)) {
+        return MINX_ERROR_DOUBLE_SPEND;
+      }
+    }
+  }
+
+  if (forceSpendCacheUpdate) {
+    updatePoWSpendCache(now);
+    std::shared_lock lock(spendMutex_);
+    if (msg.time < spendBaseTime_) {
+      return MINX_ERROR_UNTIMELY_POW;
+    }
+    size_t slot_index = (msg.time - spendBaseTime_) / spendSlotSize_;
+    if (slot_index >= spend_.size()) {
+      throw std::runtime_error("double-spend logic error");
+    }
+    if (spend_[slot_index].count(msg.solution)) {
+      return MINX_ERROR_DOUBLE_SPEND;
+    }
+  }
+  return 0;
+}
+
+void Minx::calculatePoW(randomx_vm* rxvmPtr, const MinxProveWork& msg,
+                        Hash& calculatedHash) {
+  minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
+  input_buffer.put(msg.ckey);
+  input_buffer.put(msg.hdata);
+  input_buffer.put(msg.time);
+  input_buffer.put(msg.nonce);
+  randomx_calculate_hash(rxvmPtr, input_buffer.getBackingSpan().data(),
+                         input_buffer.getSize(), calculatedHash.data());
+}
+
+uint64_t Minx::processPoW(const SockAddr& addr, const MinxProveWork& msg,
+                          const int difficulty, bool isWorkHashValid) {
+  if (isWorkHashValid) {
+    std::lock_guard lock(spendMutex_);
+    // If bucket was dropped because it got old while we verified the hash,
+    // even better: no need to store the hash, as any hash that would go into
+    // these deleted buckets can no longer be spent.
+    if (msg.time >= spendBaseTime_) {
+      size_t slot_index = (msg.time - spendBaseTime_) / spendSlotSize_;
+      if (slot_index >= spend_.size()) {
+        // Shouldn't happen, since buckets should only be deleted by moving
+        // spendBaseTime_. But guard against that anyway.
+        return MINX_ERROR_UNEXPECTED;
+      }
+      spend_[slot_index].insert(msg.solution);
+    }
+    listener_->incomingProveWork(addr, msg, difficulty);
+  } else {
+    // need to penalize sender since randomx_calculate_hash() was expensive.
+    // solution might have been altered by MitM or the sender address might
+    // be spoofed, but this penalty cannot be avoided in any case.
+    ipFilter_.reportIP(addr.address());
+    return MINX_ERROR_MISMATCHED_POW;
+  }
+  return 0;
+}
+
 int Minx::verifyPoWs(const size_t limit) {
   Hash key;
   {
@@ -283,87 +363,27 @@ int Minx::verifyPoWs(const size_t limit) {
       work_item_opt.emplace(std::move(work_.front()));
       work_.pop();
     }
-
-    MinxProveWork& work_item = work_item_opt->first;
-    SockAddr& work_sockaddr = work_item_opt->second;
     ++verified_count;
 
+    const MinxProveWork& work_item = work_item_opt->first;
+    const SockAddr& work_sockaddr = work_item_opt->second;
+
     uint8_t work_diff = getDifficulty(work_item.solution);
-    if (work_diff < minDiff_) {
-      lastError_ = MINX_ERROR_LOW_DIFF;
+
+    uint64_t ferr = filterPoW(work_item, work_diff);
+    if (ferr > 0) {
+      lastError_ = ferr;
       continue;
     }
 
-    bool forceSpendCacheUpdate = false;
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-    {
-      std::shared_lock lock(spendMutex_);
-      if (work_item.time < spendBaseTime_ || work_item.time > now + 5 * 60) {
-        lastError_ = MINX_ERROR_UNTIMELY_POW;
-        continue;
-      }
-      size_t slot_index = (work_item.time - spendBaseTime_) / spendSlotSize_;
-      if (slot_index >= spend_.size()) {
-        // Maybe the spend cache just needs updating
-        forceSpendCacheUpdate = true;
-      } else {
-        if (spend_[slot_index].count(work_item.solution)) {
-          lastError_ = MINX_ERROR_DOUBLE_SPEND;
-          continue;
-        }
-      }
-    }
-
-    if (forceSpendCacheUpdate) {
-      updatePoWSpendCache(now);
-      std::shared_lock lock(spendMutex_);
-      if (work_item.time < spendBaseTime_) {
-        lastError_ = MINX_ERROR_UNTIMELY_POW;
-        continue;
-      }
-      size_t slot_index = (work_item.time - spendBaseTime_) / spendSlotSize_;
-      if (slot_index >= spend_.size()) {
-        throw std::runtime_error("double-spend logic error");
-      }
-      if (spend_[slot_index].count(work_item.solution)) {
-        lastError_ = MINX_ERROR_DOUBLE_SPEND;
-        continue;
-      }
-    }
-
-    minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
-    input_buffer.put(work_item.ckey);
-    input_buffer.put(work_item.hdata);
-    input_buffer.put(work_item.time);
-    input_buffer.put(work_item.nonce);
     Hash calculated_hash;
-    randomx_calculate_hash(vm, input_buffer.getBackingSpan().data(),
-                           input_buffer.getSize(), calculated_hash.data());
+    calculatePoW(vm, work_item, calculated_hash);
 
-    if (calculated_hash == work_item.solution) {
-      std::lock_guard lock(spendMutex_);
-      // If bucket was dropped because it got old while we verified the hash,
-      // even better: no need to store the hash, as any hash that would go into
-      // these deleted buckets can no longer be spent.
-      if (work_item.time >= spendBaseTime_) {
-        size_t slot_index = (work_item.time - spendBaseTime_) / spendSlotSize_;
-        if (slot_index >= spend_.size()) {
-          // Shouldn't happen, since buckets should only be deleted by moving
-          // spendBaseTime_. But guard against that anyway.
-          lastError_ = MINX_ERROR_UNEXPECTED;
-          continue;
-        }
-        spend_[slot_index].insert(work_item.solution);
-      }
-      listener_->incomingProveWork(work_sockaddr, work_item, work_diff);
-    } else {
-      lastError_ = MINX_ERROR_MISMATCHED_POW;
-      // need to penalize sender since randomx_calculate_hash() was expensive.
-      // solution might have been altered by MitM or the sender address might
-      // be spoofed, but this penalty cannot be avoided in any case.
-      ipFilter_.reportIP(work_sockaddr.address());
+    bool work_valid = calculated_hash == work_item.solution;
+
+    uint64_t perr = processPoW(work_sockaddr, work_item, work_diff, work_valid);
+    if (perr > 0) {
+      lastError_ = perr;
     }
   }
   return verified_count;
@@ -733,7 +753,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     }
     MinxProveWork msg{version, gpassword, spassword, ckey, hdata,
                       time,    nonce,     solution,  data};
-    {
+    if (listener_->delegateProveWork(remoteAddr_, msg)) {
       std::lock_guard lock(workMutex_);
       work_.push({std::move(msg), remoteAddr_});
     }

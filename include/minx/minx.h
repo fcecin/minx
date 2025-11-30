@@ -150,6 +150,20 @@ public:
   virtual bool isConnected(const SockAddr& addr) { return false; }
 
   /**
+   * Check if MINX should validate this PROVE_WORK message on behalf of the
+   * application, or whether the application wants to deal with it (using
+   * `filterPoW`, `calculatePoW` and `processPoW`).
+   * @param addr Remote UDP socket sender address.
+   * @param msg The MINX message.
+   * @return `true` to allow the MINX engine to deal with PoW validation
+   * internally, `false` to let the application handle it.
+   */
+  virtual bool delegateProveWork(const SockAddr& addr,
+                                 const MinxProveWork& msg) {
+    return true;
+  }
+
+  /**
    * Receive INIT message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
@@ -227,7 +241,8 @@ private:
     bool busy_ = false;
   };
   using RecvBuffersInfo = std::array<RecvSlot, RECV_BUFFER_ARRAY_SIZE>;
-  using RecvBuffers = std::array<ArrayBuffer<MAX_UDP_BYTES>, RECV_BUFFER_ARRAY_SIZE>;
+  using RecvBuffers =
+    std::array<ArrayBuffer<MAX_UDP_BYTES>, RECV_BUFFER_ARRAY_SIZE>;
 
   std::unique_ptr<RecvBuffers> recvBuffers_;
   RecvBuffersInfo recvBuffersInfo_;
@@ -490,6 +505,38 @@ public:
    * (double-spend).
    */
   bool replayPoW(const uint64_t time, const Hash& solution);
+
+  /**
+   * Check a PROVE_WORK message for minimum difficulty and time constraints.
+   * These checks precede RandomX hashing (`calculatePoW`).
+   * @param msg The MINX message.
+   * @param difficulty Precomputed difficulty.
+   * @return Zero if `msg` is valid, otherwise an error code.
+   */
+  uint64_t filterPoW(const MinxProveWork& msg, const int difficulty);
+
+  /**
+   * Hashes a given PROVE_WORK message (needed before `processPoW`).
+   * Getting a randomx_vm* to use is the responsibility of the caller.
+   * See: `Minx::getPoWEngine` and `PoWEngine`.
+   * @param rxvmPtr RandomX machine to use for validation.
+   * @param msg The PROVE_WORK message to compute the hash for.
+   * @param calculatedHash Outparam filled with the computed hash.
+   */
+  void calculatePoW(randomx_vm* rxvmPtr, const MinxProveWork& msg,
+                    Hash& calculatedHash);
+
+  /**
+   * Inject a PROVE_WORK message that has been verified with `calculatePoW`.
+   * @param addr Remote UDP socket sender address.
+   * @param msg The MINX message.
+   * @param difficulty Precomputed difficulty.
+   * @param isWorkHashValid `true` if the calculated hash over `msg` matches
+   * `msg.solution`, `false` otherwise.
+   * @return Zero if no processing errors, otherwise an error code.
+   */
+  uint64_t processPoW(const SockAddr& addr, const MinxProveWork& msg,
+                      const int difficulty, bool isWorkHashValid);
 
   /**
    * Verify any pending incoming PoWs (can be called by multiple threads).
