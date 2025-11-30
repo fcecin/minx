@@ -1,6 +1,8 @@
 #ifndef _MINXTYPES_H_
 #define _MINXTYPES_H_
 
+#include <chrono>
+
 #include <boost/asio.hpp>
 
 #include <logkv/bytes.h>
@@ -66,6 +68,12 @@ inline int getDifficulty(const Hash& hash) {
     }
   }
   return difficulty;
+}
+
+inline uint64_t getSecsSinceEpoch() {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+           std::chrono::system_clock::now().time_since_epoch())
+    .count();
 }
 
 } // namespace minx

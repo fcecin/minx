@@ -10,11 +10,12 @@ struct ScopeExit {
   ~ScopeExit() { fn_(); }
 };
 
-Minx::Minx(MinxListener* listener, int randomXInitThreads,
-           uint64_t spendSlotSize, int randomXVMsToKeep)
-    : listener_(listener), randomXInitThreads_(randomXInitThreads),
+Minx::Minx(MinxListener* listener, uint64_t minProveWorkTimestamp,
+           uint64_t spendSlotSize, int randomXVMsToKeep, int randomXInitThreads)
+    : listener_(listener), minProveWorkTimestamp_(minProveWorkTimestamp),
       spendSlotSize_(spendSlotSize), randomXVMsToKeep_(randomXVMsToKeep),
-      passwords_(1'000'000, 60), gen_(std::random_device{}()),
+      randomXInitThreads_(randomXInitThreads), passwords_(1'000'000, 60),
+      gen_(std::random_device{}()),
       genDistrib_(1, std::numeric_limits<uint64_t>::max()) {
   if (!listener_) {
     throw std::runtime_error("listener cannot be nullptr");
@@ -209,9 +210,7 @@ uint64_t Minx::updatePoWSpendCache(uint64_t epochSecs) {
   std::lock_guard lock(spendMutex_);
   uint64_t now = epochSecs;
   if (!now) {
-    now = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
+    now = getSecsSinceEpoch();
   }
   const uint64_t current_slot_time = (now / spendSlotSize_) * spendSlotSize_;
   const uint64_t target_base_time = current_slot_time - spendSlotSize_;
@@ -255,13 +254,15 @@ uint64_t Minx::filterPoW(const MinxProveWork& msg, const int difficulty) {
     return MINX_ERROR_LOW_DIFF;
   }
 
+  const uint64_t now = getSecsSinceEpoch();
+  if (minProveWorkTimestamp_ > 0 && now < minProveWorkTimestamp_) {
+    return MINX_ERROR_UNTIMELY_POW;
+  }
+
   bool forceSpendCacheUpdate = false;
-  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                     std::chrono::system_clock::now().time_since_epoch())
-                     .count();
   {
     std::shared_lock lock(spendMutex_);
-    if (msg.time < spendBaseTime_ || msg.time > now + 5 * 60) {
+    if (msg.time < spendBaseTime_ || msg.time > now + PROVE_WORK_FUTURE_DRIFT_SECS) {
       return MINX_ERROR_UNTIMELY_POW;
     }
     size_t slot_index = (msg.time - spendBaseTime_) / spendSlotSize_;
@@ -490,9 +491,7 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
         }
 
         const auto p1 = std::chrono::system_clock::now();
-        const uint64_t time = std::chrono::duration_cast<std::chrono::seconds>(
-                                p1.time_since_epoch())
-                                .count();
+        const uint64_t time = getSecsSinceEpoch();
 
         minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;
         input_buffer.put(myKey);

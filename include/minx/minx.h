@@ -253,6 +253,7 @@ private:
   std::vector<std::shared_ptr<minx::Buffer>> sendBufferPool_;
 
   MinxListener* listener_ = nullptr;
+  uint64_t minProveWorkTimestamp_;
 
   std::shared_mutex socketStateMutex_;
 
@@ -321,19 +322,32 @@ private:
   void workerLoop();
 
 public:
+  // Default spend db slot size in seconds (1 hour)
+  static constexpr size_t DEFAULT_SPEND_SLOT_SIZE_SECS = 3600;
+
+  // Incoming PROVE_WORK timestamps are allowed to be at most this number of
+  // seconds into the future (5 minutes)
+  static constexpr uint64_t PROVE_WORK_FUTURE_DRIFT_SECS = 300;
+
   /**
    * Constructor.
    * @param listener The `MinxListener` to use.
-   * @param randomXInitThreads Number of threads to use when initializing a
-   * RandomX dataset (if less than 1, will use thread::hardware_concurrency()).
    * @param spendSlotSize Duration of each double-spend time slot in seconds
    * (default: 1 hour).
+   * @param minProveWorkTimestamp If greater than zero, minimum value for any
+   * incoming MinxProveWork::time. Any PROVE_WORK message with a smaller
+   * timestamp will be rejected as untimely. This has to be used if the
+   * application is not persisting the double-spend database. A good value is
+   * probably (spendSlotSize * 2 + Minx::PROVE_WORK_FUTURE_DRIFT_SECS).
    * @param randomXVmsToKeep Maximum number of internal `randomx_vm` objects to
    * keep inside each Minx::getPoWEngine() (if less than 1, will use
    * thread::hardware_concurrency * 2).
+   * @param randomXInitThreads Number of threads to use when initializing a
+   * RandomX dataset (if less than 1, will use thread::hardware_concurrency()).
    */
-  Minx(MinxListener* listener, int randomXInitThreads = 0,
-       uint64_t spendSlotSize = 60 * 60, int randomXVmsToKeep = 0);
+  Minx(MinxListener* listener, uint64_t minProveWorkTimestamp = 0,
+       uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE_SECS,
+       int randomXVmsToKeep = 0, int randomXInitThreads = 0);
 
   /**
    * Destructor.
