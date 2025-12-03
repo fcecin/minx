@@ -32,6 +32,29 @@ inline void hashToBytes(Bytes& dest, const Hash& src, bool upper = false) {
                    upper);
 }
 
+inline void stringToHash(Hash& dest, const std::string& src) {
+  if (src.size() != 64) {
+    throw std::invalid_argument("src is not a 64-character string");
+  }
+  logkv::decodeHex(reinterpret_cast<char*>(dest.data()), dest.size(),
+                   src.data(), src.size());
+}
+
+inline void hashToString(const Hash& src, std::string& dest, bool upper = false) {
+  dest.resize(64);
+  logkv::encodeHex(dest.data(), dest.size(),
+                   reinterpret_cast<const char*>(src.data()), src.size(),
+                   upper);
+}
+
+inline std::string hashToString(const Hash& src, bool upper = false) {
+  std::string dest(64, '\0');
+  logkv::encodeHex(dest.data(), dest.size(),
+                   reinterpret_cast<const char*>(src.data()), src.size(),
+                   upper);
+  return dest;
+}
+
 inline std::string hashToBinaryString(const minx::Hash& hash) {
   std::string binaryString;
   binaryString.reserve(256);
