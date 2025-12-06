@@ -16,7 +16,8 @@ Minx::Minx(MinxListener* listener, uint64_t minProveWorkTimestamp,
       spendSlotSize_(spendSlotSize), randomXVMsToKeep_(randomXVMsToKeep),
       randomXInitThreads_(randomXInitThreads), passwords_(1'000'000, 60),
       gen_(std::random_device{}()),
-      genDistrib_(1, std::numeric_limits<uint64_t>::max()) {
+      genDistrib_(1, std::numeric_limits<uint64_t>::max()),
+      spamFilter_(1'000'000, 3, 250, 3600) {
   if (!listener_) {
     throw std::runtime_error("listener cannot be nullptr");
   }
@@ -262,7 +263,8 @@ uint64_t Minx::filterPoW(const MinxProveWork& msg, const int difficulty) {
   bool forceSpendCacheUpdate = false;
   {
     std::shared_lock lock(spendMutex_);
-    if (msg.time < spendBaseTime_ || msg.time > now + PROVE_WORK_FUTURE_DRIFT_SECS) {
+    if (msg.time < spendBaseTime_ ||
+        msg.time > now + PROVE_WORK_FUTURE_DRIFT_SECS) {
       return MINX_ERROR_UNTIMELY_POW;
     }
     size_t slot_index = (msg.time - spendBaseTime_) / spendSlotSize_;
@@ -525,6 +527,10 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
 
 void Minx::banAddress(const IPAddr& addr) { ipFilter_.reportIP(addr); }
 
+bool Minx::checkSpam(const IPAddr& addr) {
+  return spamFilter_.updateAndCheck(addr);
+}
+
 std::shared_ptr<minx::Buffer> Minx::acquireSendBuffer() {
   std::unique_lock lock(sendBufferPoolMutex_);
   if (!sendBufferPool_.empty()) {
@@ -650,6 +656,10 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   switch (code) {
   case MINX_INIT: {
+    if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
+      ipFilter_.reportIP(remoteAddr_.address());
+      break;
+    }
     size_t bytes_expected = sizeof(code) + MinxInit::SIZE;
     if (bytes_transferred < bytes_expected) {
       lastError_ = MINX_ERROR_BAD_INIT;
@@ -683,6 +693,10 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   }
 
   case MINX_GET_INFO: {
+    if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
+      ipFilter_.reportIP(remoteAddr_.address());
+      break;
+    }
     size_t bytes_expected = sizeof(code) + MinxGetInfo::SIZE;
     if (bytes_transferred < bytes_expected) {
       lastError_ = MINX_ERROR_BAD_GET_INFO;

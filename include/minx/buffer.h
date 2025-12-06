@@ -2,6 +2,7 @@
 #define _MINX_BUFFER_H_
 
 #include <boost/asio/buffer.hpp>
+#include <boost/container/static_vector.hpp>
 #include <boost/endian/conversion.hpp>
 
 #include <logkv/autoser.h>
@@ -20,6 +21,8 @@ public:
       : buf_(backingSpan), r_(0), w_(0), s_(0) {}
 
   virtual ~Buffer() = default;
+
+  char* data() { return reinterpret_cast<char*>(&buf_[0]); }
 
   std::span<const uint8_t> getBackingSpan() const { return buf_; }
 
@@ -143,6 +146,20 @@ public:
 
 private:
   std::vector<uint8_t> vectorBuf_;
+};
+
+/**
+ * Buffer with backing byte static_vector.
+ */
+template <size_t N> class StaticVectorBuffer : public Buffer {
+public:
+  explicit StaticVectorBuffer() {
+    vectorBuf_.resize(N);
+    setBackingSpan(vectorBuf_);
+  }
+
+private:
+  boost::container::static_vector<uint8_t, N> vectorBuf_;
 };
 
 } // namespace minx

@@ -16,6 +16,7 @@
 #include <minx/ipfilter.h>
 #include <minx/powengine.h>
 #include <minx/types.h>
+#include <minx/spamfilter.h>
 
 namespace minx {
 
@@ -304,6 +305,8 @@ private:
   std::mutex genMutex_;
   std::mt19937_64 gen_;
   std::uniform_int_distribution<uint64_t> genDistrib_;
+
+  SpamFilter spamFilter_;
 
   std::shared_ptr<minx::Buffer> acquireSendBuffer();
 
@@ -620,6 +623,13 @@ public:
    * this once per hour.
    */
   void banAddress(const IPAddr& addr);
+
+  /**
+   * Check an IP address against the spam filter.
+   * @param addr IP address to increment and check against the spam filter.
+   * @return `true` if address is flagged by the spam filter, `false` otherwise.
+   */
+  bool checkSpam(const IPAddr& addr);
 };
 
 } // namespace minx
