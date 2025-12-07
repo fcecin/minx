@@ -566,6 +566,12 @@ public:
   int verifyPoWs(const size_t limit = 0);
 
   /**
+   * Get current PoW verification work queue size.
+   * @return PoW work queue size.
+   */
+  size_t getVerifyPoWQueueSize();
+
+  /**
    * Create a RandomX PoWEngine (asynchronous).
    * @param key The RandomX PoWEngine key.
    */

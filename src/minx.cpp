@@ -392,6 +392,11 @@ int Minx::verifyPoWs(const size_t limit) {
   return verified_count;
 }
 
+size_t Minx::getVerifyPoWQueueSize() {
+  std::lock_guard lock(workMutex_);
+  return work_.size();
+}
+
 void Minx::createPoWEngine(const Hash& key) {
   {
     std::lock_guard lock(enginesMutex_);
