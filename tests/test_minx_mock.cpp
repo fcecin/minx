@@ -219,7 +219,7 @@ BOOST_AUTO_TEST_CASE(TestParallelPoWBurst) {
     auto& bot = fleet[i];
     for (int j = 0; j < POWS_PER_CLIENT; ++j) {
       uint64_t uniqueTicket = (i * 10000) + j + 1;
-      serverNode.minx->allocatePassword(uniqueTicket, bot->addr.address());
+      serverNode.minx->allocatePassword(uniqueTicket);
 
       minx::Hash uniqueHdata;
       std::fill(uniqueHdata.begin(), uniqueHdata.end(), 0);

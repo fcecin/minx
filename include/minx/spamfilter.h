@@ -18,17 +18,19 @@ public:
     genKeys();
   }
 
-  bool updateAndCheck(const boost::asio::ip::address& addr) {
+  bool check(const boost::asio::ip::address& addr, bool alsoUpdate = false) {
     const uint8_t* data = nullptr;
     size_t len = 0;
     boost::asio::ip::address_v4::bytes_type bytes_v4;
     boost::asio::ip::address_v6::bytes_type bytes_v6;
     if (addr.is_v4()) {
       bytes_v4 = addr.to_v4().to_bytes();
+      bytes_v4[3] = 0;
       data = bytes_v4.data();
       len = bytes_v4.size();
     } else {
       bytes_v6 = addr.to_v6().to_bytes();
+      std::fill(bytes_v6.begin() + 7, bytes_v6.end(), 0);
       data = bytes_v6.data();
       len = bytes_v6.size();
     }
@@ -47,7 +49,7 @@ public:
     if (min_val > threshold_) {
       return true;
     }
-    if (min_val < std::numeric_limits<uint8_t>::max()) {
+    if (alsoUpdate && min_val < std::numeric_limits<uint8_t>::max()) {
       ++table_[min_idx];
     }
     return false;
@@ -85,6 +87,8 @@ private:
  * Params `width` and `depth` need to be adjusted based on expected traffic and
  * may need to be exposed as app configs.
  * Allocates `2 * width * depth` bytes and runs `depth` SipHash ops per query.
+ * All IPv4 addresses within the same /24 share the same spam budget.
+ * All IPv6 addresses within the same /56 share the same spam budget.
  * NOTE: This class is thread-safe.
  */
 class SpamFilter {
@@ -100,6 +104,11 @@ public:
   bool
   updateAndCheck(const boost::asio::ip::address& addr,
                  const std::chrono::steady_clock::time_point* clock = nullptr) {
+    return check(addr, true, clock);
+  }
+
+  bool check(const boost::asio::ip::address& addr, bool alsoUpdate = false,
+             const std::chrono::steady_clock::time_point* clock = nullptr) {
     auto now = (clock) ? *clock : std::chrono::steady_clock::now();
     std::lock_guard{mutex_};
     if (now - lastRotation_ > rotationInterval_) {
@@ -108,10 +117,10 @@ public:
       lastRotation_ = now;
     }
     int olderIndex = !currentIndex_;
-    if (buckets_[olderIndex]->updateAndCheck(addr)) {
+    if (buckets_[olderIndex]->check(addr, alsoUpdate)) {
       return true;
     }
-    return buckets_[currentIndex_]->updateAndCheck(addr);
+    return buckets_[currentIndex_]->check(addr, alsoUpdate);
   }
 
 private:

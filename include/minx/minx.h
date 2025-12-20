@@ -15,8 +15,8 @@
 #include <minx/buffer.h>
 #include <minx/ipfilter.h>
 #include <minx/powengine.h>
-#include <minx/types.h>
 #include <minx/spamfilter.h>
+#include <minx/types.h>
 
 namespace minx {
 
@@ -51,6 +51,17 @@ enum {
   MINX_ERROR_BAD_INIT = 0x0A,
   MINX_ERROR_BAD_MESSAGE = 0x0B,
   MINX_ERROR_UNEXPECTED = 0xFF
+};
+
+/**
+ * MINX queryPoW() result.
+ */
+enum {
+  MINX_SOLUTION_UNSPENT = 0x00,
+  MINX_SOLUTION_SPENT = 0x01,
+  MINX_SOLUTION_UNTIMELY = 0x02,
+  // Not atually returned by queryPoW(), but can be used by the app.
+  MINX_SOLUTION_UNKNOWN = 0x03
 };
 
 /**
@@ -296,7 +307,7 @@ private:
   uint64_t spendBaseTime_ = 0;
   std::deque<std::unordered_set<Hash, SecureHashHasher>> spend_;
 
-  BucketCache<uint64_t, IPAddr> passwords_;
+  BucketCache<uint64_t, void> passwords_;
 
   IPFilter ipFilter_;
 
@@ -407,7 +418,7 @@ public:
   void setUseDataset(bool useDataset) { useDataset_ = useDataset; };
 
   /**
-   * Generate a non-zero random password to send in INIT or INIT_ACK messages.
+   * Generate a non-zero random password to send in messages.
    * @return A random and fresh password value not previously seen from or to
    * any remote IP address.
    */
@@ -416,18 +427,16 @@ public:
   /**
    * Store a redeemable password ticket for a remote host.
    * @param password The password ticket to allocate.
-   * @param addr The host address to associate with the password ticket.
    */
-  void allocatePassword(uint64_t password, const IPAddr& addr);
+  void allocatePassword(uint64_t password);
 
   /**
    * Check for a redeemable password ticket from a remote host.
    * @param password The password ticket to check.
-   * @param addr The host address associated with the password ticket.
    * @return `true` if a match was found and the password ticket was consumed,
    * `false` otherwise.
    */
-  bool spendPassword(uint64_t password, const IPAddr& addr);
+  bool spendPassword(uint64_t password);
 
   /**
    * Open the UDP socket if one was not previously opened.
@@ -498,6 +507,20 @@ public:
    */
   void sendApplication(const SockAddr& addr, const Bytes& data,
                        const uint8_t code = MINX_APPLICATION_DEFAULT);
+
+  /**
+   * Check if a PoW solution is spent.
+   * @param time The timestamp of the PoW solution to check.
+   * @param solution The hash of the PoW solution check.
+   * @param epochSecs Current time in seconds since epoch to use as the current
+   * time. If `0` (default), get the current time from the system clock.
+   * @return `MINX_SOLUTION_UNSPENT` if the solution is timely and not spent,
+   * `MINX_SOLUTION_SPENT` if the solution is timely and spent, or
+   * `MINX_SOLUTION_UNTIMELY` if the solution's timestamp is outside the
+   * double-spend table's tracking window.
+   */
+  int queryPoW(const uint64_t time, const Hash& solution,
+               uint64_t epochSecs = 0);
 
   /**
    * Checks if the double-spend cache's bucket list should be updated by, for
@@ -632,11 +655,19 @@ public:
 
   /**
    * Check an IP address against the spam filter.
-   * @param addr IP address to increment and check against the spam filter.
+   * @param addr IP address to check against the spam filter.
+   * @param alsoUpdate `true` to update the spam counter (+1) as well, `false`
+   * to just read the spam filter.
    * @return `true` if address is flagged by the spam filter, `false` otherwise.
    */
-  bool checkSpam(const IPAddr& addr);
+  bool checkSpam(const IPAddr& addr, bool alsoUpdate = true);
 };
+
+std::ostream& operator<<(std::ostream& os, const MinxInit& m);
+std::ostream& operator<<(std::ostream& os, const MinxGetInfo& m);
+std::ostream& operator<<(std::ostream& os, const MinxMessage& m);
+std::ostream& operator<<(std::ostream& os, const MinxInfo& m);
+std::ostream& operator<<(std::ostream& os, const MinxProveWork& m);
 
 } // namespace minx
 

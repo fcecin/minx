@@ -13,25 +13,58 @@ namespace minx {
 /**
  * Reads and writes a backing byte span.
  */
-class Buffer {
+template <typename T> class BasicBuffer {
 public:
-  Buffer() : r_(0), w_(0), s_(0) {}
+  static_assert(sizeof(T) == 1,
+                "BasicBuffer<T> does not support sizeof(T) > 1");
 
-  explicit Buffer(std::span<uint8_t> backingSpan)
-      : buf_(backingSpan), r_(0), w_(0), s_(0) {}
+  static constexpr bool IsMutable = !std::is_const_v<T>;
 
-  virtual ~Buffer() = default;
+  BasicBuffer() : r_(0), w_(0), s_(0) {}
 
-  char* data() { return reinterpret_cast<char*>(&buf_[0]); }
+  explicit BasicBuffer(std::span<T> backingSpan)
+      : buf_(backingSpan), r_(0), w_(0),
+        s_(IsMutable ? 0 : backingSpan.size()) {}
+
+  template <typename C> explicit BasicBuffer(C& c) {
+    setBackingContainer<C>(c);
+  }
+
+  virtual ~BasicBuffer() = default;
+
+  auto data() {
+    return reinterpret_cast<std::conditional_t<IsMutable, char*, const char*>>(
+      &buf_[0]);
+  }
 
   std::span<const uint8_t> getBackingSpan() const { return buf_; }
 
-  void setBackingSpan(std::span<uint8_t> external_buffer) {
+  void setBackingSpan(std::span<T> external_buffer) {
     buf_ = external_buffer;
+    r_ = 0;
+    w_ = 0;
+    if constexpr (!IsMutable) {
+      s_ = buf_.size();
+    } else {
+      s_ = 0;
+    }
   }
 
-  template <typename T> void put(const T& val) {
-    logkv::Writer writer(&buf_[w_], buf_.size() - w_);
+  template <typename C> void setBackingContainer(C& c) {
+    auto* ptr = std::data(c);
+    size_t len = std::size(c);
+    using TargetType = std::conditional_t<IsMutable, uint8_t, const uint8_t>;
+    if constexpr (IsMutable) {
+      static_assert(!std::is_const_v<std::remove_pointer_t<decltype(ptr)>>,
+                    "Const C cannot back non-const T");
+    }
+    setBackingSpan(
+      std::span<TargetType>(reinterpret_cast<TargetType*>(ptr), len));
+  }
+
+  template <typename V, bool M = IsMutable, typename = std::enable_if_t<M>>
+  void put(const V& val) {
+    logkv::Writer writer(const_cast<uint8_t*>(&buf_[w_]), buf_.size() - w_);
     try {
       writer.write(val);
       w_ += writer.bytes_processed();
@@ -41,7 +74,13 @@ public:
     }
   }
 
-  template <typename T> void get(T&& val) {
+  boost::asio::mutable_buffer getAsioBufferToWrite() {
+    static_assert(IsMutable,
+                  "Cannot get mutable ASIO buffer from a ConstBuffer");
+    return boost::asio::buffer(const_cast<uint8_t*>(buf_.data()), buf_.size());
+  }
+
+  template <typename V> void get(V&& val) {
     logkv::Reader reader(&buf_[r_], s_ - r_);
     try {
       reader.read(val);
@@ -51,8 +90,8 @@ public:
     }
   }
 
-  template <typename T> T get() {
-    T val;
+  template <typename V> V get() {
+    V val;
     logkv::Reader reader(&buf_[r_], s_ - r_);
     try {
       reader.read(val);
@@ -80,9 +119,7 @@ public:
     s_ = s;
   }
 
-  void setSizeToCapacity() {
-    s_ = buf_.size();
-  }
+  void setSizeToCapacity() { s_ = buf_.size(); }
 
   size_t getWritePos() const { return w_; }
 
@@ -112,16 +149,16 @@ public:
     return boost::asio::buffer(buf_.data(), s_);
   }
 
-  boost::asio::mutable_buffer getAsioBufferToWrite() {
-    return boost::asio::buffer(buf_.data(), buf_.size());
-  }
-
 private:
-  std::span<uint8_t> buf_;
+  std::span<T> buf_;
   size_t s_;
   size_t w_;
   size_t r_;
 };
+
+using Buffer = BasicBuffer<uint8_t>;
+
+using ConstBuffer = BasicBuffer<const uint8_t>;
 
 /**
  * Buffer with backing byte array.

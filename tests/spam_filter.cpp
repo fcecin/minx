@@ -118,9 +118,28 @@ BOOST_AUTO_TEST_CASE(TestExactThresholdBoundary) {
   std::string ip = "192.168.9.9";
   spam(ip, PASSING_CAPACITY);
   BOOST_TEST(check(ip) == true, "Packet 19 should drop");
-  std::string ip2 = "192.168.9.10";
+  std::string ip2 = "192.168.10.10";
   spam(ip2, PASSING_CAPACITY - 1);
   BOOST_TEST(check(ip2) == false, "Packet 18 should still pass");
+}
+
+BOOST_AUTO_TEST_CASE(TestSubnetMasking) {
+  std::string v4_target = "192.168.50.5";
+  std::string v4_neighbor = "192.168.50.200";
+  std::string v4_outsider = "192.168.51.5";
+  spam(v4_target, PASSING_CAPACITY + 1);
+  BOOST_TEST(check(v4_target) == true, "Target should be blocked");
+  BOOST_TEST(check(v4_neighbor) == true,
+             "Neighbor in same /24 should be blocked");
+  BOOST_TEST(check(v4_outsider) == false, "IP in different /24 should pass");
+  std::string v6_target = "2001:db8:1:2200::1";
+  std::string v6_neighbor = "2001:db8:1:22ff::1";
+  std::string v6_outsider = "2001:db8:1:2300::1";
+  spam(v6_target, PASSING_CAPACITY + 1);
+  BOOST_TEST(check(v6_target) == true, "v6 Target should be blocked");
+  BOOST_TEST(check(v6_neighbor) == true,
+             "v6 Neighbor in same /56 should be blocked");
+  BOOST_TEST(check(v6_outsider) == false, "v6 IP in different /56 should pass");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

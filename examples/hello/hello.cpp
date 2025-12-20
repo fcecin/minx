@@ -3,6 +3,8 @@
 #include <iostream>
 #include <random>
 
+#include <minx/blog.h>
+
 minx::Hash generateRandomHash() {
   minx::Hash hash;
   std::random_device rd;
@@ -14,7 +16,19 @@ minx::Hash generateRandomHash() {
   return hash;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+  if (argc > 1) {
+    if (argc == 2 && std::string(argv[1]) == "-v") {
+      blog::enable("minx");
+      blog::enable("powengine");
+      blog::set_level(blog::trace);
+      blog::dim(true);
+    } else {
+      std::cout << "usage: hello [-v]" << std::endl;
+      exit(1);
+    }
+  }
+
   std::cout << "🚀 Starting Minx Hello World Test..." << std::endl;
 
   std::atomic<bool> testFinished = false;
@@ -99,7 +113,7 @@ int main() {
 
       // 2. Wait for the client's worker thread to finish initializing the VM.
       while (!minx_instance_->checkPoWEngine(msg.skey)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
       std::cout << "  -> Client: VM is ready." << std::endl;
 
@@ -196,7 +210,7 @@ int main() {
     << std::endl;
   server_minx.createPoWEngine(server_key);
   while (!server_minx.checkPoWEngine(server_key)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
   std::cout << "  -> Server: VM is ready." << std::endl;
 
