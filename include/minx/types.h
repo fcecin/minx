@@ -1,9 +1,12 @@
 #ifndef _MINXTYPES_H_
 #define _MINXTYPES_H_
 
+#include <bit>
 #include <chrono>
 
 #include <boost/asio.hpp>
+#include <boost/container/small_vector.hpp>
+#include <boost/endian/conversion.hpp>
 
 #include <logkv/bytes.h>
 
@@ -12,7 +15,7 @@ namespace minx {
 using SockAddr = boost::asio::ip::udp::endpoint;
 using IPAddr = boost::asio::ip::address;
 using IOContext = boost::asio::io_context;
-using Bytes = logkv::Bytes;
+using Bytes = boost::container::small_vector<char, 256>;
 using Hash = std::array<uint8_t, 32>;
 
 inline void bytesToHash(Hash& dest, const Bytes& src) {
@@ -40,7 +43,8 @@ inline void stringToHash(Hash& dest, const std::string& src) {
                    src.data(), src.size());
 }
 
-inline void hashToString(const Hash& src, std::string& dest, bool upper = false) {
+inline void hashToString(const Hash& src, std::string& dest,
+                         bool upper = false) {
   dest.resize(64);
   logkv::encodeHex(dest.data(), dest.size(),
                    reinterpret_cast<const char*>(src.data()), src.size(),
@@ -76,18 +80,15 @@ struct SecureHashHasher {
 
 inline int getDifficulty(const Hash& hash) {
   int difficulty = 0;
-  for (uint8_t byte : hash) {
-    if (byte == 0x00) {
-      difficulty += 8;
+  for (size_t i = 0; i < 4; ++i) {
+    uint64_t chunk;
+    std::memcpy(&chunk, hash.data() + (i * 8), 8);
+    chunk = boost::endian::big_to_native(chunk);
+    if (chunk == 0) {
+      difficulty += 64;
     } else {
-      int leading_zeros_in_byte = 0;
-      uint8_t mask = 0x80;
-      while ((byte & mask) == 0) {
-        ++leading_zeros_in_byte;
-        mask >>= 1;
-      }
-      difficulty += leading_zeros_in_byte;
-      break;
+      difficulty += std::countl_zero(chunk);
+      return difficulty;
     }
   }
   return difficulty;
@@ -101,13 +102,13 @@ inline uint64_t getSecsSinceEpoch() {
 
 } // namespace minx
 
-inline std::ostream& operator<<(std::ostream& os, const minx::Hash& hash) {
-  os << std::hex << std::setfill('0');
-  for (const auto& byte : hash) {
-    os << std::setw(2) << static_cast<int>(byte);
-  }
-  os << std::dec;
-  return os;
+namespace logkv {
+inline std::span<std::byte> bytesAsSpan(minx::Bytes& b) {
+  return {reinterpret_cast<std::byte*>(b.data()), b.size()};
 }
+inline std::span<const std::byte> bytesAsSpan(const minx::Bytes& b) {
+  return {reinterpret_cast<const std::byte*>(b.data()), b.size()};
+}
+} // namespace logkv
 
 #endif

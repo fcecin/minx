@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/log/sources/global_logger_storage.hpp>
 #include <boost/log/sources/severity_channel_logger.hpp>
 #include <boost/log/trivial.hpp>
@@ -37,10 +38,18 @@ BOOST_LOG_INLINE_GLOBAL_LOGGER_INIT(my_logger, logger_type) {
   return logger_type(keywords::channel = blog::kDefaultModule);
 }
 
-namespace std { // kinda evil, but compiles
+// kinda evil, but compiles
+namespace std {
 std::ostream& operator<<(std::ostream& os, const std::vector<uint8_t>& bin);
 std::ostream& operator<<(std::ostream& os, const std::vector<char>& bin);
+std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 32>& bin);
+std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 8>& bin);
+} // namespace std
+namespace boost {
+namespace container {
+std::ostream& operator<<(std::ostream& os, const small_vector<char, 256>& v);
 }
+} // namespace boost
 
 namespace blog {
 void set_level(blog::severity_level level);

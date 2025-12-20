@@ -6,6 +6,7 @@
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/udp.hpp>
+#include <boost/container/small_vector.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/log/support/date_time.hpp>
 #include <boost/log/utility/setup/common_attributes.hpp>
@@ -126,13 +127,12 @@ void dim(bool d) {
   cfg.dim_log = d;
 }
 
-template <typename T, typename B>
-void format_hex(T& os, const std::vector<B>& data) {
-  static_assert(sizeof(B) == 1, "format_hex requires sizeof(B) == 1");
-  if (data.data() && data.size() > 0) {
-    os << "[" << data.size() << "]";
+void format_hex(std::ostream& os, const void* ptr, size_t size) {
+  if (ptr && size > 0) {
+    const uint8_t* data = static_cast<const uint8_t*>(ptr);
+    os << "[" << size << "]";
     const size_t max_sz = 1024;
-    size_t count = (data.size() > max_sz) ? max_sz : data.size();
+    size_t count = (size > max_sz) ? max_sz : size;
     char buffer[max_sz * 2 + 1];
     char* p = buffer;
     for (size_t i = 0; i < count; ++i) {
@@ -141,7 +141,7 @@ void format_hex(T& os, const std::vector<B>& data) {
       *p++ = logkv_detail::hexEncodeLookupUpper[byte & 0x0F];
     }
     os.write(buffer, p - buffer);
-    if (count > max_sz)
+    if (count < size)
       os << "...";
   } else {
     os << "{}";
@@ -271,10 +271,10 @@ void init() {
           strm << val.get();
         } else if (auto val = boost::log::extract<std::vector<uint8_t>>(
                      attr.first, rec)) {
-          blog::format_hex(strm, val.get());
+          strm << val.get();
         } else if (auto val =
                      boost::log::extract<std::vector<char>>(attr.first, rec)) {
-          blog::format_hex(strm, val.get());
+          strm << val.get();
         } else if (auto val = boost::log::extract<uint64_t>(attr.first, rec)) {
           strm << val.get();
         } else if (auto val = boost::log::extract<uint32_t>(attr.first, rec)) {
@@ -322,14 +322,31 @@ void init() {
 
 namespace std {
 std::ostream& operator<<(std::ostream& os, const std::vector<uint8_t>& bin) {
-  blog::format_hex(os, bin);
+  ::blog::format_hex(os, bin.data(), bin.size());
   return os;
 }
 std::ostream& operator<<(std::ostream& os, const std::vector<char>& bin) {
-  blog::format_hex(os, bin);
+  ::blog::format_hex(os, bin.data(), bin.size());
+  return os;
+}
+std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 32>& bin) {
+  ::blog::format_hex(os, bin.data(), bin.size());
+  return os;
+}
+std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 8>& bin) {
+  ::blog::format_hex(os, bin.data(), bin.size());
   return os;
 }
 } // namespace std
+
+namespace boost {
+namespace container {
+std::ostream& operator<<(std::ostream& os, const small_vector<char, 256>& v) {
+  ::blog::format_hex(os, v.data(), v.size());
+  return os;
+}
+} // namespace container
+} // namespace boost
 
 namespace {
 struct BlogAutoInit {

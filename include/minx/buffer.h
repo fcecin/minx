@@ -6,7 +6,8 @@
 #include <boost/endian/conversion.hpp>
 
 #include <logkv/autoser.h>
-#include <logkv/bytes.h>
+
+#include <minx/types.h>
 
 namespace minx {
 
@@ -102,9 +103,13 @@ public:
     }
   }
 
-  logkv::Bytes getRemainingBytes() {
-    logkv::Bytes result(getRemainingBytesCount());
-    get(logkv::bytesAsSpan(result));
+  minx::Bytes getRemainingBytes() {
+    size_t count = getRemainingBytesCount();
+    minx::Bytes result(count);
+    if (count > 0) {
+      std::memcpy(result.data(), &buf_[r_], count);
+      r_ += count;
+    }
     return result;
   }
 
