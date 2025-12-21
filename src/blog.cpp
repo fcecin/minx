@@ -320,34 +320,6 @@ void init() {
 
 } // namespace blog
 
-namespace std {
-std::ostream& operator<<(std::ostream& os, const std::vector<uint8_t>& bin) {
-  ::blog::format_hex(os, bin.data(), bin.size());
-  return os;
-}
-std::ostream& operator<<(std::ostream& os, const std::vector<char>& bin) {
-  ::blog::format_hex(os, bin.data(), bin.size());
-  return os;
-}
-std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 32>& bin) {
-  ::blog::format_hex(os, bin.data(), bin.size());
-  return os;
-}
-std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 8>& bin) {
-  ::blog::format_hex(os, bin.data(), bin.size());
-  return os;
-}
-} // namespace std
-
-namespace boost {
-namespace container {
-std::ostream& operator<<(std::ostream& os, const small_vector<char, 256>& v) {
-  ::blog::format_hex(os, v.data(), v.size());
-  return os;
-}
-} // namespace container
-} // namespace boost
-
 namespace {
 struct BlogAutoInit {
   BlogAutoInit() { ::blog::init(); }

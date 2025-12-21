@@ -38,18 +38,34 @@ BOOST_LOG_INLINE_GLOBAL_LOGGER_INIT(my_logger, logger_type) {
   return logger_type(keywords::channel = blog::kDefaultModule);
 }
 
-// kinda evil, but compiles
+namespace blog {
+void format_hex(std::ostream& os, const void* ptr, size_t size);
+} // namespace blog
+
 namespace std {
-std::ostream& operator<<(std::ostream& os, const std::vector<uint8_t>& bin);
-std::ostream& operator<<(std::ostream& os, const std::vector<char>& bin);
-std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 32>& bin);
-std::ostream& operator<<(std::ostream& os, const std::array<uint8_t, 8>& bin);
-} // namespace std
-namespace boost {
-namespace container {
-std::ostream& operator<<(std::ostream& os, const small_vector<char, 256>& v);
+template <typename T, std::size_t N>
+inline auto operator<<(std::ostream& os, const std::array<T, N>& bin) ->
+  typename std::enable_if_t<sizeof(T) == 1, std::ostream&> {
+  ::blog::format_hex(os, bin.data(), N);
+  return os;
 }
-} // namespace boost
+
+template <typename T>
+inline auto operator<<(std::ostream& os, const std::vector<T>& bin) ->
+  typename std::enable_if_t<sizeof(T) == 1, std::ostream&> {
+  ::blog::format_hex(os, bin.data(), bin.size());
+  return os;
+}
+} // namespace std
+
+namespace boost::container {
+template <typename T, std::size_t N>
+inline auto operator<<(std::ostream& os, const small_vector<T, N>& bin) ->
+  typename std::enable_if_t<sizeof(T) == 1, std::ostream&> {
+  ::blog::format_hex(os, bin.data(), bin.size());
+  return os;
+}
+} // namespace boost::container
 
 namespace blog {
 void set_level(blog::severity_level level);
