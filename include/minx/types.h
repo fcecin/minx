@@ -78,6 +78,14 @@ struct SecureHashHasher {
   }
 };
 
+inline std::span<std::byte> bytesAsSpan(minx::Bytes& b) {
+  return {reinterpret_cast<std::byte*>(b.data()), b.size()};
+}
+
+inline std::span<const std::byte> bytesAsSpan(const minx::Bytes& b) {
+  return {reinterpret_cast<const std::byte*>(b.data()), b.size()};
+}
+
 inline int getDifficulty(const Hash& hash) {
   int difficulty = 0;
   for (size_t i = 0; i < 4; ++i) {
@@ -101,14 +109,5 @@ inline uint64_t getSecsSinceEpoch() {
 }
 
 } // namespace minx
-
-namespace logkv {
-inline std::span<std::byte> bytesAsSpan(minx::Bytes& b) {
-  return {reinterpret_cast<std::byte*>(b.data()), b.size()};
-}
-inline std::span<const std::byte> bytesAsSpan(const minx::Bytes& b) {
-  return {reinterpret_cast<const std::byte*>(b.data()), b.size()};
-}
-} // namespace logkv
 
 #endif

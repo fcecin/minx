@@ -204,7 +204,7 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
   if (msg.gpassword > 0) {
     allocatePassword(msg.gpassword);
   }
-  buf->put(logkv::bytesAsSpan(msg.data));
+  buf->put(bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -218,7 +218,7 @@ void Minx::sendMessage(const SockAddr& addr, const MinxMessage& msg) {
     allocatePassword(msg.gpassword);
   }
   buf->put(msg.spassword);
-  buf->put(logkv::bytesAsSpan(msg.data));
+  buf->put(bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -231,7 +231,7 @@ void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
   if (msg.gpassword > 0) {
     allocatePassword(msg.gpassword);
   }
-  buf->put(logkv::bytesAsSpan(msg.data));
+  buf->put(bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -247,7 +247,7 @@ void Minx::sendInfo(const SockAddr& addr, const MinxInfo& msg) {
   buf->put(msg.spassword);
   buf->put(msg.skey);
   buf->put(msg.difficulty);
-  buf->put(logkv::bytesAsSpan(msg.data));
+  buf->put(bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -266,7 +266,7 @@ void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
   buf->put(msg.time);
   buf->put(msg.nonce);
   buf->put(msg.solution);
-  buf->put(logkv::bytesAsSpan(msg.data));
+  buf->put(bytesAsSpan(msg.data));
   doSocketSend(addr, buf);
 }
 
@@ -278,7 +278,7 @@ void Minx::sendApplication(const SockAddr& addr, const Bytes& data,
   }
   auto buf = acquireSendBuffer();
   buf->put(code);
-  buf->put(logkv::bytesAsSpan(data));
+  buf->put(bytesAsSpan(data));
   doSocketSend(addr, buf);
 }
 
@@ -287,7 +287,7 @@ void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
   auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_EXTENSION);
   buf->put<uint8_t>(0x0);
-  buf->put(logkv::bytesAsSpan(data));
+  buf->put(bytesAsSpan(data));
   doSocketSend(addr, buf);
 }
 
