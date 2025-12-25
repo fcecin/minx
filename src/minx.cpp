@@ -35,26 +35,26 @@ std::ostream& operator<<(std::ostream& os, const MinxInfo& m) {
   return os << "{MinxInfo v" << static_cast<int>(m.version)
             << " gpass:" << std::hex << m.gpassword << " spass:" << m.spassword
             << std::dec << " diff:" << static_cast<int>(m.difficulty)
-            << " skey:" << blog::to_vec(m.skey) << " data:" << m.data << "}";
+            << " skey:" << m.skey << " data:" << m.data << "}";
 }
 
 std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
   return os << "{MinxProveWork v" << static_cast<int>(m.version)
             << " gpass:" << std::hex << m.gpassword << " spass:" << m.spassword
-            << std::dec << " ckey:" << blog::to_vec(m.ckey)
-            << " hdata:" << blog::to_vec(m.hdata) << " time:" << m.time
-            << " nonce:" << m.nonce << " soln:" << blog::to_vec(m.solution)
-            << " data:" << m.data << "}";
+            << std::dec << " ckey:" << m.ckey << " hdata:" << m.hdata
+            << " time:" << m.time << " nonce:" << m.nonce
+            << " soln:" << m.solution << " data:" << m.data << "}";
 }
 
 Minx::Minx(MinxListener* listener, uint64_t minProveWorkTimestamp,
-           uint64_t spendSlotSize, int randomXVMsToKeep, int randomXInitThreads)
+           uint64_t spendSlotSize, int randomXVMsToKeep, int randomXInitThreads,
+           uint16_t spamThreshold)
     : listener_(listener), minProveWorkTimestamp_(minProveWorkTimestamp),
       spendSlotSize_(spendSlotSize), randomXVMsToKeep_(randomXVMsToKeep),
-      randomXInitThreads_(randomXInitThreads), passwords_(1'000'000, 60),
-      gen_(std::random_device{}()),
+      randomXInitThreads_(randomXInitThreads), spamThreshold_(spamThreshold),
+      passwords_(1'000'000, 60), gen_(std::random_device{}()),
       genDistrib_(1, std::numeric_limits<uint64_t>::max()),
-      spamFilter_(1'000'000, 3, 250, 3600) {
+      spamFilter_(1'000'000, 3, spamThreshold, 3600) {
   LOGTRACE << "Minx";
   if (!listener_) {
     throw std::runtime_error("listener cannot be nullptr");
@@ -204,7 +204,7 @@ void Minx::sendInit(const SockAddr& addr, const MinxInit& msg) {
   if (msg.gpassword > 0) {
     allocatePassword(msg.gpassword);
   }
-  buf->put(bytesAsSpan(msg.data));
+  buf->put(std::span{msg.data});
   doSocketSend(addr, buf);
 }
 
@@ -218,7 +218,7 @@ void Minx::sendMessage(const SockAddr& addr, const MinxMessage& msg) {
     allocatePassword(msg.gpassword);
   }
   buf->put(msg.spassword);
-  buf->put(bytesAsSpan(msg.data));
+  buf->put(std::span{msg.data});
   doSocketSend(addr, buf);
 }
 
@@ -231,7 +231,7 @@ void Minx::sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
   if (msg.gpassword > 0) {
     allocatePassword(msg.gpassword);
   }
-  buf->put(bytesAsSpan(msg.data));
+  buf->put(std::span{msg.data});
   doSocketSend(addr, buf);
 }
 
@@ -247,7 +247,7 @@ void Minx::sendInfo(const SockAddr& addr, const MinxInfo& msg) {
   buf->put(msg.spassword);
   buf->put(msg.skey);
   buf->put(msg.difficulty);
-  buf->put(bytesAsSpan(msg.data));
+  buf->put(std::span{msg.data});
   doSocketSend(addr, buf);
 }
 
@@ -266,7 +266,7 @@ void Minx::sendProveWork(const SockAddr& addr, const MinxProveWork& msg) {
   buf->put(msg.time);
   buf->put(msg.nonce);
   buf->put(msg.solution);
-  buf->put(bytesAsSpan(msg.data));
+  buf->put(std::span{msg.data});
   doSocketSend(addr, buf);
 }
 
@@ -278,7 +278,7 @@ void Minx::sendApplication(const SockAddr& addr, const Bytes& data,
   }
   auto buf = acquireSendBuffer();
   buf->put(code);
-  buf->put(bytesAsSpan(data));
+  buf->put(std::span{data});
   doSocketSend(addr, buf);
 }
 
@@ -287,13 +287,13 @@ void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
   auto buf = acquireSendBuffer();
   buf->put<uint8_t>(MINX_EXTENSION);
   buf->put<uint8_t>(0x0);
-  buf->put(bytesAsSpan(data));
+  buf->put(std::span{data});
   doSocketSend(addr, buf);
 }
 
 int Minx::queryPoW(const uint64_t time, const Hash& solution,
                    uint64_t epochSecs) {
-  LOGTRACE << "queryPoW" << VAR(time) << BVAR(solution) << VAR(epochSecs);
+  LOGTRACE << "queryPoW" << VAR(time) << VAR(solution) << VAR(epochSecs);
   uint64_t now = epochSecs;
   if (!now) {
     now = getSecsSinceEpoch();
@@ -406,7 +406,7 @@ void Minx::calculatePoW(randomx_vm* rxvmPtr, const MinxProveWork& msg,
   input_buffer.put(msg.nonce);
   randomx_calculate_hash(rxvmPtr, input_buffer.getBackingSpan().data(),
                          input_buffer.getSize(), calculatedHash.data());
-  LOGTRACE << "calculatePoW" << SVAR(msg) << BVAR(calculatedHash);
+  LOGTRACE << "calculatePoW" << SVAR(msg) << VAR(calculatedHash);
 }
 
 uint64_t Minx::processPoW(const SockAddr& addr, const MinxProveWork& msg,
@@ -466,7 +466,21 @@ int Minx::verifyPoWs(const size_t limit) {
       if (work_.empty()) {
         break;
       }
-      work_item_opt.emplace(std::move(work_.front()));
+      const auto& next = work_.front();
+      const auto& nextSockAddr = next.second;
+      const auto& nextIPAddr = nextSockAddr.address();
+      auto bucket = getAddressPrefix(nextIPAddr);
+      auto it = workPrefixCounts_.find(bucket);
+      if (it != workPrefixCounts_.end()) {
+        auto& count = it->second;
+        if (count > 0) {
+          --count;
+        }
+        if (count == 0) {
+          workPrefixCounts_.erase(it);
+        }
+      }
+      work_item_opt.emplace(std::move(next));
       work_.pop();
     }
     ++verified_count;
@@ -476,12 +490,6 @@ int Minx::verifyPoWs(const size_t limit) {
 
     if (ipFilter_.checkIP(work_sockaddr.address())) {
       LOGTRACE << "verifyPoWs() dropped work from IP filtered address"
-               << VAR(work_sockaddr);
-      continue;
-    }
-
-    if (spamFilter_.check(work_sockaddr.address(), false)) {
-      LOGTRACE << "verifyPoWs() dropped work from Spam filtered address"
                << VAR(work_sockaddr);
       continue;
     }
@@ -513,7 +521,7 @@ size_t Minx::getVerifyPoWQueueSize() {
 }
 
 void Minx::createPoWEngine(const Hash& key) {
-  LOGTRACE << "createPoWEngine" << BVAR(key);
+  LOGTRACE << "createPoWEngine" << VAR(key);
   {
     std::lock_guard lock(enginesMutex_);
     if (stopWorker_) {
@@ -548,12 +556,12 @@ std::shared_ptr<PoWEngine> Minx::getPoWEngine(const Hash& key) {
 bool Minx::checkPoWEngine(const Hash& key) {
   std::shared_ptr<PoWEngine> engine_ptr = getPoWEngine(key);
   if (!engine_ptr) {
-    LOGTRACE << "checkPoWEngine not found" << BVAR(key);
+    LOGTRACE << "checkPoWEngine not found" << VAR(key);
     return false;
   }
   auto state = engine_ptr->getState();
   if (state == PoWEngineState::Error) {
-    LOGTRACE << "checkPoWEngine State=Error" << BVAR(key);
+    LOGTRACE << "checkPoWEngine State=Error" << VAR(key);
     throw std::runtime_error("VM initialization failed: " +
                              engine_ptr->getErrorMessage());
   }
@@ -562,11 +570,11 @@ bool Minx::checkPoWEngine(const Hash& key) {
 }
 
 bool Minx::destroyPoWEngine(const Hash& key) {
-  LOGTRACE << "destroyPoWEngine" << BVAR(key);
+  LOGTRACE << "destroyPoWEngine" << VAR(key);
   std::lock_guard{enginesMutex_};
   auto it = engines_.find(key);
   if (it == engines_.end()) {
-    LOGTRACE << "destroyPoWEngine not found" << BVAR(key);
+    LOGTRACE << "destroyPoWEngine not found" << VAR(key);
     return false;
   }
   engines_.erase(it);
@@ -577,7 +585,7 @@ std::optional<MinxProveWork>
 Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
                 int difficulty, int numThreads, uint64_t startNonce,
                 uint64_t maxIters) {
-  LOGTRACE << "proveWork" << BVAR(myKey) << BVAR(hdata) << BVAR(targetKey)
+  LOGTRACE << "proveWork" << VAR(myKey) << VAR(hdata) << VAR(targetKey)
            << VAR(difficulty) << VAR(numThreads) << VAR(startNonce)
            << VAR(maxIters);
   std::shared_ptr<PoWEngine> engine_ptr;
@@ -792,8 +800,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   switch (code) {
   case MINX_INIT: {
     if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
-      LOGTRACE << "onProcessPacket MINX_INIT caught by spam filter";
-      ipFilter_.reportIP(remoteAddr_.address());
+      // A mass spoofing attack should not log or ban IPs
       break;
     }
     size_t bytes_expected = sizeof(code) + MinxInit::SIZE;
@@ -805,8 +812,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     }
     const uint8_t version = buffer_.get<uint8_t>();
     const uint64_t gpassword = buffer_.get<uint64_t>();
-    Bytes data = buffer_.getRemainingBytes();
-    MinxInit msg{version, gpassword, data};
+    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
+    MinxInit msg{version, gpassword, {data.begin(), data.end()}};
     LOGTRACE << "onProcessPacket MINX_INIT" << SVAR(msg);
     listener_->incomingInit(remoteAddr_, msg);
     break;
@@ -823,14 +830,17 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     const uint8_t version = buffer_.get<uint8_t>();
     const uint64_t gpassword = buffer_.get<uint64_t>();
     const uint64_t spassword = buffer_.get<uint64_t>();
-    if (spassword == 0 || !spendPassword(spassword)) {
-      LOGTRACE << "onProcessPacket MINX_MESSAGE bad spend password"
-               << VAR(HEXU64(spassword));
-      lastError_ = MINX_ERROR_BAD_MESSAGE;
-      break;
+    bool password_matched = spassword > 0 && spendPassword(spassword);
+    if (!password_matched) {
+      if (!listener_->isConnected(remoteAddr_)) {
+        LOGTRACE << "onProcessPacket MINX_MESSAGE not connected"
+                 << VAR(HEXU64(spassword));
+        lastError_ = MINX_ERROR_NOT_CONNECTED;
+        break;
+      }
     }
-    Bytes data = buffer_.getRemainingBytes();
-    MinxMessage msg{version, gpassword, spassword, data};
+    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
+    MinxMessage msg{version, gpassword, spassword, {data.begin(), data.end()}};
     LOGTRACE << "onProcessPacket MINX_MESSAGE" << SVAR(msg);
     listener_->incomingMessage(remoteAddr_, msg);
     break;
@@ -838,8 +848,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   case MINX_GET_INFO: {
     if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
-      LOGTRACE << "onProcessPacket MINX_GET_INFO caught by spam filter";
-      ipFilter_.reportIP(remoteAddr_.address());
+      // A mass spoofing attack should not log or ban IPs
       break;
     }
     size_t bytes_expected = sizeof(code) + MinxGetInfo::SIZE;
@@ -851,8 +860,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     }
     const uint8_t version = buffer_.get<uint8_t>();
     const uint64_t gpassword = buffer_.get<uint64_t>();
-    Bytes data = buffer_.getRemainingBytes();
-    MinxGetInfo msg{version, gpassword, data};
+    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
+    MinxGetInfo msg{version, gpassword, {data.begin(), data.end()}};
     LOGTRACE << "onProcessPacket MINX_GET_INFO" << SVAR(msg);
     listener_->incomingGetInfo(remoteAddr_, msg);
     break;
@@ -876,16 +885,20 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     }
     const uint64_t gpassword = buffer_.get<uint64_t>();
     const uint64_t spassword = buffer_.get<uint64_t>();
-    if (spassword == 0 || !spendPassword(spassword)) {
-      LOGTRACE << "onProcessPacket MINX_INFO bad spend password"
-               << VAR(HEXU64(spassword));
-      lastError_ = MINX_ERROR_BAD_INFO;
-      break;
+    bool password_matched = spassword > 0 && spendPassword(spassword);
+    if (!password_matched) {
+      if (!listener_->isConnected(remoteAddr_)) {
+        LOGTRACE << "onProcessPacket MINX_INFO not connected"
+                 << VAR(HEXU64(spassword));
+        lastError_ = MINX_ERROR_NOT_CONNECTED;
+        break;
+      }
     }
     Hash skey = buffer_.get<Hash>();
     const uint8_t difficulty = buffer_.get<uint8_t>();
-    Bytes data = buffer_.getRemainingBytes();
-    MinxInfo msg{version, gpassword, spassword, difficulty, skey, data};
+    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
+    MinxInfo msg{version,    gpassword, spassword,
+                 difficulty, skey,      {data.begin(), data.end()}};
     LOGTRACE << "onProcessPacket MINX_INFO" << SVAR(msg);
     listener_->incomingInfo(remoteAddr_, msg);
     break;
@@ -914,7 +927,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     const uint64_t time = buffer_.get<uint64_t>();
     const uint64_t nonce = buffer_.get<uint64_t>();
     Hash solution = buffer_.get<Hash>();
-    Bytes data = buffer_.getRemainingBytes();
+    std::vector<char> data =
+      buffer_.getRemainingBytes<std::vector<char>>(MAX_DATA_SIZE);
     bool password_matched = spassword > 0 && spendPassword(spassword);
     if (!password_matched) {
       if (!listener_->isConnected(remoteAddr_)) {
@@ -924,11 +938,17 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
         break;
       }
     }
-    MinxProveWork msg{version, gpassword, spassword, ckey, hdata,
-                      time,    nonce,     solution,  data};
+    MinxProveWork msg{version, gpassword, spassword, ckey,           hdata,
+                      time,    nonce,     solution,  std::move(data)};
     LOGTRACE << "onProcessPacket MINX_PROVE_WORK" << SVAR(msg);
     if (listener_->delegateProveWork(remoteAddr_, msg)) {
+      auto bucket = getAddressPrefix(remoteAddr_.address());
       std::lock_guard lock(workMutex_);
+      size_t& count = workPrefixCounts_[bucket];
+      if (count >= MAX_WORK_PER_PREFIX) {
+        break;
+      }
+      ++count;
       work_.push({std::move(msg), remoteAddr_});
     }
     break;
@@ -944,17 +964,18 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
       break;
     }
     version = buffer_.get<uint8_t>();
-    Bytes data = buffer_.getRemainingBytes();
-    listener_->incomingExtension(remoteAddr_, data);
+    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
+    listener_->incomingExtension(remoteAddr_, {data.begin(), data.end()});
     break;
   }
 
   default: {
     // Any other code is an APPLICATION message code [0x00, 0xFB]
-    Bytes data = buffer_.getRemainingBytes();
+    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
     LOGTRACE << "onProcessPacket MINX_APPLICATION message too short"
              << VAR(code) << VAR(data);
-    listener_->incomingApplication(remoteAddr_, code, data);
+    listener_->incomingApplication(remoteAddr_, code,
+                                   {data.begin(), data.end()});
   } break;
   }
 }
@@ -984,16 +1005,16 @@ void Minx::workerLoop() {
       auto it = engines_.find(keyToInitialize);
       if (it != engines_.end()) {
         engine_ptr = it->second;
-        LOGTRACE << "workerLoop found engine to init" << BVAR(keyToInitialize)
-                 << BVAR(engine_ptr->getKey());
+        LOGTRACE << "workerLoop found engine to init" << VAR(keyToInitialize)
+                 << VAR(engine_ptr->getKey());
       } else {
         LOGTRACE << "workerLoop did not find engine to init"
-                 << BVAR(keyToInitialize);
+                 << VAR(keyToInitialize);
       }
     }
     if (engine_ptr) {
       LOGTRACE << "workerLoop initialize engine" << VAR(randomXInitThreads_)
-               << BVAR(engine_ptr->getKey());
+               << VAR(engine_ptr->getKey());
       engine_ptr->initialize(randomXInitThreads_);
     } else {
       LOGERROR << "workerLoop null PoWEngine";

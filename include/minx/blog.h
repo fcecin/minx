@@ -1,6 +1,31 @@
 #ifndef _MINXBLOG_H_
 #define _MINXBLOG_H_
 
+/**
+ * Console logger for applications using Boost::Log's trivial logger.
+ *
+ * Simple use in any cpp file:
+ *
+ *   #include <minx/blog.h>
+ *   int world = 100;
+ *   LOGINFO << "Hello!" << VAR(world);
+ *
+ * To use with named module support in a cpp file:
+ *
+ *   #include <minx/blog.h>
+ *   LOG_MODULE("mymod")
+ *
+ * To change the global logging severity level:
+ *
+ *   blog::set_level(blog::debug);
+ *
+ * To change the logging severity level per module:
+ *
+ *   blog::set_level("mymod", blog::trace);
+ *
+ * See `src/minx.cpp` and `examples/hello/hello.cpp` for more usage examples.
+ */
+
 #include <cstdint>
 #include <iterator>
 #include <ostream>
@@ -61,6 +86,13 @@ inline auto operator<<(std::ostream& os, const std::vector<T>& bin) ->
 namespace boost::container {
 template <typename T, std::size_t N>
 inline auto operator<<(std::ostream& os, const small_vector<T, N>& bin) ->
+  typename std::enable_if_t<sizeof(T) == 1, std::ostream&> {
+  ::blog::format_hex(os, bin.data(), bin.size());
+  return os;
+}
+
+template <typename T, std::size_t N>
+inline auto operator<<(std::ostream& os, const static_vector<T, N>& bin) ->
   typename std::enable_if_t<sizeof(T) == 1, std::ostream&> {
   ::blog::format_hex(os, bin.data(), bin.size());
   return os;
@@ -145,7 +177,9 @@ static constexpr const char* resolve_log_module(long) {
     return os << __VA_ARGS__;                                                  \
   }
 
-// If variable is std::vector<B> where sizeof(B) == 1, can use VAR/VAL instead
+// If variable is std::vector<B> where sizeof(B) == 1, can use VAR/VAL instead.
+// If variable is std::array<uint8_t, 32>, can use VAR/VAL instead.
+// If variable is std::array<uint8_t, 8>, can use VAR/VAL instead.
 #define BVAR(variable)                                                         \
   ::boost::log::add_value(#variable, ::blog::to_vec(variable))
 #define BVAL(key, variable)                                                    \

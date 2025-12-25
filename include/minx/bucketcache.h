@@ -257,4 +257,4 @@ private:
   int64_t lastFlipSecs_;
 };
 
-#endif // _BUCKETCACHE_H_
+#endif

@@ -5,17 +5,19 @@
 #include <chrono>
 
 #include <boost/asio.hpp>
-#include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 #include <boost/endian/conversion.hpp>
 
-#include <logkv/bytes.h>
+#include <logkv/hex.h>
 
 namespace minx {
+
+static constexpr size_t MAX_DATA_SIZE = 1280;
 
 using SockAddr = boost::asio::ip::udp::endpoint;
 using IPAddr = boost::asio::ip::address;
 using IOContext = boost::asio::io_context;
-using Bytes = boost::container::small_vector<char, 256>;
+using Bytes = boost::container::static_vector<char, MAX_DATA_SIZE>;
 using Hash = std::array<uint8_t, 32>;
 
 inline void bytesToHash(Hash& dest, const Bytes& src) {
@@ -77,14 +79,6 @@ struct SecureHashHasher {
     return hash_value;
   }
 };
-
-inline std::span<std::byte> bytesAsSpan(minx::Bytes& b) {
-  return {reinterpret_cast<std::byte*>(b.data()), b.size()};
-}
-
-inline std::span<const std::byte> bytesAsSpan(const minx::Bytes& b) {
-  return {reinterpret_cast<const std::byte*>(b.data()), b.size()};
-}
 
 inline int getDifficulty(const Hash& hash) {
   int difficulty = 0;

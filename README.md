@@ -179,3 +179,8 @@ The inclusion of `CKEY` in the PoW puzzle ensures the server can securely credit
 
 Double-spending in the same server is solved by the server keeping track of all previously accepted solutions. Solutions can be forgotten by the server after a given time, since puzzles with a `TIME` that is too old are not accepted by the server.
 
+### Limits
+
+The reference implementation imposes an internal absolute limit of 1,280 bytes to all `DATA` fields. In practice, all applications should use less than 1,280 bytes since that's the IPv6 MTU.
+
+To prevent UDP amplification attacks without imposing e.g. a large and fixed packet size for the first leg of every 3-way handshake, the reference implementation uses a spam filter built with a modified count-min sketch. The `spamThreshold` constructor argument for `Minx` should ideally receive a lower value for P2P node deployments, e.g. `250`, to prevent P2P networks being hijacked for distributed amplification attacks. Centralized services using Minx can just use what is currently the highest allowed value (`65535`).

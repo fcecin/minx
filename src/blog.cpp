@@ -6,13 +6,12 @@
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/udp.hpp>
-#include <boost/container/small_vector.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/log/support/date_time.hpp>
 #include <boost/log/utility/setup/common_attributes.hpp>
 #include <boost/log/utility/setup/console.hpp>
 
-#include <logkv/bytes.h>
+#include <logkv/hex.h>
 
 namespace {
 constexpr const char* kChannelAttrName = "Channel";
@@ -268,6 +267,12 @@ void init() {
           strm << val.get();
         } else if (auto val =
                      boost::log::extract<const char*>(attr.first, rec)) {
+          strm << val.get();
+        } else if (auto val =
+                     boost::log::extract<std::array<uint8_t, 32>>(attr.first, rec)) {
+          strm << val.get();
+        } else if (auto val =
+                     boost::log::extract<std::array<uint8_t, 8>>(attr.first, rec)) {
           strm << val.get();
         } else if (auto val = boost::log::extract<std::vector<uint8_t>>(
                      attr.first, rec)) {

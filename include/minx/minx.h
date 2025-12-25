@@ -13,9 +13,8 @@
 
 #include <minx/bucketcache.h>
 #include <minx/buffer.h>
-#include <minx/ipfilter.h>
+#include <minx/filter.h>
 #include <minx/powengine.h>
-#include <minx/spamfilter.h>
 #include <minx/types.h>
 
 namespace minx {
@@ -141,7 +140,7 @@ struct MinxProveWork {
   const uint64_t time;
   const uint64_t nonce;
   Hash solution;
-  Bytes data;
+  std::vector<char> data;
   static constexpr size_t SIZE =
     sizeof(version) + sizeof(gpassword) + sizeof(spassword) + sizeof(ckey) +
     sizeof(hdata) + sizeof(time) + sizeof(nonce) + sizeof(solution);
@@ -239,6 +238,14 @@ private:
   // TODO:
   // - remove handlerCount_ & enable_shared_from_this for a MinxImpl
 
+  // A prefix (defined by filter.h) can only have MAX_WORK_PER_PREFIX pending
+  // work items in work_. This is to prevent attacks where an attacker will
+  // submit many (valid or invalid) PoW tickets to try and overload the PoW
+  // validation queue. If the tickets are invalid, the host and all its tickets
+  // will be purged without checking, but the work queue still has to reach the
+  // point where it processes them.
+  static constexpr size_t MAX_WORK_PER_PREFIX = 128;
+
   // Protocols implemented on Minx shouldn't push the total packet size over the
   // guaranteed IPv6 MTU of 1280 bytes in any case. All incoming packets with
   // size exactly MAX_UDP_BYTES are assumed to be truncated and are dropped
@@ -297,6 +304,7 @@ private:
   std::thread workerThread_;
   std::atomic<bool> stopWorker_ = false;
 
+  std::map<boost::asio::ip::address, size_t> workPrefixCounts_;
   std::queue<std::pair<MinxProveWork, SockAddr>> work_;
   std::mutex workMutex_;
 
@@ -317,6 +325,7 @@ private:
   std::mt19937_64 gen_;
   std::uniform_int_distribution<uint64_t> genDistrib_;
 
+  uint16_t spamThreshold_;
   SpamFilter spamFilter_;
 
   std::shared_ptr<minx::Buffer> acquireSendBuffer();
@@ -358,10 +367,13 @@ public:
    * thread::hardware_concurrency * 2).
    * @param randomXInitThreads Number of threads to use when initializing a
    * RandomX dataset (if less than 1, will use thread::hardware_concurrency()).
+   * @param spamThreshold Number of non-handshaked packets that will be received
+   * from same IP block in the spam filter's window (which defaults to 1 hour).
    */
   Minx(MinxListener* listener, uint64_t minProveWorkTimestamp = 0,
        uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE_SECS,
-       int randomXVmsToKeep = 0, int randomXInitThreads = 0);
+       int randomXVmsToKeep = 0, int randomXInitThreads = 0,
+       uint16_t spamThreshold = 250);
 
   /**
    * Destructor.

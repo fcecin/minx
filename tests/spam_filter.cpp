@@ -1,12 +1,14 @@
 #include <boost/asio.hpp>
 #include <boost/test/unit_test.hpp>
 #include <chrono>
-#include <minx/spamfilter.h>
+#include <minx/filter.h>
 #include <thread>
 
 namespace {
 
 using boost::asio::ip::address;
+
+using namespace minx;
 
 struct SpamFilterFixture {
   static constexpr size_t TEST_WIDTH = 1000;
@@ -118,6 +120,8 @@ BOOST_AUTO_TEST_CASE(TestExactThresholdBoundary) {
   std::string ip = "192.168.9.9";
   spam(ip, PASSING_CAPACITY);
   BOOST_TEST(check(ip) == true, "Packet 19 should drop");
+  filter = std::make_unique<SpamFilter>(TEST_WIDTH, TEST_DEPTH, TEST_THRESHOLD,
+                                        ROTATION_SEC);
   std::string ip2 = "192.168.10.10";
   spam(ip2, PASSING_CAPACITY - 1);
   BOOST_TEST(check(ip2) == false, "Packet 18 should still pass");

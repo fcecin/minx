@@ -1,8 +1,7 @@
-#ifndef _MINX_BUFFER_H_
-#define _MINX_BUFFER_H_
+#ifndef _MINXBUFFER_H_
+#define _MINXBUFFER_H_
 
 #include <boost/asio/buffer.hpp>
-#include <boost/container/static_vector.hpp>
 #include <boost/endian/conversion.hpp>
 
 #include <logkv/autoser.h>
@@ -13,25 +12,23 @@ namespace minx {
 
 /**
  * Reads and writes a backing byte span.
+ * Uses `logkv::serializer` to `get` and `put` objects.
  */
-template <typename T> class BasicBuffer {
+template <typename T> class AutoBuffer {
 public:
-  static_assert(sizeof(T) == 1,
-                "BasicBuffer<T> does not support sizeof(T) > 1");
+  static_assert(sizeof(T) == 1, "AutoBuffer<T> does not support sizeof(T) > 1");
 
   static constexpr bool IsMutable = !std::is_const_v<T>;
 
-  BasicBuffer() : r_(0), w_(0), s_(0) {}
+  AutoBuffer() : r_(0), w_(0), s_(0) {}
 
-  explicit BasicBuffer(std::span<T> backingSpan)
+  explicit AutoBuffer(std::span<T> backingSpan)
       : buf_(backingSpan), r_(0), w_(0),
         s_(IsMutable ? 0 : backingSpan.size()) {}
 
-  template <typename C> explicit BasicBuffer(C& c) {
-    setBackingContainer<C>(c);
-  }
+  template <typename C> explicit AutoBuffer(C& c) { setBackingContainer<C>(c); }
 
-  virtual ~BasicBuffer() = default;
+  virtual ~AutoBuffer() = default;
 
   auto data() {
     return reinterpret_cast<std::conditional_t<IsMutable, char*, const char*>>(
@@ -103,9 +100,32 @@ public:
     }
   }
 
-  minx::Bytes getRemainingBytes() {
+  /**
+   * Returns a view of the remaining bytes and advance the read cursor.
+   * WARNING: The returned span points to internal memory. Use "immediately"
+   * (for example, in the same scope); do NOT store the pointer long-term.
+   */
+  std::span<const uint8_t> getRemainingBytesSpan(size_t maxSize = 0) {
     size_t count = getRemainingBytesCount();
-    minx::Bytes result(count);
+
+    if (maxSize > 0 && count > maxSize) {
+      throw std::runtime_error(std::format(
+        "AutoBuffer::getRemainingBytesSpan(): maximum size exceeded: {} > {}",
+        count, maxSize));
+    }
+    std::span<const uint8_t> result(buf_.data() + r_, count);
+    r_ += count; // fake zero-copy read
+    return result;
+  }
+
+  template <typename R> R getRemainingBytes(size_t maxSize = 0) {
+    size_t count = getRemainingBytesCount();
+    if (maxSize > 0 && count > maxSize) {
+      throw std::runtime_error(std::format(
+        "AutoBuffer::getRemainingBytes(): maximum size exceeded: {} > {}",
+        count, maxSize));
+    }
+    R result(count);
     if (count > 0) {
       std::memcpy(result.data(), &buf_[r_], count);
       r_ += count;
@@ -161,9 +181,9 @@ private:
   size_t r_;
 };
 
-using Buffer = BasicBuffer<uint8_t>;
+using Buffer = AutoBuffer<uint8_t>;
 
-using ConstBuffer = BasicBuffer<const uint8_t>;
+using ConstBuffer = AutoBuffer<const uint8_t>;
 
 /**
  * Buffer with backing byte array.
@@ -171,6 +191,10 @@ using ConstBuffer = BasicBuffer<const uint8_t>;
 template <size_t N> class ArrayBuffer : public Buffer {
 public:
   ArrayBuffer() : Buffer(arrayBuf_) {}
+  ArrayBuffer(const ArrayBuffer&) = delete;
+  ArrayBuffer& operator=(const ArrayBuffer&) = delete;
+  ArrayBuffer(ArrayBuffer&&) = delete;
+  ArrayBuffer& operator=(ArrayBuffer&&) = delete;
 
 private:
   std::array<uint8_t, N> arrayBuf_;
@@ -188,20 +212,6 @@ public:
 
 private:
   std::vector<uint8_t> vectorBuf_;
-};
-
-/**
- * Buffer with backing byte static_vector.
- */
-template <size_t N> class StaticVectorBuffer : public Buffer {
-public:
-  explicit StaticVectorBuffer() {
-    vectorBuf_.resize(N);
-    setBackingSpan(vectorBuf_);
-  }
-
-private:
-  boost::container::static_vector<uint8_t, N> vectorBuf_;
 };
 
 } // namespace minx
