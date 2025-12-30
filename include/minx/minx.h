@@ -457,12 +457,31 @@ public:
    * NOTE: Using more than one thread to run `netIO` currently makes no sense
    * since all operations (send, receive) are serialized using a strand.
    * NOTE: Threads running `taskIO` can invoke the `MinxListener` callbacks.
-   * @param sockaddr The local IP address and port to bind to.
+   * @param sockAddr The local IP address and port (0=auto) to bind to.
    * @param netIO The `boost::asio::io_context` for a net recv/send thread.
    * @param taskIO The `boost::asio::io_context` for message processing threads.
+   * @return Bound port number if opened a socket, zero otherwise.
    * @throws A runtime exception on any error.
    */
-  void openSocket(const SockAddr& addr, IOContext& netIO, IOContext& taskIO);
+  uint16_t openSocket(const SockAddr& sockAddr, IOContext& netIO,
+                      IOContext& taskIO);
+
+  /**
+   * Open the UDP socket if one was not previously opened.
+   * The `boost::asio::io_context` objects are externally-provided, which gives
+   * the client full control over threading.
+   * NOTE: Using more than one thread to run `netIO` currently makes no sense
+   * since all operations (send, receive) are serialized using a strand.
+   * NOTE: Threads running `taskIO` can invoke the `MinxListener` callbacks.
+   * @param ipAddr The local IP address to bind to.
+   * @param port The local port to bind to (0=auto).
+   * @param netIO The `boost::asio::io_context` for a net recv/send thread.
+   * @param taskIO The `boost::asio::io_context` for message processing threads.
+   * @return Bound port number if opened a socket, zero otherwise.
+   * @throws A runtime exception on any error.
+   */
+  uint16_t openSocket(const IPAddr& ipAddr, uint16_t port, IOContext& netIO,
+                      IOContext& taskIO);
 
   /**
    * Close the UDP socket if one was previously opened.

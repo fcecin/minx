@@ -110,13 +110,13 @@ bool Minx::spendPassword(uint64_t password) {
   return found;
 }
 
-void Minx::openSocket(const SockAddr& addr, IOContext& netIO,
-                      IOContext& taskIO) {
+uint16_t Minx::openSocket(const SockAddr& sockAddr, IOContext& netIO,
+                          IOContext& taskIO) {
   LOGTRACE << "openSocket";
   std::lock_guard lock(socketStateMutex_);
   if (socket_) {
-    LOGTRACE << "openSocket no socket";
-    return;
+    LOGTRACE << "openSocket socket already exists";
+    return 0;
   }
   netIO_ = &netIO;
   taskIO_ = &taskIO;
@@ -128,17 +128,35 @@ void Minx::openSocket(const SockAddr& addr, IOContext& netIO,
       netIO_->get_executor());
   netIORetryTimer_ = std::make_unique<boost::asio::steady_timer>(*netIO_);
   socket_ = std::make_unique<boost::asio::ip::udp::socket>(*netIO_);
-  socket_->open(addr.protocol());
-  if (addr.protocol() == boost::asio::ip::udp::v6()) {
+  socket_->open(sockAddr.protocol());
+  if (sockAddr.protocol() == boost::asio::ip::udp::v6()) {
     boost::system::error_code ec;
     socket_->set_option(boost::asio::ip::v6_only(false), ec);
     if (ec) {
       LOGTRACE << "openSocket ipv6 failed to set option v6_only == false";
     }
   }
-  socket_->bind(addr);
-  receive();
-  LOGTRACE << "openSocket done";
+  try {
+    socket_->bind(sockAddr);
+    boost::system::error_code ec;
+    auto ep = socket_->local_endpoint(ec);
+    if (ec) {
+      LOGTRACE << "openSocket failed to get local endpoint";
+      return 0;
+    }
+    receive();
+    uint16_t serverBoundPort = ep.port();
+    LOGTRACE << "openSocket done" << VAR(serverBoundPort);
+    return serverBoundPort;
+  } catch (const std::exception& e) {
+    LOGTRACE << "openSocket bind failed: " << e.what();
+    return 0;
+  }
+}
+
+uint16_t Minx::openSocket(const IPAddr& ipAddr, uint16_t port, IOContext& netIO,
+                          IOContext& taskIO) {
+  return openSocket(SockAddr(ipAddr, port), netIO, taskIO);
 }
 
 void Minx::closeSocket() {
