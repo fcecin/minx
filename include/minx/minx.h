@@ -275,8 +275,8 @@ private:
   uint64_t minProveWorkTimestamp_;
 
   std::shared_mutex socketStateMutex_;
-
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
+  std::atomic<bool> socketClosing_ = false;
 
   IOContext* netIO_ = nullptr;
   std::unique_ptr<boost::asio::strand<IOContext::executor_type>> netIOStrand_;
@@ -485,8 +485,10 @@ public:
 
   /**
    * Close the UDP socket if one was previously opened.
+   * @param shouldPoll `true` (default) to poll the `IOContext`s during
+   * shutdown, `false` if caller is pumping the `IOContext`s during shutdown.
    */
-  void closeSocket();
+  void closeSocket(bool shouldPoll = true);
 
   /**
    * Send INIT message.

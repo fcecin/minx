@@ -73,7 +73,7 @@ Minx::~Minx() {
   closeSocket();
   LOGTRACE << "~Minx stop worker and engines";
   {
-    std::lock_guard lock(queueMutex_);
+    std::lock_guard lock(enginesMutex_);
     stopWorker_ = true;
     auto it = engines_.begin();
     while (it != engines_.end()) {
@@ -159,45 +159,38 @@ uint16_t Minx::openSocket(const IPAddr& ipAddr, uint16_t port, IOContext& netIO,
   return openSocket(SockAddr(ipAddr, port), netIO, taskIO);
 }
 
-void Minx::closeSocket() {
+void Minx::closeSocket(bool shouldPoll) {
   LOGTRACE << "closeSocket";
-  {
-    std::lock_guard lock(socketStateMutex_);
-    if (!socket_) {
-      return;
-    }
-    if (netIORetryTimer_) {
-      boost::system::error_code ec;
-      netIORetryTimer_->cancel(ec);
-    }
-    std::atomic<bool> done_flag(false);
-    boost::asio::post(*netIOStrand_, [this, &done_flag]() {
-      if (socket_) {
-        boost::system::error_code ec;
-        socket_->close(ec);
-        socket_.reset();
-      }
-      done_flag = true;
-    });
-    LOGTRACE << "closeSocket join netIO";
-    while (!done_flag || netIOHandlerCount_ > 0) {
-      if (netIO_)
-        netIO_->poll();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    netIORetryTimer_.reset();
-    netIOStrand_.reset();
-    netIO_ = nullptr;
+  std::lock_guard lock(socketStateMutex_);
+  if (!socket_) {
+    return;
   }
-  // TODO: This bit here is unprotected from multithreading because
-  // taskIO execution can actually trigger callbacks into client code.
-  // But really, who is going to call openSocket() / closeSocket()
-  // in rapid succession from different threads?
-  // In any case, the actual solution is fixing this handlerCount
-  // nonsense and using shared_from_this.
+  if (netIORetryTimer_) {
+    boost::system::error_code ec;
+    netIORetryTimer_->cancel(ec);
+  }
+  std::atomic<bool> done_flag(false);
+  boost::asio::post(*netIOStrand_, [this, &done_flag]() {
+    if (socket_) {
+      boost::system::error_code ec;
+      socket_->close(ec);
+      socket_.reset();
+    }
+    done_flag = true;
+  });
+  LOGTRACE << "closeSocket join netIO";
+  while (!done_flag || netIOHandlerCount_ > 0) {
+    if (shouldPoll && netIO_)
+      netIO_->poll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  netIORetryTimer_.reset();
+  netIOStrand_.reset();
+  netIO_ = nullptr;
   LOGTRACE << "closeSocket join taskIO";
+  socketClosing_ = true;
   while (taskIOHandlerCount_ > 0) {
-    if (taskIO_) {
+    if (shouldPoll && taskIO_) {
       try {
         taskIO_->poll();
       } catch (...) {
@@ -205,11 +198,9 @@ void Minx::closeSocket() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  {
-    std::lock_guard lock(socketStateMutex_);
-    taskIOWorkGuard_.reset();
-    taskIO_ = nullptr;
-  }
+  socketClosing_ = false;
+  taskIOWorkGuard_.reset();
+  taskIO_ = nullptr;
   LOGTRACE << "closeSocket done";
 }
 
@@ -733,18 +724,19 @@ void Minx::receive() {
     if (slot.busy_) {
       // If no more slots, of which are plenty, should wait a long time anyways.
       netIORetryTimer_->expires_after(std::chrono::milliseconds(100));
-      netIORetryTimer_->async_wait([this](const boost::system::error_code& ec) {
-        if (ec == boost::asio::error::operation_aborted) {
-          // closeSocket() was called and we killer the timer somewhere in there
-          return;
-        }
-        if (ec) {
-          throw std::runtime_error("boost timer returned a fatal error: " +
-                                   std::to_string(ec.value()) + " (" +
-                                   ec.message() + ")");
-        }
-        receive();
-      });
+      ++netIOHandlerCount_;
+      netIORetryTimer_->async_wait(boost::asio::bind_executor(
+        *netIOStrand_, [this](const boost::system::error_code& ec) {
+          ScopeExit onExit([&]() { --netIOHandlerCount_; });
+          if (ec == boost::asio::error::operation_aborted)
+            return;
+          if (ec) {
+            throw std::runtime_error("boost timer returned a fatal error: " +
+                                     std::to_string(ec.value()) + " (" +
+                                     ec.message() + ")");
+          }
+          receive();
+        }));
       return;
     }
     slot.busy_ = true;
@@ -806,6 +798,10 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     slot.busy_ = false;
     --taskIOHandlerCount_;
   });
+
+  // we're holding the socketStateMutex_ in closeSocket() so don't do anything
+  if (socketClosing_)
+    return;
 
   auto& remoteAddr_ = slot.remoteAddr_;
   auto& buffer_ = (*recvBuffers_)[slotIndex];
