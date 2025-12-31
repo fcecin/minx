@@ -330,6 +330,8 @@ private:
 
   std::shared_ptr<minx::Buffer> acquireSendBuffer();
 
+  MINX_LOG_INSTANCE_STANDARD_BOILERPLATE
+
   void releaseSendBuffer(std::shared_ptr<minx::Buffer> buf);
 
   void doSocketSend(const SockAddr& addr,
@@ -355,6 +357,7 @@ public:
   /**
    * Constructor.
    * @param listener The `MinxListener` to use.
+   * @param instanceName Instance string name for logging.
    * @param spendSlotSize Duration of each double-spend time slot in seconds
    * (default: 1 hour).
    * @param minProveWorkTimestamp If greater than zero, minimum value for any
@@ -370,7 +373,8 @@ public:
    * @param spamThreshold Number of non-handshaked packets that will be received
    * from same IP block in the spam filter's window (which defaults to 1 hour).
    */
-  Minx(MinxListener* listener, uint64_t minProveWorkTimestamp = 0,
+  Minx(MinxListener* listener, const std::string instanceName = "",
+       uint64_t minProveWorkTimestamp = 0,
        uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE_SECS,
        int randomXVmsToKeep = 0, int randomXInitThreads = 0,
        uint16_t spamThreshold = 250);

@@ -239,6 +239,13 @@ void init() {
       size_t channelLen =
         (channelStr != blog::kDefaultModule) ? channelStr.length() + 1 : 0;
 
+      auto instance = boost::log::extract<std::string>(kInstanceAttrName, rec);
+      std::string instanceStr = instance ? instance.get() : "";
+      if (instanceStr != "") {
+        channelLen += 2 + instanceStr.length();
+        channelStr += "[" + instanceStr + "]";
+      }
+
       auto msgRef = boost::log::extract<std::string>(kMessageAttrName, rec);
       std::string msgStr = msgRef ? msgRef.get() : "";
       size_t msgLen = msgStr.length();
@@ -259,7 +266,8 @@ void init() {
         const std::string& name = attr.first.string();
         if (name == kSeverityAttrName || name == kMessageAttrName ||
             name == kFileAttrName || name == kLineAttrName ||
-            name == kTimeStampAttrName || name == kChannelAttrName) {
+            name == kTimeStampAttrName || name == kChannelAttrName ||
+            name == kInstanceAttrName) {
           continue;
         }
         strm << " " << sev_color << name << RESET << "=" << VAL_C;
@@ -268,11 +276,11 @@ void init() {
         } else if (auto val =
                      boost::log::extract<const char*>(attr.first, rec)) {
           strm << val.get();
-        } else if (auto val =
-                     boost::log::extract<std::array<uint8_t, 32>>(attr.first, rec)) {
+        } else if (auto val = boost::log::extract<std::array<uint8_t, 32>>(
+                     attr.first, rec)) {
           strm << val.get();
-        } else if (auto val =
-                     boost::log::extract<std::array<uint8_t, 8>>(attr.first, rec)) {
+        } else if (auto val = boost::log::extract<std::array<uint8_t, 8>>(
+                     attr.first, rec)) {
           strm << val.get();
         } else if (auto val = boost::log::extract<std::vector<uint8_t>>(
                      attr.first, rec)) {

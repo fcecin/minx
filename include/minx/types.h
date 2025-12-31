@@ -12,6 +12,10 @@
 
 namespace minx {
 
+#define MINX_LOG_INSTANCE_STANDARD_BOILERPLATE                                 \
+  std::string instanceName_;                                                   \
+  std::string _instanceName(int) const { return instanceName_; }
+
 static constexpr size_t MAX_DATA_SIZE = 1280;
 
 using SockAddr = boost::asio::ip::udp::endpoint;

@@ -23,6 +23,13 @@
  *
  *   blog::set_level("mymod", blog::trace);
  *
+ * To add automatic instance name logging to a class:
+ *
+ *   class MyClass {
+ *     std::string name_ = "Worker1";
+ *     LOG_INSTANCE_NAME(name_);
+ *   };
+ *
  * See `src/minx.cpp` and `examples/hello/hello.cpp` for more usage examples.
  */
 
@@ -51,6 +58,7 @@ constexpr auto default_log_level = info;
 constexpr const char* kDefaultModule = "";
 constexpr const char* kFileAttrName = "File";
 constexpr const char* kLineAttrName = "Line";
+constexpr const char* kInstanceAttrName = "Inst";
 } // namespace blog
 
 namespace src = boost::log::sources;
@@ -113,6 +121,9 @@ void init();
 
 inline logger_type& get_logger() { return my_logger::get(); }
 
+inline std::string to_str(const std::string& s) { return s; }
+inline std::string to_str(const char* s) { return s; }
+inline std::string to_str(char* s) { return s; }
 template <typename T> std::string to_str(const T& value) {
   std::ostringstream oss;
   oss << value;
@@ -130,6 +141,7 @@ namespace blog_fallback {
 static constexpr const char* resolve_log_module(long) {
   return ::blog::kDefaultModule;
 }
+static constexpr const char* _instanceName(long) { return ""; }
 } // namespace blog_fallback
 
 #define GET_MACRO(_1, _2, NAME, ...) NAME
@@ -147,6 +159,9 @@ static constexpr const char* resolve_log_module(long) {
 
 #define LOG_MODULE_DISABLED(name) LOG_MODULE(name, ::blog::none)
 
+#define LOG_INSTANCE_NAME(name_expr)                                           \
+  auto _instanceName(int) const { return (name_expr); }
+
 #define MLOG_LEVEL(level)                                                      \
   BOOST_LOG_CHANNEL_SEV(::blog::get_logger(), ([]() {                          \
                           using namespace blog_fallback;                       \
@@ -154,7 +169,11 @@ static constexpr const char* resolve_log_module(long) {
                         }()),                                                  \
                         level)                                                 \
     << ::boost::log::add_value(blog::kFileAttrName, __FILE__)                  \
-    << ::boost::log::add_value(blog::kLineAttrName, __LINE__)
+    << ::boost::log::add_value(blog::kLineAttrName, __LINE__)                  \
+    << ::boost::log::add_value(blog::kInstanceAttrName, [&]() {                \
+         using namespace blog_fallback;                                        \
+         return ::blog::to_str(_instanceName(0));                              \
+       }())
 
 #define LOGTRACE MLOG_LEVEL(::blog::trace)
 #define LOGDEBUG MLOG_LEVEL(::blog::debug)

@@ -93,6 +93,9 @@ private:
 
   friend class RandomXVMReleaser;
   std::atomic<int64_t> pendingReleasers_ = 0;
+
+  std::string instanceName_;
+  std::string _instanceName(int) const { return instanceName_; }
 };
 
 #endif

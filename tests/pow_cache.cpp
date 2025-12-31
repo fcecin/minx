@@ -4,8 +4,7 @@
 
 namespace {
 
-class MinxMockListener : public minx::MinxListener {
-};
+class MinxMockListener : public minx::MinxListener {};
 
 minx::Hash makeHash(uint64_t id) {
   minx::Hash h;
@@ -20,7 +19,7 @@ struct MinxFixture {
   std::unique_ptr<minx::Minx> minx;
   uint64_t uniqueHashId = 0;
   MinxFixture() {
-    minx = std::make_unique<minx::Minx>(&listener, 0, SLOT_SIZE);
+    minx = std::make_unique<minx::Minx>(&listener, "", 0, SLOT_SIZE);
   }
   bool isTimeAccepted(uint64_t t) {
     return minx->replayPoW(t, makeHash(++uniqueHashId));

@@ -3,6 +3,8 @@
 #include <minx/blog.h>
 LOG_MODULE_DISABLED("powengine")
 
+#include <logkv/hex.h>
+
 RandomXVM::RandomXVM(randomx_vm* vm) : vm_(vm) {
   if (!vm_) {
     throw std::runtime_error(
@@ -41,6 +43,12 @@ PoWEngine::PoWEngine(std::span<const uint8_t> key, bool full_mem, int vmsToKeep)
   vmsToKeep_ = vmsToKeep;
   if (vmsToKeep_ < 1) {
     vmsToKeep = std::thread::hardware_concurrency() * 2;
+  }
+  if (!key_.empty()) {
+    size_t len = std::min(key_.size(), size_t{4});
+    instanceName_ = std::string(8, '\0');
+    logkv::encodeHex(instanceName_.data(), instanceName_.size(),
+                     reinterpret_cast<const char*>(key_.data()), len, true);
   }
 }
 
@@ -264,6 +272,7 @@ void PoWEngine::cleanup() {
   dataset_ = nullptr;
   cache_ = nullptr;
   key_.clear();
+  // instanceName_.clear(); -- used by dtor to print
   error_message_.clear();
 }
 
@@ -274,6 +283,7 @@ void PoWEngine::move_from(PoWEngine&& other) {
   vmPool_ = std::move(other.vmPool_);
   is_full_mem_ = other.is_full_mem_;
   key_ = std::move(other.key_);
+  instanceName_ = std::move(other.instanceName_);
   error_message_ = std::move(other.error_message_);
   state_.store(other.state_.load(std::memory_order_relaxed),
                std::memory_order_relaxed);
@@ -285,5 +295,6 @@ void PoWEngine::move_from(PoWEngine&& other) {
   other.state_.store(PoWEngineState::Uninitialized);
   other.destruction_requested_.store(false);
   other.key_.clear();
+  other.instanceName_.clear();
   other.error_message_.clear();
 }

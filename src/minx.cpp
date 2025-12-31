@@ -46,10 +46,11 @@ std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
             << " soln:" << m.solution << " data:" << m.data << "}";
 }
 
-Minx::Minx(MinxListener* listener, uint64_t minProveWorkTimestamp,
-           uint64_t spendSlotSize, int randomXVMsToKeep, int randomXInitThreads,
-           uint16_t spamThreshold)
-    : listener_(listener), minProveWorkTimestamp_(minProveWorkTimestamp),
+Minx::Minx(MinxListener* listener, const std::string instanceName,
+           uint64_t minProveWorkTimestamp, uint64_t spendSlotSize,
+           int randomXVMsToKeep, int randomXInitThreads, uint16_t spamThreshold)
+    : instanceName_(instanceName), listener_(listener),
+      minProveWorkTimestamp_(minProveWorkTimestamp),
       spendSlotSize_(spendSlotSize), randomXVMsToKeep_(randomXVMsToKeep),
       randomXInitThreads_(randomXInitThreads), spamThreshold_(spamThreshold),
       passwords_(1'000'000, 60), gen_(std::random_device{}()),

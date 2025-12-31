@@ -23,6 +23,7 @@ int main(int argc, char* argv[]) {
       blog::enable("powengine");
       blog::set_level(blog::trace);
       blog::dim(true);
+      LOGINFO << "verbose logging enabled";
     } else {
       std::cout << "usage: hello [-v]" << std::endl;
       exit(1);
@@ -177,13 +178,13 @@ int main(int argc, char* argv[]) {
   minx::Hash server_key = generateRandomHash();
 
   ServerListener server_listener(testFinished, server_key);
-  minx::Minx server_minx(&server_listener);
+  minx::Minx server_minx(&server_listener, "sv");
   server_minx.setUseDataset(false); // server will verify hash only once
   server_listener.setMinxInstance(&server_minx);
 
   minx::Hash client_key = generateRandomHash();
   ClientListener client_listener(client_key, server_addr);
-  minx::Minx client_minx(&client_listener);
+  minx::Minx client_minx(&client_listener, "cl");
   client_minx.setUseDataset(true); // client will hash repeatedly (hash mining)
   client_listener.setMinxInstance(&client_minx);
 
