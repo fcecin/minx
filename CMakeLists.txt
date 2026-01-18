@@ -39,7 +39,7 @@ set(ARCH "native" CACHE STRING "Set RandomX architecture optimizations" FORCE)
 
 FetchContent_MakeAvailable(randomx)
 
-# fcecin/logkv (a header-only library)
+# logkv
 
 FetchContent_Declare(
     logkv
@@ -59,7 +59,6 @@ target_compile_definitions(minxlib PRIVATE BOOST_ASIO_HEADER_ONLY)
 
 target_include_directories(minxlib
 PUBLIC
-  ${logkv_SOURCE_DIR}/include
   ${randomx_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${Boost_INCLUDE_DIRS}
@@ -67,6 +66,7 @@ PUBLIC
 
 target_link_libraries(minxlib
 PUBLIC
+  logkv
   randomx
   ${Boost_LIBRARIES}
 PRIVATE

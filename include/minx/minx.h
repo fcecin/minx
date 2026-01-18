@@ -231,6 +231,64 @@ public:
 };
 
 /**
+ * Configuration parameters for the Minx instance.
+ */
+struct MinxConfig {
+  /**
+   * The sliding-window PoW spend table has 1 hour slots by default.
+   */
+  static constexpr size_t DEFAULT_SPEND_SLOT_SIZE_SECS = 3600;
+
+  /**
+   * Instance string name for logging. Use "" to not log an instance name.
+   */
+  std::string instanceName = "";
+
+  /**
+   * If greater than zero, minimum value for any incoming MinxProveWork::time.
+   * Any PROVE_WORK message with a smaller timestamp will be rejected as
+   * untimely. This has to be used if the application is not persisting the
+   * double-spend database. A good value is probably (spendSlotSize * 2 +
+   * Minx::PROVE_WORK_FUTURE_DRIFT_SECS).
+   */
+  uint64_t minProveWorkTimestamp = 0;
+
+  /**
+   * Duration of each PoW spend table time slot in seconds.
+   */
+  uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE_SECS;
+
+  /**
+   * Maximum number of internal `randomx_vm` objects to keep inside each
+   * Minx::getPoWEngine(). If < 1, will use thread::hardware_concurrency * 2).
+   */
+  int randomXVMsToKeep = 0;
+
+  /**
+   * Number of threads to use when initializing a RandomX dataset. If < 1,
+   * will use thread::hardware_concurrency().
+   */
+  int randomXInitThreads = 0;
+
+  /**
+   * Number of non-handshaked packets that will be received from same IP block
+   * in the spam filter's window (which defaults to 1 hour)
+   */
+  uint16_t spamThreshold = 250;
+
+  /**
+   * If `true`, packets received from loopback addresses will be trusted and not
+   * subject to filtering (default: `false`).
+   */
+  bool trustLoopback = false;
+
+  /**
+   * Size of receive ring buffer (number of 2048 byte buffers).
+   */
+  size_t recvBuffersSize = 16384;
+};
+
+/**
  * MINX reference implementation.
  */
 class Minx {
@@ -241,29 +299,28 @@ private:
   // A prefix (defined by filter.h) can only have MAX_WORK_PER_PREFIX pending
   // work items in work_. This is to prevent attacks where an attacker will
   // submit many (valid or invalid) PoW tickets to try and overload the PoW
-  // validation queue. If the tickets are invalid, the host and all its tickets
-  // will be purged without checking, but the work queue still has to reach the
-  // point where it processes them.
+  // validation queue. If the tickets are invalid, the host and all its
+  // tickets will be purged without checking, but the work queue still has to
+  // reach the point where it processes them.
   static constexpr size_t MAX_WORK_PER_PREFIX = 128;
 
-  // Protocols implemented on Minx shouldn't push the total packet size over the
-  // guaranteed IPv6 MTU of 1280 bytes in any case. All incoming packets with
-  // size exactly MAX_UDP_BYTES are assumed to be truncated and are dropped
-  // (an application should not be generating packets of size anywhere near
-  // MAX_UDP_BYTES anyway).
+  // Protocols implemented on Minx shouldn't push the total packet size over
+  // the guaranteed IPv6 MTU of 1280 bytes in any case. All incoming packets
+  // with size exactly MAX_UDP_BYTES are assumed to be truncated and are
+  // dropped (an application should not be generating packets of size anywhere
+  // near MAX_UDP_BYTES anyway).
   static constexpr size_t MAX_UDP_BYTES = 2048;
   static constexpr size_t SEND_BUFFER_POOL_MAX_SIZE = 256;
-  static constexpr size_t RECV_BUFFER_ARRAY_SIZE = 16384;
 
   struct RecvSlot {
     SockAddr remoteAddr_;
     bool busy_ = false;
   };
-  using RecvBuffersInfo = std::array<RecvSlot, RECV_BUFFER_ARRAY_SIZE>;
-  using RecvBuffers =
-    std::array<ArrayBuffer<MAX_UDP_BYTES>, RECV_BUFFER_ARRAY_SIZE>;
+  using RecvBuffersInfo = std::vector<RecvSlot>;
+  using RecvBufferType = ArrayBuffer<MAX_UDP_BYTES>;
+  using RecvBuffers = std::unique_ptr<RecvBufferType[]>;
 
-  std::unique_ptr<RecvBuffers> recvBuffers_;
+  RecvBuffers recvBuffers_;
   RecvBuffersInfo recvBuffersInfo_;
   std::mutex recvBuffersMutex_;
   size_t recvBuffersIndex_ = 0;
@@ -272,7 +329,6 @@ private:
   std::vector<std::shared_ptr<minx::Buffer>> sendBufferPool_;
 
   MinxListener* listener_ = nullptr;
-  uint64_t minProveWorkTimestamp_;
 
   std::shared_mutex socketStateMutex_;
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
@@ -296,8 +352,6 @@ private:
   std::mutex enginesMutex_;
 
   std::atomic<bool> useDataset_ = true;
-  int randomXInitThreads_;
-  int randomXVMsToKeep_;
   std::queue<Hash> pendingInitializations_;
   std::mutex queueMutex_;
   std::condition_variable queueCondVar_;
@@ -308,10 +362,12 @@ private:
   std::queue<std::pair<MinxProveWork, SockAddr>> work_;
   std::mutex workMutex_;
 
+  std::unordered_set<Hash, SecureHashHasher> workChecking_;
+  std::mutex workCheckingMutex_;
+
   uint8_t minDiff_ = 1;
 
   std::shared_mutex spendMutex_;
-  uint64_t spendSlotSize_;
   uint64_t spendBaseTime_ = 0;
   std::deque<std::unordered_set<Hash, SecureHashHasher>> spend_;
 
@@ -325,12 +381,13 @@ private:
   std::mt19937_64 gen_;
   std::uniform_int_distribution<uint64_t> genDistrib_;
 
-  uint16_t spamThreshold_;
   SpamFilter spamFilter_;
 
-  std::shared_ptr<minx::Buffer> acquireSendBuffer();
+  MinxConfig config_;
 
-  MINX_LOG_INSTANCE_STANDARD_BOILERPLATE
+  uint64_t updatePoWSpendCacheInternal(uint64_t epochSecs = 0);
+
+  std::shared_ptr<minx::Buffer> acquireSendBuffer();
 
   void releaseSendBuffer(std::shared_ptr<minx::Buffer> buf);
 
@@ -346,10 +403,10 @@ private:
 
   void workerLoop();
 
-public:
-  // Default spend db slot size in seconds (1 hour)
-  static constexpr size_t DEFAULT_SPEND_SLOT_SIZE_SECS = 3600;
+protected:
+  MINX_LOG_INSTANCE_STANDARD_BOILERPLATE
 
+public:
   // Incoming PROVE_WORK timestamps are allowed to be at most this number of
   // seconds into the future (5 minutes)
   static constexpr uint64_t PROVE_WORK_FUTURE_DRIFT_SECS = 300;
@@ -357,27 +414,9 @@ public:
   /**
    * Constructor.
    * @param listener The `MinxListener` to use.
-   * @param instanceName Instance string name for logging.
-   * @param spendSlotSize Duration of each double-spend time slot in seconds
-   * (default: 1 hour).
-   * @param minProveWorkTimestamp If greater than zero, minimum value for any
-   * incoming MinxProveWork::time. Any PROVE_WORK message with a smaller
-   * timestamp will be rejected as untimely. This has to be used if the
-   * application is not persisting the double-spend database. A good value is
-   * probably (spendSlotSize * 2 + Minx::PROVE_WORK_FUTURE_DRIFT_SECS).
-   * @param randomXVmsToKeep Maximum number of internal `randomx_vm` objects to
-   * keep inside each Minx::getPoWEngine() (if less than 1, will use
-   * thread::hardware_concurrency * 2).
-   * @param randomXInitThreads Number of threads to use when initializing a
-   * RandomX dataset (if less than 1, will use thread::hardware_concurrency()).
-   * @param spamThreshold Number of non-handshaked packets that will be received
-   * from same IP block in the spam filter's window (which defaults to 1 hour).
+   * @param config The config parameters to use.
    */
-  Minx(MinxListener* listener, const std::string instanceName = "",
-       uint64_t minProveWorkTimestamp = 0,
-       uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE_SECS,
-       int randomXVmsToKeep = 0, int randomXInitThreads = 0,
-       uint16_t spamThreshold = 250);
+  Minx(MinxListener* listener, const MinxConfig config = {});
 
   /**
    * Destructor.
@@ -428,8 +467,8 @@ public:
 
   /**
    * Set whether to use RandoMX datasets or just the cache.
-   * @param useDataset `true` to allocate the full dataset, `false` to just use
-   * the cache.
+   * @param useDataset `true` to allocate the full dataset, `false` to just
+   * use the cache.
    */
   void setUseDataset(bool useDataset) { useDataset_ = useDataset; };
 
@@ -456,14 +495,15 @@ public:
 
   /**
    * Open the UDP socket if one was not previously opened.
-   * The `boost::asio::io_context` objects are externally-provided, which gives
-   * the client full control over threading.
-   * NOTE: Using more than one thread to run `netIO` currently makes no sense
-   * since all operations (send, receive) are serialized using a strand.
-   * NOTE: Threads running `taskIO` can invoke the `MinxListener` callbacks.
+   * The `boost::asio::io_context` objects are externally-provided, which
+   * gives the client full control over threading. NOTE: Using more than one
+   * thread to run `netIO` currently makes no sense since all operations
+   * (send, receive) are serialized using a strand. NOTE: Threads running
+   * `taskIO` can invoke the `MinxListener` callbacks.
    * @param sockAddr The local IP address and port (0=auto) to bind to.
    * @param netIO The `boost::asio::io_context` for a net recv/send thread.
-   * @param taskIO The `boost::asio::io_context` for message processing threads.
+   * @param taskIO The `boost::asio::io_context` for message processing
+   * threads.
    * @return Bound port number if opened a socket, zero otherwise.
    * @throws A runtime exception on any error.
    */
@@ -472,15 +512,16 @@ public:
 
   /**
    * Open the UDP socket if one was not previously opened.
-   * The `boost::asio::io_context` objects are externally-provided, which gives
-   * the client full control over threading.
-   * NOTE: Using more than one thread to run `netIO` currently makes no sense
-   * since all operations (send, receive) are serialized using a strand.
-   * NOTE: Threads running `taskIO` can invoke the `MinxListener` callbacks.
+   * The `boost::asio::io_context` objects are externally-provided, which
+   * gives the client full control over threading. NOTE: Using more than one
+   * thread to run `netIO` currently makes no sense since all operations
+   * (send, receive) are serialized using a strand. NOTE: Threads running
+   * `taskIO` can invoke the `MinxListener` callbacks.
    * @param ipAddr The local IP address to bind to.
    * @param port The local port to bind to (0=auto).
    * @param netIO The `boost::asio::io_context` for a net recv/send thread.
-   * @param taskIO The `boost::asio::io_context` for message processing threads.
+   * @param taskIO The `boost::asio::io_context` for message processing
+   * threads.
    * @return Bound port number if opened a socket, zero otherwise.
    * @throws A runtime exception on any error.
    */
@@ -549,8 +590,9 @@ public:
    * Check if a PoW solution is spent.
    * @param time The timestamp of the PoW solution to check.
    * @param solution The hash of the PoW solution check.
-   * @param epochSecs Current time in seconds since epoch to use as the current
-   * time. If `0` (default), get the current time from the system clock.
+   * @param epochSecs Current time in seconds since epoch to use as the
+   * current time. If `0` (default), get the current time from the system
+   * clock.
    * @return `MINX_SOLUTION_UNSPENT` if the solution is timely and not spent,
    * `MINX_SOLUTION_SPENT` if the solution is timely and spent, or
    * `MINX_SOLUTION_UNTIMELY` if the solution's timestamp is outside the
@@ -561,11 +603,12 @@ public:
 
   /**
    * Checks if the double-spend cache's bucket list should be updated by, for
-   * example, dropping old buckets or inserting new buckets. This method must be
-   * called before `verifyPoWs` (and `replayPoW` calls if they are not called
-   * right after the Minx constructor).
-   * @param epochSecs Current time in seconds since epoch to use as the current
-   * time. If `0` (default), get the current time from the system clock.
+   * example, dropping old buckets or inserting new buckets. This method must
+   * be called before `verifyPoWs` (and `replayPoW` calls if they are not
+   * called right after the Minx constructor).
+   * @param epochSecs Current time in seconds since epoch to use as the
+   * current time. If `0` (default), get the current time from the system
+   * clock.
    * @return Earliest time in seconds since epoch that can be stored in the
    * double-spend cache. Earlier solution times are too old and won't be
    * spendable at all in any case. The application can safely delete any
@@ -618,8 +661,8 @@ public:
   /**
    * Verify any pending incoming PoWs (can be called by multiple threads).
    * Pending PoWs are only verified after the server key's PoWEngine is ready.
-   * @param limit Maximum number of PoW hashes to validate in this call, or `0`
-   * to validate all pending PoW hashes.
+   * @param limit Maximum number of PoW hashes to validate in this call, or
+   * `0` to validate all pending PoW hashes.
    * @return If zero or greater, number of PoW verification jobs performed,
    * otherwise a temporary error occurred (no PoWEngine, or engine not ready).
    */
@@ -669,10 +712,10 @@ public:
    * @param numThreads Number of threads to use for mining; default is 1. A
    * value of 0 means `std::hardware_concurrency`.
    * @param startNonce Starting nonce value for solution search (default: 0).
-   * @param maxIters Maximum number of solutions to try; if zero, will try until
-   * a solution is found.
-   * @return Proof-of-Work template message with the mined solution, or an empty
-   * optional if the solution was not found in `maxIters` iterations.
+   * @param maxIters Maximum number of solutions to try; if zero, will try
+   * until a solution is found.
+   * @return Proof-of-Work template message with the mined solution, or an
+   * empty optional if the solution was not found in `maxIters` iterations.
    * @throws std::runtime_error if VM not found or is not ready.
    */
   std::optional<MinxProveWork> proveWork(const Hash& myKey, const Hash& hdata,
@@ -695,7 +738,8 @@ public:
    * @param addr IP address to check against the spam filter.
    * @param alsoUpdate `true` to update the spam counter (+1) as well, `false`
    * to just read the spam filter.
-   * @return `true` if address is flagged by the spam filter, `false` otherwise.
+   * @return `true` if address is flagged by the spam filter, `false`
+   * otherwise.
    */
   bool checkSpam(const IPAddr& addr, bool alsoUpdate = true);
 };

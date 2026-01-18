@@ -46,23 +46,19 @@ std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
             << " soln:" << m.solution << " data:" << m.data << "}";
 }
 
-Minx::Minx(MinxListener* listener, const std::string instanceName,
-           uint64_t minProveWorkTimestamp, uint64_t spendSlotSize,
-           int randomXVMsToKeep, int randomXInitThreads, uint16_t spamThreshold)
-    : instanceName_(instanceName), listener_(listener),
-      minProveWorkTimestamp_(minProveWorkTimestamp),
-      spendSlotSize_(spendSlotSize), randomXVMsToKeep_(randomXVMsToKeep),
-      randomXInitThreads_(randomXInitThreads), spamThreshold_(spamThreshold),
+Minx::Minx(MinxListener* listener, const MinxConfig config)
+    : instanceName_(config.instanceName), listener_(listener), config_(config),
       passwords_(1'000'000, 60), gen_(std::random_device{}()),
       genDistrib_(1, std::numeric_limits<uint64_t>::max()),
-      spamFilter_(1'000'000, 3, spamThreshold, 3600) {
+      spamFilter_(1'000'000, 3, config.spamThreshold, 3600) {
   LOGTRACE << "Minx";
   if (!listener_) {
     throw std::runtime_error("listener cannot be nullptr");
   }
-  recvBuffers_ = std::make_unique<RecvBuffers>();
-  for (auto& buf : *recvBuffers_) {
-    buf.setSizeToCapacity();
+  recvBuffersInfo_.resize(config.recvBuffersSize);
+  recvBuffers_ = std::make_unique<RecvBufferType[]>(config.recvBuffersSize);
+  for (size_t i = 0; i < config.recvBuffersSize; ++i) {
+    recvBuffers_[i].setSizeToCapacity();
   }
   workerThread_ = std::thread(&Minx::workerLoop, this);
   updatePoWSpendCache();
@@ -130,6 +126,33 @@ uint16_t Minx::openSocket(const SockAddr& sockAddr, IOContext& netIO,
   netIORetryTimer_ = std::make_unique<boost::asio::steady_timer>(*netIO_);
   socket_ = std::make_unique<boost::asio::ip::udp::socket>(*netIO_);
   socket_->open(sockAddr.protocol());
+
+  try {
+    boost::asio::socket_base::receive_buffer_size rBuf;
+    boost::asio::socket_base::send_buffer_size sBuf;
+
+    socket_->get_option(rBuf);
+    socket_->get_option(sBuf);
+    int rBefore = rBuf.value();
+    int sBefore = sBuf.value();
+    LOGDEBUG << "openSocket buffer sizes BEFORE:" << VAR(rBefore)
+             << VAR(sBefore);
+
+    int targetSize = 1 << 24;
+    socket_->set_option(
+      boost::asio::socket_base::receive_buffer_size(targetSize));
+    socket_->set_option(boost::asio::socket_base::send_buffer_size(targetSize));
+
+    socket_->get_option(rBuf);
+    socket_->get_option(sBuf);
+    int rAfter = rBuf.value();
+    int sAfter = sBuf.value();
+    LOGDEBUG << "openSocket buffer sizes AFTER:" << VAR(rAfter) << VAR(sAfter);
+
+  } catch (const std::exception& e) {
+    LOGWARNING << "openSocket failed to set/get buffer options: " << e.what();
+  }
+
   if (sockAddr.protocol() == boost::asio::ip::udp::v6()) {
     boost::system::error_code ec;
     socket_->set_option(boost::asio::ip::v6_only(false), ec);
@@ -309,28 +332,27 @@ int Minx::queryPoW(const uint64_t time, const Hash& solution,
     now = getSecsSinceEpoch();
   }
   bool forceSpendCacheUpdate = false;
-  {
-    std::shared_lock lock(spendMutex_);
-    if (time < spendBaseTime_ || time > now + PROVE_WORK_FUTURE_DRIFT_SECS) {
-      return MINX_SOLUTION_UNTIMELY;
-    }
-    size_t slot_index = (time - spendBaseTime_) / spendSlotSize_;
-    if (slot_index >= spend_.size()) {
-      // Maybe the spend cache just needs updating
-      forceSpendCacheUpdate = true;
-    } else {
-      if (spend_[slot_index].count(solution)) {
-        return MINX_SOLUTION_SPENT;
-      }
+  std::shared_lock read_lock(spendMutex_);
+  if (time < spendBaseTime_ || time > now + PROVE_WORK_FUTURE_DRIFT_SECS) {
+    return MINX_SOLUTION_UNTIMELY;
+  }
+  size_t slot_index = (time - spendBaseTime_) / config_.spendSlotSize;
+  if (slot_index >= spend_.size()) {
+    // Maybe the spend cache just needs updating
+    forceSpendCacheUpdate = true;
+  } else {
+    if (spend_[slot_index].count(solution)) {
+      return MINX_SOLUTION_SPENT;
     }
   }
   if (forceSpendCacheUpdate) {
-    updatePoWSpendCache(now);
-    std::shared_lock lock(spendMutex_);
+    read_lock.unlock();
+    std::lock_guard write_lock(spendMutex_);
+    updatePoWSpendCacheInternal(now);
     if (time < spendBaseTime_) {
       return MINX_SOLUTION_UNTIMELY;
     }
-    size_t slot_index = (time - spendBaseTime_) / spendSlotSize_;
+    size_t slot_index = (time - spendBaseTime_) / config_.spendSlotSize;
     if (slot_index >= spend_.size()) {
       throw std::runtime_error("double-spend logic error");
     }
@@ -342,23 +364,30 @@ int Minx::queryPoW(const uint64_t time, const Hash& solution,
 }
 
 uint64_t Minx::updatePoWSpendCache(uint64_t epochSecs) {
+  std::lock_guard lock(spendMutex_);
+  return updatePoWSpendCacheInternal(epochSecs);
+}
+
+uint64_t Minx::updatePoWSpendCacheInternal(uint64_t epochSecs) {
   uint64_t now = epochSecs;
   if (!now) {
     now = getSecsSinceEpoch();
   }
-  std::lock_guard lock(spendMutex_);
-  const uint64_t current_slot_time = (now / spendSlotSize_) * spendSlotSize_;
-  const uint64_t target_base_time = current_slot_time - spendSlotSize_;
+  const uint64_t current_slot_time =
+    (now / config_.spendSlotSize) * config_.spendSlotSize;
+  const uint64_t target_base_time = current_slot_time - config_.spendSlotSize;
   if (target_base_time < spendBaseTime_ ||
-      target_base_time >= spendBaseTime_ + (spend_.size() * spendSlotSize_)) {
+      target_base_time >=
+        spendBaseTime_ + (spend_.size() * config_.spendSlotSize)) {
     spend_.clear();
     spendBaseTime_ = target_base_time;
     spend_.emplace_back();
     spend_.emplace_back();
     spend_.emplace_back();
   } else {
-    const uint64_t next_slot_time = current_slot_time + spendSlotSize_;
-    size_t needed_idx = (next_slot_time - spendBaseTime_) / spendSlotSize_;
+    const uint64_t next_slot_time = current_slot_time + config_.spendSlotSize;
+    size_t needed_idx =
+      (next_slot_time - spendBaseTime_) / config_.spendSlotSize;
     while (spend_.size() <= needed_idx) {
       spend_.emplace_back();
     }
@@ -366,7 +395,7 @@ uint64_t Minx::updatePoWSpendCache(uint64_t epochSecs) {
       if (!spend_.empty()) {
         spend_.pop_front();
       }
-      spendBaseTime_ += spendSlotSize_;
+      spendBaseTime_ += config_.spendSlotSize;
     }
   }
   return spendBaseTime_;
@@ -377,7 +406,7 @@ bool Minx::replayPoW(const uint64_t time, const Hash& solution) {
   if (time < spendBaseTime_) {
     return false;
   }
-  size_t slot_index = (time - spendBaseTime_) / spendSlotSize_;
+  size_t slot_index = (time - spendBaseTime_) / config_.spendSlotSize;
   if (slot_index >= spend_.size()) {
     return false;
   }
@@ -390,7 +419,8 @@ uint64_t Minx::filterPoW(const MinxProveWork& msg, const int difficulty) {
   }
 
   const uint64_t now = getSecsSinceEpoch();
-  if (minProveWorkTimestamp_ > 0 && now < minProveWorkTimestamp_) {
+  if (config_.minProveWorkTimestamp > 0 &&
+      now < config_.minProveWorkTimestamp) {
     return MINX_ERROR_UNTIMELY_POW;
   }
 
@@ -423,24 +453,35 @@ uint64_t Minx::processPoW(const SockAddr& addr, const MinxProveWork& msg,
                           const int difficulty, bool isWorkHashValid) {
   if (isWorkHashValid) {
     std::lock_guard lock(spendMutex_);
-    // If bucket was dropped because it got old while we verified the hash,
-    // even better: no need to store the hash, as any hash that would go into
-    // these deleted buckets can no longer be spent.
-    if (msg.time >= spendBaseTime_) {
-      size_t slot_index = (msg.time - spendBaseTime_) / spendSlotSize_;
-      if (slot_index >= spend_.size()) {
-        // Shouldn't happen, since buckets should only be deleted by moving
-        // spendBaseTime_. But guard against that anyway.
-        return MINX_ERROR_UNEXPECTED;
-      }
-      spend_[slot_index].insert(msg.solution);
+    if (msg.time < spendBaseTime_) {
+      // If bucket was dropped because it got old while we verified the hash,
+      // then it's not obviously safe that we can accept the hash under
+      // multithreaded hash verification, unfortunately.
+      return MINX_ERROR_UNTIMELY_POW;
+    }
+    size_t slot_index = (msg.time - spendBaseTime_) / config_.spendSlotSize;
+    if (slot_index >= spend_.size()) {
+      // Shouldn't happen, since buckets should only be deleted by moving
+      // spendBaseTime_. But guard against that anyway.
+      return MINX_ERROR_UNEXPECTED;
+    }
+    auto [it, inserted] = spend_[slot_index].insert(msg.solution);
+    if (!inserted) {
+      // Since we want to support parallel PoW verification, we need to
+      // protect against user submitting the same valid PoW multiple times
+      // and multiple threads racing to verify the PoW copies.
+      return MINX_ERROR_DOUBLE_SPEND;
     }
     listener_->incomingProveWork(addr, msg, difficulty);
   } else {
     // need to penalize sender since randomx_calculate_hash() was expensive.
     // solution might have been altered by MitM or the sender address might
     // be spoofed, but this penalty cannot be avoided in any case.
-    ipFilter_.reportIP(addr.address());
+    auto ipaddr = addr.address();
+    if (!config_.trustLoopback || !ipaddr.is_loopback()) {
+      // If localhost is trusted don't penalize (e.g. when testing).
+      ipFilter_.reportIP(ipaddr);
+    }
     return MINX_ERROR_MISMATCHED_POW;
   }
   return 0;
@@ -477,6 +518,7 @@ int Minx::verifyPoWs(const size_t limit) {
         break;
       }
       const auto& next = work_.front();
+      const auto& nextMinxProveWork = next.first;
       const auto& nextSockAddr = next.second;
       const auto& nextIPAddr = nextSockAddr.address();
       auto bucket = getAddressPrefix(nextIPAddr);
@@ -490,6 +532,17 @@ int Minx::verifyPoWs(const size_t limit) {
           workPrefixCounts_.erase(it);
         }
       }
+      {
+        std::lock_guard lock(workCheckingMutex_);
+        auto [wcit, wcinserted] =
+          workChecking_.insert(nextMinxProveWork.solution);
+        if (!wcinserted) {
+          // Exact PoW solution hash already being checked by another thread
+          // (so it is not in the spent table yet nor is the sender banned).
+          work_.pop();
+          continue;
+        }
+      }
       work_item_opt.emplace(std::move(next));
       work_.pop();
     }
@@ -497,6 +550,17 @@ int Minx::verifyPoWs(const size_t limit) {
 
     const MinxProveWork& work_item = work_item_opt->first;
     const SockAddr& work_sockaddr = work_item_opt->second;
+
+    // Ensure workChecking_ entry is removed when done for whatever reason
+    // so that a hash value is never stuck as "being checked."
+    // All that matters is tracking when a hash is being checked to minimize
+    // duplicate work by other verifier threads. When a hash is done then either
+    // the submitter IP block or the hash itself have been tagged, putting a
+    // stop to verification abuses in any case.
+    ScopeExit workCheckingGuard{[&, this, solHash = work_item.solution]() {
+      std::lock_guard lock(workCheckingMutex_);
+      workChecking_.erase(solHash);
+    }};
 
     if (ipFilter_.checkIP(work_sockaddr.address())) {
       LOGTRACE << "verifyPoWs() dropped work from IP filtered address"
@@ -540,9 +604,9 @@ void Minx::createPoWEngine(const Hash& key) {
     if (engines_.count(key)) {
       return;
     }
-    engines_.try_emplace(key, std::make_shared<PoWEngine>(std::span(key),
-                                                          useDataset_,
-                                                          randomXVMsToKeep_));
+    engines_.try_emplace(
+      key, std::make_shared<PoWEngine>(std::span(key), useDataset_,
+                                       config_.randomXVMsToKeep));
   }
   {
     std::lock_guard lock(queueMutex_);
@@ -676,11 +740,17 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
 }
 
 void Minx::banAddress(const IPAddr& addr) {
+  if (config_.trustLoopback && addr.is_loopback()) {
+    return;
+  }
   LOGTRACE << "banAddress" << VAR(addr);
   ipFilter_.reportIP(addr);
 }
 
 bool Minx::checkSpam(const IPAddr& addr, bool alsoUpdate) {
+  if (config_.trustLoopback && addr.is_loopback()) {
+    return false;
+  }
   return spamFilter_.check(addr, alsoUpdate);
 }
 
@@ -724,7 +794,7 @@ void Minx::receive() {
     auto& slot = recvBuffersInfo_[recvBuffersIndex_];
     if (slot.busy_) {
       // If no more slots, of which are plenty, should wait a long time anyways.
-      netIORetryTimer_->expires_after(std::chrono::milliseconds(100));
+      netIORetryTimer_->expires_after(std::chrono::milliseconds(1));
       ++netIOHandlerCount_;
       netIORetryTimer_->async_wait(boost::asio::bind_executor(
         *netIOStrand_, [this](const boost::system::error_code& ec) {
@@ -743,11 +813,12 @@ void Minx::receive() {
     slot.busy_ = true;
     bufIndex = recvBuffersIndex_;
     ++recvBuffersIndex_;
-    if (recvBuffersIndex_ >= RECV_BUFFER_ARRAY_SIZE)
+    // recvBuffers_ has the same size as recvBuffersInfo_
+    if (recvBuffersIndex_ >= recvBuffersInfo_.size())
       recvBuffersIndex_ = 0;
   }
 
-  auto& buf = (*recvBuffers_)[bufIndex];
+  auto& buf = recvBuffers_[bufIndex];
   auto& slot = recvBuffersInfo_[bufIndex];
   ++netIOHandlerCount_;
   socket_->async_receive_from(
@@ -771,7 +842,9 @@ void Minx::onReceivePacket(size_t slotIndex,
   try {
     if (error || bytes_transferred < sizeof(uint8_t) ||
         bytes_transferred == MAX_UDP_BYTES ||
-        ipFilter_.checkIP(slot.remoteAddr_.address())) {
+        ((!config_.trustLoopback ||
+          !slot.remoteAddr_.address().is_loopback()) &&
+         ipFilter_.checkIP(slot.remoteAddr_.address()))) {
       // drop message
       slot.busy_ = false;
     } else {
@@ -805,7 +878,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     return;
 
   auto& remoteAddr_ = slot.remoteAddr_;
-  auto& buffer_ = (*recvBuffers_)[slotIndex];
+  auto& buffer_ = recvBuffers_[slotIndex];
 
   uint8_t code;
   buffer_.setSize(bytes_transferred);
@@ -814,7 +887,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   switch (code) {
   case MINX_INIT: {
-    if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
+    if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
+        spamFilter_.updateAndCheck(remoteAddr_.address())) {
       // A mass spoofing attack should not log or ban IPs
       break;
     }
@@ -862,7 +936,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   }
 
   case MINX_GET_INFO: {
-    if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
+    if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
+        spamFilter_.updateAndCheck(remoteAddr_.address())) {
       // A mass spoofing attack should not log or ban IPs
       break;
     }
@@ -1028,9 +1103,9 @@ void Minx::workerLoop() {
       }
     }
     if (engine_ptr) {
-      LOGTRACE << "workerLoop initialize engine" << VAR(randomXInitThreads_)
-               << VAR(engine_ptr->getKey());
-      engine_ptr->initialize(randomXInitThreads_);
+      LOGTRACE << "workerLoop initialize engine"
+               << VAR(config_.randomXInitThreads) << VAR(engine_ptr->getKey());
+      engine_ptr->initialize(config_.randomXInitThreads);
     } else {
       LOGERROR << "workerLoop null PoWEngine";
       throw std::runtime_error("missing PoWEngine to initialize");

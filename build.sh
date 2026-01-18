@@ -142,7 +142,7 @@ run_tests() {
             echo "👻 Running with AddressSanitizer enabled..."
         fi
 
-        "${FOUND_BIN}" -l message
+        "${FOUND_BIN}" --log_level=test_suite --color_output=yes
     else
         echo "❌ No Boost.Test executable found in: ${TEST_DIR}"
         echo "   Make sure the build succeeded."
