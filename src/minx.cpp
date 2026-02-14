@@ -185,6 +185,7 @@ uint16_t Minx::openSocket(const IPAddr& ipAddr, uint16_t port, IOContext& netIO,
 
 void Minx::closeSocket(bool shouldPoll) {
   LOGTRACE << "closeSocket";
+  socketClosing_ = true;
   std::lock_guard lock(socketStateMutex_);
   if (!socket_) {
     return;
@@ -200,19 +201,21 @@ void Minx::closeSocket(bool shouldPoll) {
       socket_->close(ec);
       socket_.reset();
     }
-    done_flag = true;
   });
   LOGTRACE << "closeSocket join netIO";
-  while (!done_flag || netIOHandlerCount_ > 0) {
-    if (shouldPoll && netIO_)
-      netIO_->poll();
+  while (socket_ || netIOHandlerCount_ > 0) {
+    if (shouldPoll && netIO_) {
+      try {
+        netIO_->poll();
+      } catch (...) {
+      }
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   netIORetryTimer_.reset();
   netIOStrand_.reset();
   netIO_ = nullptr;
   LOGTRACE << "closeSocket join taskIO";
-  socketClosing_ = true;
   while (taskIOHandlerCount_ > 0) {
     if (shouldPoll && taskIO_) {
       try {
@@ -222,9 +225,9 @@ void Minx::closeSocket(bool shouldPoll) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  socketClosing_ = false;
   taskIOWorkGuard_.reset();
   taskIO_ = nullptr;
+  socketClosing_ = false;
   LOGTRACE << "closeSocket done";
 }
 
@@ -776,8 +779,21 @@ void Minx::releaseSendBuffer(std::shared_ptr<minx::Buffer> buf) {
 
 void Minx::doSocketSend(const SockAddr& addr,
                         const std::shared_ptr<minx::Buffer>& buf) {
-  std::shared_lock lock(socketStateMutex_);
+  // In case sends are invoked from within handlers and we are closing
+  // the socket, this lock could deadlock. If we can't get the lock
+  // in 3s, then we just drop the packet as the socket is closing.
+  std::shared_lock<std::shared_timed_mutex> lock(socketStateMutex_,
+                                                 std::defer_lock);
+  if (!lock.try_lock_for(std::chrono::seconds(3))) {
+    return;
+  }
+  if (socketClosing_) {
+    return;
+  }
   if (!socket_) {
+    // If socket is null because of socketClose(), the socketClosing_ check will
+    // catch it above. If not, throw an exception since sending without opening
+    // the socket is an application error.
     throw std::runtime_error("no socket");
   }
   socket_->async_send_to(
@@ -788,6 +804,9 @@ void Minx::doSocketSend(const SockAddr& addr,
 }
 
 void Minx::receive() {
+  if (socketClosing_) {
+    return;
+  }
   size_t bufIndex = 0;
   {
     std::lock_guard lock(recvBuffersMutex_);
@@ -834,7 +853,7 @@ void Minx::onReceivePacket(size_t slotIndex,
 
   auto& slot = recvBuffersInfo_[slotIndex];
 
-  if (error == boost::asio::error::operation_aborted) {
+  if (error == boost::asio::error::operation_aborted || socketClosing_) {
     slot.busy_ = false;
     return; // socket is closing; don't post another receive
   }

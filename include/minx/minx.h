@@ -240,6 +240,16 @@ struct MinxConfig {
   static constexpr size_t DEFAULT_SPEND_SLOT_SIZE_SECS = 3600;
 
   /**
+   * Consume 32MB in UDP receive buffers by default.
+   */
+  static constexpr size_t DEFAULT_RECV_BUFFERS_SIZE = 16384;
+
+  /**
+   * Strict spam threshold by default for P2P nodes.
+   */
+  static constexpr uint16_t DEFAULT_SPAM_THRESHOLD = 250;
+
+  /**
    * Instance string name for logging. Use "" to not log an instance name.
    */
   std::string instanceName = "";
@@ -274,7 +284,7 @@ struct MinxConfig {
    * Number of non-handshaked packets that will be received from same IP block
    * in the spam filter's window (which defaults to 1 hour)
    */
-  uint16_t spamThreshold = 250;
+  uint16_t spamThreshold = DEFAULT_SPAM_THRESHOLD;
 
   /**
    * If `true`, packets received from loopback addresses will be trusted and not
@@ -285,7 +295,7 @@ struct MinxConfig {
   /**
    * Size of receive ring buffer (number of 2048 byte buffers).
    */
-  size_t recvBuffersSize = 16384;
+  size_t recvBuffersSize = DEFAULT_RECV_BUFFERS_SIZE;
 };
 
 /**
@@ -330,7 +340,7 @@ private:
 
   MinxListener* listener_ = nullptr;
 
-  std::shared_mutex socketStateMutex_;
+  std::shared_timed_mutex socketStateMutex_;
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
   std::atomic<bool> socketClosing_ = false;
 
