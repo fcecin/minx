@@ -119,6 +119,10 @@ void turn_on();
 void dim(bool d);
 void init();
 
+// Minimum severity level active anywhere (global or any module).
+// Doesn't need synchronization; a plain int is just faster.
+extern int fast_min_level;
+
 inline logger_type& get_logger() { return my_logger::get(); }
 
 inline std::string to_str(const std::string& s) { return s; }
@@ -163,6 +167,7 @@ static constexpr const char* _instanceName(long) { return ""; }
   auto _instanceName(int) const { return (name_expr); }
 
 #define MLOG_LEVEL(level)                                                      \
+  if (static_cast<int>(level) < ::blog::fast_min_level) {} else                \
   BOOST_LOG_CHANNEL_SEV(::blog::get_logger(), ([]() {                          \
                           using namespace blog_fallback;                       \
                           return resolve_log_module(0);                        \

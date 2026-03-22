@@ -23,7 +23,6 @@ struct BlogConfig {
   std::shared_mutex mutex;
   blog::severity_level global_level = blog::default_log_level;
   std::map<std::string, blog::severity_level> module_levels;
-  std::atomic<bool> do_log{true};
   std::atomic<uint64_t> generation{1};
   std::atomic<bool> dim_log{false};
 };
@@ -44,8 +43,6 @@ static thread_local FilterCache t_cache;
 
 bool blog_global_filter(boost::log::attribute_value_set const& set) {
   auto& cfg = get_config();
-  if (!cfg.do_log.load(std::memory_order_relaxed))
-    return false;
   auto severity_opt = set[kSeverityAttrName].extract<blog::severity_level>();
   if (!severity_opt)
     return true;
@@ -72,6 +69,21 @@ bool blog_global_filter(boost::log::attribute_value_set const& set) {
 
 namespace blog {
 
+int fast_min_level = static_cast<int>(default_log_level);
+
+namespace {
+// Recompute fast_min_level from current config. Caller must hold cfg.mutex.
+void recompute_fast_min_level(const BlogConfig& cfg) {
+  int min_level = static_cast<int>(cfg.global_level);
+  for (const auto& [mod, lvl] : cfg.module_levels) {
+    int ml = static_cast<int>(lvl);
+    if (ml < min_level)
+      min_level = ml;
+  }
+  fast_min_level = min_level;
+}
+} // namespace
+
 void set_level(blog::severity_level level) {
   auto& cfg = get_config();
   std::lock_guard<std::shared_mutex> lock(cfg.mutex);
@@ -83,6 +95,7 @@ void set_level(blog::severity_level level) {
       it = cfg.module_levels.erase(it);
     }
   }
+  recompute_fast_min_level(cfg);
   cfg.generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -90,6 +103,7 @@ void set_level(const std::string& module, blog::severity_level level) {
   auto& cfg = get_config();
   std::lock_guard<std::shared_mutex> lock(cfg.mutex);
   cfg.module_levels[module] = level;
+  recompute_fast_min_level(cfg);
   cfg.generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -97,6 +111,7 @@ void disable(const std::string& module) {
   auto& cfg = get_config();
   std::lock_guard<std::shared_mutex> lock(cfg.mutex);
   cfg.module_levels[module] = blog::none;
+  recompute_fast_min_level(cfg);
   cfg.generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -104,6 +119,7 @@ void enable(const std::string& module) {
   auto& cfg = get_config();
   std::lock_guard<std::shared_mutex> lock(cfg.mutex);
   cfg.module_levels.erase(module);
+  recompute_fast_min_level(cfg);
   cfg.generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -112,13 +128,13 @@ void disable() { disable(kDefaultModule); }
 void enable() { enable(kDefaultModule); }
 
 void turn_off() {
-  auto& cfg = get_config();
-  cfg.do_log.store(false, std::memory_order_relaxed);
+  fast_min_level = static_cast<int>(blog::none);
 }
 
 void turn_on() {
   auto& cfg = get_config();
-  cfg.do_log.store(true, std::memory_order_relaxed);
+  std::shared_lock<std::shared_mutex> lock(cfg.mutex);
+  recompute_fast_min_level(cfg);
 }
 
 void dim(bool d) {

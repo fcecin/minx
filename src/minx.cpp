@@ -542,6 +542,7 @@ int Minx::verifyPoWs(const size_t limit) {
         if (!wcinserted) {
           // Exact PoW solution hash already being checked by another thread
           // (so it is not in the spent table yet nor is the sender banned).
+          LOGDEBUG << "verifyPoWs() duplicate PoW solution, already checking";
           work_.pop();
           continue;
         }
@@ -575,6 +576,8 @@ int Minx::verifyPoWs(const size_t limit) {
 
     uint64_t ferr = filterPoW(work_item, work_diff);
     if (ferr > 0) {
+      LOGDEBUG << "verifyPoWs() filterPoW rejected" << VAR(HEXU64(ferr))
+               << VAR(work_diff) << VAR(work_sockaddr);
       lastError_ = ferr;
       continue;
     }
@@ -864,7 +867,8 @@ void Minx::onReceivePacket(size_t slotIndex,
         ((!config_.trustLoopback ||
           !slot.remoteAddr_.address().is_loopback()) &&
          ipFilter_.checkIP(slot.remoteAddr_.address()))) {
-      // drop message
+      LOGDEBUG << "onReceivePacket drop" << SVAR(error)
+               << VAR(bytes_transferred) << SVAR(slot.remoteAddr_);
       slot.busy_ = false;
     } else {
       ++taskIOHandlerCount_;
@@ -908,7 +912,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   case MINX_INIT: {
     if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
         spamFilter_.updateAndCheck(remoteAddr_.address())) {
-      // A mass spoofing attack should not log or ban IPs
+      LOGTRACE << "onProcessPacket MINX_INIT spam filtered"
+               << SVAR(remoteAddr_);
       break;
     }
     size_t bytes_expected = sizeof(code) + MinxInit::SIZE;
@@ -957,7 +962,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   case MINX_GET_INFO: {
     if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
         spamFilter_.updateAndCheck(remoteAddr_.address())) {
-      // A mass spoofing attack should not log or ban IPs
+      LOGTRACE << "onProcessPacket MINX_GET_INFO spam filtered"
+               << SVAR(remoteAddr_);
       break;
     }
     size_t bytes_expected = sizeof(code) + MinxGetInfo::SIZE;
@@ -1055,6 +1061,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
       std::lock_guard lock(workMutex_);
       size_t& count = workPrefixCounts_[bucket];
       if (count >= MAX_WORK_PER_PREFIX) {
+        LOGDEBUG << "onProcessPacket MINX_PROVE_WORK work queue full for prefix"
+                 << SVAR(remoteAddr_);
         break;
       }
       ++count;
