@@ -595,7 +595,7 @@ int Minx::verifyPoWs(const size_t limit) {
   return verified_count;
 }
 
-size_t Minx::getVerifyPoWQueueSize() {
+size_t Minx::getVerifyPoWQueueSize() const {
   std::lock_guard lock(workMutex_);
   return work_.size();
 }
@@ -799,10 +799,12 @@ void Minx::doSocketSend(const SockAddr& addr,
     // the socket is an application error.
     throw std::runtime_error("no socket");
   }
+  ++netIOHandlerCount_;
   socket_->async_send_to(
     buf->getAsioBufferToRead(), addr,
     [this, buf](const boost::system::error_code&, std::size_t) {
       this->releaseSendBuffer(buf);
+      --netIOHandlerCount_;
     });
 }
 

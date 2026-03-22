@@ -370,7 +370,7 @@ private:
 
   std::map<boost::asio::ip::address, size_t> workPrefixCounts_;
   std::queue<std::pair<MinxProveWork, SockAddr>> work_;
-  std::mutex workMutex_;
+  mutable std::mutex workMutex_;
 
   std::unordered_set<Hash, SecureHashHasher> workChecking_;
   std::mutex workCheckingMutex_;
@@ -473,7 +473,7 @@ public:
    * Get minimum difficulty.
    * @return Current minimum PoW difficulty.
    */
-  uint8_t getMinimumDifficulty() { return minDiff_; }
+  uint8_t getMinimumDifficulty() const { return minDiff_; }
 
   /**
    * Set whether to use RandoMX datasets or just the cache.
@@ -682,7 +682,7 @@ public:
    * Get current PoW verification work queue size.
    * @return PoW work queue size.
    */
-  size_t getVerifyPoWQueueSize();
+  size_t getVerifyPoWQueueSize() const;
 
   /**
    * Create a RandomX PoWEngine (asynchronous).
