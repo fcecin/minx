@@ -212,7 +212,7 @@ void init() {
       }
 
       auto severity = rec[boost::log::trivial::severity];
-      const char* sev_color;
+      const char* sev_color = RESET;
       if (severity) {
         switch (severity.get()) {
         case blog::trace:

@@ -119,9 +119,8 @@ void MinxRunner::stop() {
 void MinxRunner::powWorkerLoop() {
   LOGTRACE << "powworker started";
   while (running_) {
-    int processed = 0;
     try {
-      processed = this->verifyPoWs();
+      this->verifyPoWs();
     } catch (...) {
     }
 

@@ -58,7 +58,7 @@ int main(int argc, char* argv[]) {
 
     void setMinxInstance(minx::Minx* instance) { minx_instance_ = instance; }
 
-    bool isConnected(const minx::SockAddr& addr) override { return false; }
+    bool isConnected(const minx::SockAddr& /*addr*/) override { return false; }
 
     void incomingGetInfo(const minx::SockAddr& addr,
                          const minx::MinxGetInfo& msg) override {
@@ -76,7 +76,7 @@ int main(int argc, char* argv[]) {
       std::cout << "  -> Server: Sent INFO." << std::endl;
     }
 
-    void incomingProveWork(const minx::SockAddr& addr,
+    void incomingProveWork(const minx::SockAddr& /*addr*/,
                            const minx::MinxProveWork& msg,
                            const int difficulty) override {
       std::cout << "✅ Server: Received and successfully validated PROVE_WORK!"
@@ -100,7 +100,7 @@ int main(int argc, char* argv[]) {
 
     void setMinxInstance(minx::Minx* instance) { minx_instance_ = instance; }
 
-    void incomingInfo(const minx::SockAddr& addr,
+    void incomingInfo(const minx::SockAddr& /*addr*/,
                       const minx::MinxInfo& msg) override {
       std::cout << "✅ Client: Received INFO from server." << std::endl;
       std::cout << "  -> Server key: " << msg.skey << std::endl;
@@ -139,6 +139,7 @@ int main(int argc, char* argv[]) {
                                            .gpassword = 0,
                                            .spassword = msg.gpassword,
                                            .ckey = pow_template.ckey,
+                                           .hdata = {},
                                            .time = pow_template.time,
                                            .nonce = pow_template.nonce,
                                            .solution = pow_template.solution,

@@ -253,7 +253,7 @@ void PoWEngine::releaseVM(std::shared_ptr<RandomXVM> rxvmSptr) {
   if (!rxvmSptr)
     return;
   std::lock_guard lock(vmPoolMutex_);
-  if (vmPool_.size() < vmsToKeep_) {
+  if (static_cast<int>(vmPool_.size()) < vmsToKeep_) {
     vmPool_.push_back(std::move(rxvmSptr));
   }
 }

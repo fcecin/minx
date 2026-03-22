@@ -4,6 +4,8 @@ file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "*.cpp")
 
 add_executable(minxtests ${TEST_SOURCES})
 
+target_compile_options(minxtests PRIVATE -Wall -Wextra)
+
 target_link_libraries(minxtests
   PRIVATE
   minxlib

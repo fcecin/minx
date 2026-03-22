@@ -23,7 +23,7 @@ BOOST_AUTO_TEST_CASE(TestFullHandshakeAndMining) {
   };
 
   serverNode.listener.onProveWork =
-    [&](const minx::SockAddr& addr, const minx::MinxProveWork& msg, int diff) {
+    [&](const minx::SockAddr& /*addr*/, const minx::MinxProveWork& /*msg*/, int /*diff*/) {
       BOOST_TEST_MESSAGE("Server: Validated PROVE_WORK successfully!");
     };
 
@@ -35,7 +35,7 @@ BOOST_AUTO_TEST_CASE(TestFullHandshakeAndMining) {
   minx::Hash capturedServerKey;
   bool infoReceived = false;
 
-  clientNode.listener.onInfo = [&](const minx::SockAddr& addr,
+  clientNode.listener.onInfo = [&](const minx::SockAddr& /*addr*/,
                                    const minx::MinxInfo& msg) {
     BOOST_TEST_MESSAGE("Client: Received INFO, capturing Server Key");
     capturedServerKey = msg.skey;
@@ -160,7 +160,7 @@ BOOST_AUTO_TEST_CASE(TestApplicationMessage) {
   bool msgReceived = false;
 
   serverNode.listener.onApplication =
-    [&](const minx::SockAddr& addr, uint8_t code, const minx::Bytes& data) {
+    [&](const minx::SockAddr& /*addr*/, uint8_t code, const minx::Bytes& data) {
       BOOST_TEST_MESSAGE("Server: Received App Message");
       BOOST_TEST(code == appCode);
       BOOST_TEST(data == secretPayload);

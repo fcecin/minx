@@ -55,6 +55,8 @@ file(GLOB CORE_CPP "src/*.cpp")
 
 add_library(minxlib STATIC ${CORE_CPP})
 
+target_compile_options(minxlib PRIVATE -Wall -Wextra)
+
 target_compile_definitions(minxlib PRIVATE BOOST_ASIO_HEADER_ONLY)
 
 target_include_directories(minxlib

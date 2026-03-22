@@ -37,18 +37,18 @@ public:
 
   TestServerListener(const minx::Hash& key) : skey_(key) {}
 
-  bool isConnected(const minx::SockAddr& addr) override { return true; }
+  bool isConnected(const minx::SockAddr& /*addr*/) override { return true; }
 
   void incomingGetInfo(const minx::SockAddr& addr,
                        const minx::MinxGetInfo& msg) override {
     minx::MinxInfo info = {0, minx_->generatePassword(), msg.gpassword,
-                           DIFFICULTY, skey_};
+                           DIFFICULTY, skey_, {}};
     minx_->sendInfo(addr, info);
   }
 
-  void incomingProveWork(const minx::SockAddr& addr,
-                         const minx::MinxProveWork& msg,
-                         const int diff) override {
+  void incomingProveWork(const minx::SockAddr& /*addr*/,
+                         const minx::MinxProveWork& /*msg*/,
+                         const int /*diff*/) override {
     auto tid = std::this_thread::get_id();
     {
       std::lock_guard lock(threadMutex);
@@ -79,7 +79,7 @@ public:
   TestClientListener(const minx::Hash& key, const minx::SockAddr& srv)
       : ckey_(key), server_addr_(srv) {}
 
-  void incomingInfo(const minx::SockAddr& addr,
+  void incomingInfo(const minx::SockAddr& /*addr*/,
                     const minx::MinxInfo& msg) override {
     lastInfo_.emplace(msg);
     infoReceived_ = true;

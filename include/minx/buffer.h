@@ -176,9 +176,9 @@ public:
 
 private:
   std::span<T> buf_;
-  size_t s_;
-  size_t w_;
   size_t r_;
+  size_t w_;
+  size_t s_;
 };
 
 using Buffer = AutoBuffer<uint8_t>;

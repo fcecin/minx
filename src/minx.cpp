@@ -47,10 +47,11 @@ std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
 }
 
 Minx::Minx(MinxListener* listener, const MinxConfig config)
-    : instanceName_(config.instanceName), listener_(listener), config_(config),
+    : config_(config), listener_(listener),
       passwords_(1'000'000, 60), gen_(std::random_device{}()),
       genDistrib_(1, std::numeric_limits<uint64_t>::max()),
-      spamFilter_(1'000'000, 3, config.spamThreshold, 3600) {
+      spamFilter_(1'000'000, 3, config.spamThreshold, 3600),
+      instanceName_(config.instanceName) {
   LOGTRACE << "Minx";
   if (!listener_) {
     throw std::runtime_error("listener cannot be nullptr");
@@ -698,7 +699,7 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
   }
   std::vector<std::thread> threads;
   threads.reserve(numThreads);
-  for (size_t i = 0; i < numThreads; ++i) {
+  for (int i = 0; i < numThreads; ++i) {
     threads.emplace_back([&, i]() {
       auto releaser = engine_ptr->getVM();
       randomx_vm* vm = releaser.vm();
@@ -712,7 +713,6 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
           break;
         }
 
-        const auto p1 = std::chrono::system_clock::now();
         const uint64_t time = getSecsSinceEpoch();
 
         minx::ArrayBuffer<HASH_INPUT_SIZE> input_buffer;

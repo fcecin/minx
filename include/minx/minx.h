@@ -158,7 +158,7 @@ public:
    * @return `true` if `addr` is authorized for communication by the
    * application, `false` otherwise.
    */
-  virtual bool isConnected(const SockAddr& addr) { return false; }
+  virtual bool isConnected(const SockAddr& /*addr*/) { return false; }
 
   /**
    * Check if MINX should validate this PROVE_WORK message on behalf of the
@@ -169,8 +169,8 @@ public:
    * @return `true` to allow the MINX engine to deal with PoW validation
    * internally, `false` to let the application handle it.
    */
-  virtual bool delegateProveWork(const SockAddr& addr,
-                                 const MinxProveWork& msg) {
+  virtual bool delegateProveWork(const SockAddr& /*addr*/,
+                                 const MinxProveWork& /*msg*/) {
     return true;
   }
 
@@ -179,28 +179,28 @@ public:
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingInit(const SockAddr& addr, const MinxInit& msg) {}
+  virtual void incomingInit(const SockAddr& /*addr*/, const MinxInit& /*msg*/) {}
 
   /**
    * Receive MESSAGE message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingMessage(const SockAddr& addr, const MinxMessage& msg) {}
+  virtual void incomingMessage(const SockAddr& /*addr*/, const MinxMessage& /*msg*/) {}
 
   /**
    * Receive GET_INFO message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {}
+  virtual void incomingGetInfo(const SockAddr& /*addr*/, const MinxGetInfo& /*msg*/) {}
 
   /**
    * Receive INFO message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingInfo(const SockAddr& addr, const MinxInfo& msg) {}
+  virtual void incomingInfo(const SockAddr& /*addr*/, const MinxInfo& /*msg*/) {}
 
   /**
    * Receive PROVE_WORK message with a validated work item.
@@ -210,15 +210,15 @@ public:
    * @param msg The MINX message.
    * @param difficulty Precomputed difficulty.
    */
-  virtual void incomingProveWork(const SockAddr& addr, const MinxProveWork& msg,
-                                 const int difficulty) {}
+  virtual void incomingProveWork(const SockAddr& /*addr*/, const MinxProveWork& /*msg*/,
+                                 const int /*difficulty*/) {}
 
   /**
    * Receive EXTENSION message.
    * @param addr Remote UDP socket sender address.
    * @param data Extension data.
    */
-  virtual void incomingExtension(const SockAddr& addr, const Bytes& data) {}
+  virtual void incomingExtension(const SockAddr& /*addr*/, const Bytes& /*data*/) {}
 
   /**
    * Receive APPLICATION message.
@@ -226,8 +226,8 @@ public:
    * @param code The specific application message code.
    * @param data Application data.
    */
-  virtual void incomingApplication(const SockAddr& addr, const uint8_t code,
-                                   const Bytes& data) {}
+  virtual void incomingApplication(const SockAddr& /*addr*/, const uint8_t /*code*/,
+                                   const Bytes& /*data*/) {}
 };
 
 /**
@@ -338,6 +338,8 @@ private:
   std::mutex sendBufferPoolMutex_;
   std::vector<std::shared_ptr<minx::Buffer>> sendBufferPool_;
 
+  MinxConfig config_;
+
   MinxListener* listener_ = nullptr;
 
   std::shared_timed_mutex socketStateMutex_;
@@ -392,8 +394,6 @@ private:
   std::uniform_int_distribution<uint64_t> genDistrib_;
 
   SpamFilter spamFilter_;
-
-  MinxConfig config_;
 
   uint64_t updatePoWSpendCacheInternal(uint64_t epochSecs = 0);
 
