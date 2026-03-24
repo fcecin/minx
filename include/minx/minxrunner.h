@@ -36,13 +36,9 @@ public:
 
 private:
   IOContext netIO_;
-  std::optional<boost::asio::executor_work_guard<IOContext::executor_type>>
-    netWorkGuard_;
   std::vector<std::thread> netThreads_;
 
   IOContext taskIO_;
-  std::optional<boost::asio::executor_work_guard<IOContext::executor_type>>
-    taskWorkGuard_;
   size_t taskThreadCount_;
   std::vector<std::thread> taskThreads_;
 

@@ -179,28 +179,32 @@ public:
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingInit(const SockAddr& /*addr*/, const MinxInit& /*msg*/) {}
+  virtual void incomingInit(const SockAddr& /*addr*/, const MinxInit& /*msg*/) {
+  }
 
   /**
    * Receive MESSAGE message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingMessage(const SockAddr& /*addr*/, const MinxMessage& /*msg*/) {}
+  virtual void incomingMessage(const SockAddr& /*addr*/,
+                               const MinxMessage& /*msg*/) {}
 
   /**
    * Receive GET_INFO message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingGetInfo(const SockAddr& /*addr*/, const MinxGetInfo& /*msg*/) {}
+  virtual void incomingGetInfo(const SockAddr& /*addr*/,
+                               const MinxGetInfo& /*msg*/) {}
 
   /**
    * Receive INFO message.
    * @param addr Remote UDP socket sender address.
    * @param msg The MINX message.
    */
-  virtual void incomingInfo(const SockAddr& /*addr*/, const MinxInfo& /*msg*/) {}
+  virtual void incomingInfo(const SockAddr& /*addr*/, const MinxInfo& /*msg*/) {
+  }
 
   /**
    * Receive PROVE_WORK message with a validated work item.
@@ -210,7 +214,8 @@ public:
    * @param msg The MINX message.
    * @param difficulty Precomputed difficulty.
    */
-  virtual void incomingProveWork(const SockAddr& /*addr*/, const MinxProveWork& /*msg*/,
+  virtual void incomingProveWork(const SockAddr& /*addr*/,
+                                 const MinxProveWork& /*msg*/,
                                  const int /*difficulty*/) {}
 
   /**
@@ -218,7 +223,8 @@ public:
    * @param addr Remote UDP socket sender address.
    * @param data Extension data.
    */
-  virtual void incomingExtension(const SockAddr& /*addr*/, const Bytes& /*data*/) {}
+  virtual void incomingExtension(const SockAddr& /*addr*/,
+                                 const Bytes& /*data*/) {}
 
   /**
    * Receive APPLICATION message.
@@ -226,7 +232,8 @@ public:
    * @param code The specific application message code.
    * @param data Application data.
    */
-  virtual void incomingApplication(const SockAddr& /*addr*/, const uint8_t /*code*/,
+  virtual void incomingApplication(const SockAddr& /*addr*/,
+                                   const uint8_t /*code*/,
                                    const Bytes& /*data*/) {}
 };
 
@@ -350,6 +357,8 @@ private:
   std::unique_ptr<boost::asio::strand<IOContext::executor_type>> netIOStrand_;
   std::atomic<uint64_t> netIOHandlerCount_ = 0;
   std::unique_ptr<boost::asio::steady_timer> netIORetryTimer_;
+  std::unique_ptr<boost::asio::executor_work_guard<IOContext::executor_type>>
+    netIOWorkGuard_;
 
   IOContext* taskIO_ = nullptr;
   std::atomic<uint64_t> taskIOHandlerCount_ = 0;

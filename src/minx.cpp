@@ -118,6 +118,9 @@ uint16_t Minx::openSocket(const SockAddr& sockAddr, IOContext& netIO,
   }
   netIO_ = &netIO;
   taskIO_ = &taskIO;
+  netIOWorkGuard_ = std::make_unique<
+    boost::asio::executor_work_guard<IOContext::executor_type>>(
+    netIO_->get_executor());
   taskIOWorkGuard_ = std::make_unique<
     boost::asio::executor_work_guard<IOContext::executor_type>>(
     taskIO_->get_executor());
@@ -215,6 +218,7 @@ void Minx::closeSocket(bool shouldPoll) {
   }
   netIORetryTimer_.reset();
   netIOStrand_.reset();
+  netIOWorkGuard_.reset();
   netIO_ = nullptr;
   LOGTRACE << "closeSocket join taskIO";
   while (taskIOHandlerCount_ > 0) {

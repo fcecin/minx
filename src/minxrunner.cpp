@@ -45,9 +45,6 @@ uint16_t MinxRunner::start(const SockAddr& addr) {
 
   running_ = true;
 
-  netWorkGuard_.emplace(boost::asio::make_work_guard(netIO_));
-  taskWorkGuard_.emplace(boost::asio::make_work_guard(taskIO_));
-
   netThreads_.emplace_back([this]() {
     try {
       netIO_.run();
@@ -109,9 +106,6 @@ void MinxRunner::stop() {
 
   netIO_.reset();
   taskIO_.reset();
-
-  netWorkGuard_.reset();
-  taskWorkGuard_.reset();
 
   LOGTRACE << "stop stopped";
 }
