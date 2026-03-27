@@ -18,13 +18,20 @@ TestNode::TestNode(std::string n, std::string ip, uint16_t port)
   minx = std::make_unique<minx::Minx>(&listener, minx::MinxConfig{});
 }
 
+TestNode::TestNode(std::string n, std::string ip, uint16_t port,
+                   const minx::MinxConfig& config)
+    : name(n), addr(boost::asio::ip::address::from_string(ip), port),
+      key(makeKey()) {
+  minx = std::make_unique<minx::Minx>(&listener, config);
+}
+
 TestNode::~TestNode() {
   if (minx)
     minx->closeSocket();
 }
 
 void TestNode::createPoWEngine(const minx::Hash& engineKey,
-                                const std::string& logLabel) {
+                               const std::string& logLabel) {
   BOOST_TEST_MESSAGE("Node [" << name << "]: Initializing " << logLabel
                               << "...");
   auto start_time = std::chrono::high_resolution_clock::now();
@@ -49,7 +56,7 @@ void TestNode::createServerPoWEngine(bool useDataset) {
 }
 
 void TestNode::createClientPoWEngine(const minx::Hash& targetKey,
-                                  bool useDataset) {
+                                     bool useDataset) {
   minx->setUseDataset(useDataset);
   std::string modeStr =
     useDataset ? "CLIENT Engine (Full Dataset)" : "CLIENT Engine (Cache Only)";
@@ -58,7 +65,7 @@ void TestNode::createClientPoWEngine(const minx::Hash& targetKey,
 
 void TestNode::startNetwork(int minDiff) {
   minx->setMinimumDifficulty(minDiff);
-  minx->openSocket(addr, netio, taskio);
+  boundPort_ = minx->openSocket(addr, netio, taskio);
 }
 
 void TestNode::poll() {

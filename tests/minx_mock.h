@@ -85,6 +85,8 @@ struct TestNode {
   std::unique_ptr<minx::Minx> minx;
 
   TestNode(std::string n, std::string ip, uint16_t port);
+  TestNode(std::string n, std::string ip, uint16_t port,
+           const minx::MinxConfig& config);
   ~TestNode();
 
   void createServerPoWEngine(bool useDataset);
@@ -95,6 +97,7 @@ struct TestNode {
                        const std::string& logLabel);
 
   void startNetwork(int minDiff = 1);
+  uint16_t boundPort() const { return boundPort_; }
 
   void startFull(bool useDataset, int minDiff = 1) {
     createServerPoWEngine(useDataset);
@@ -103,6 +106,9 @@ struct TestNode {
 
   void poll();
   void processPoW();
+
+private:
+  uint16_t boundPort_ = 0;
 };
 
 struct MinxMockFixture {

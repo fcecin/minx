@@ -41,8 +41,8 @@ public:
 
   void incomingGetInfo(const minx::SockAddr& addr,
                        const minx::MinxGetInfo& msg) override {
-    minx::MinxInfo info = {0, minx_->generatePassword(), msg.gpassword,
-                           DIFFICULTY, skey_, {}};
+    minx::MinxInfo info = {
+      0, minx_->generatePassword(), msg.gpassword, DIFFICULTY, skey_, {}};
     minx_->sendInfo(addr, info);
   }
 

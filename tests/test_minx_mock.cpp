@@ -22,10 +22,11 @@ BOOST_AUTO_TEST_CASE(TestFullHandshakeAndMining) {
     serverNode.minx->sendInfo(addr, infoMsg);
   };
 
-  serverNode.listener.onProveWork =
-    [&](const minx::SockAddr& /*addr*/, const minx::MinxProveWork& /*msg*/, int /*diff*/) {
-      BOOST_TEST_MESSAGE("Server: Validated PROVE_WORK successfully!");
-    };
+  serverNode.listener.onProveWork = [&](const minx::SockAddr& /*addr*/,
+                                        const minx::MinxProveWork& /*msg*/,
+                                        int /*diff*/) {
+    BOOST_TEST_MESSAGE("Server: Validated PROVE_WORK successfully!");
+  };
 
   TestNode clientNode("Client", "127.0.0.1", 9001);
   registerNode(clientNode);

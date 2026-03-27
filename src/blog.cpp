@@ -127,9 +127,7 @@ void disable() { disable(kDefaultModule); }
 
 void enable() { enable(kDefaultModule); }
 
-void turn_off() {
-  fast_min_level = static_cast<int>(blog::none);
-}
+void turn_off() { fast_min_level = static_cast<int>(blog::none); }
 
 void turn_on() {
   auto& cfg = get_config();

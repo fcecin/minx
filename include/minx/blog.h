@@ -167,18 +167,19 @@ static constexpr const char* _instanceName(long) { return ""; }
   auto _instanceName(int) const { return (name_expr); }
 
 #define MLOG_LEVEL(level)                                                      \
-  if (static_cast<int>(level) < ::blog::fast_min_level) {} else                \
-  BOOST_LOG_CHANNEL_SEV(::blog::get_logger(), ([]() {                          \
-                          using namespace blog_fallback;                       \
-                          return resolve_log_module(0);                        \
-                        }()),                                                  \
-                        level)                                                 \
-    << ::boost::log::add_value(blog::kFileAttrName, __FILE__)                  \
-    << ::boost::log::add_value(blog::kLineAttrName, __LINE__)                  \
-    << ::boost::log::add_value(blog::kInstanceAttrName, [&]() {                \
-         using namespace blog_fallback;                                        \
-         return ::blog::to_str(_instanceName(0));                              \
-       }())
+  if (static_cast<int>(level) < ::blog::fast_min_level) {                      \
+  } else                                                                       \
+    BOOST_LOG_CHANNEL_SEV(::blog::get_logger(), ([]() {                        \
+                            using namespace blog_fallback;                     \
+                            return resolve_log_module(0);                      \
+                          }()),                                                \
+                          level)                                               \
+      << ::boost::log::add_value(blog::kFileAttrName, __FILE__)                \
+      << ::boost::log::add_value(blog::kLineAttrName, __LINE__)                \
+      << ::boost::log::add_value(blog::kInstanceAttrName, [&]() {              \
+           using namespace blog_fallback;                                      \
+           return ::blog::to_str(_instanceName(0));                            \
+         }())
 
 #define LOGTRACE MLOG_LEVEL(::blog::trace)
 #define LOGDEBUG MLOG_LEVEL(::blog::debug)

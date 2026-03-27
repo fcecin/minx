@@ -10,7 +10,8 @@ namespace minx {
  */
 class MinxRunner : public Minx {
 public:
-  MinxRunner(MinxListener* listener, const MinxConfig config = {}, size_t taskThreads = 0, size_t powThreads = 0);
+  MinxRunner(MinxListener* listener, const MinxConfig config = {},
+             size_t taskThreads = 0, size_t powThreads = 0);
 
   virtual ~MinxRunner();
 

@@ -20,6 +20,12 @@
 namespace minx {
 
 /**
+ * Maximum UDP packet size.
+ * Packets at exactly this size are assumed truncated and dropped.
+ */
+static constexpr size_t MAX_UDP_BYTES = 2048;
+
+/**
  * MINX message code.
  */
 enum minx_code_t : uint8_t {
@@ -321,12 +327,6 @@ private:
   // reach the point where it processes them.
   static constexpr size_t MAX_WORK_PER_PREFIX = 128;
 
-  // Protocols implemented on Minx shouldn't push the total packet size over
-  // the guaranteed IPv6 MTU of 1280 bytes in any case. All incoming packets
-  // with size exactly MAX_UDP_BYTES are assumed to be truncated and are
-  // dropped (an application should not be generating packets of size anywhere
-  // near MAX_UDP_BYTES anyway).
-  static constexpr size_t MAX_UDP_BYTES = 2048;
   static constexpr size_t SEND_BUFFER_POOL_MAX_SIZE = 256;
 
   struct RecvSlot {

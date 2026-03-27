@@ -47,8 +47,8 @@ std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
 }
 
 Minx::Minx(MinxListener* listener, const MinxConfig config)
-    : config_(config), listener_(listener),
-      passwords_(1'000'000, 60), gen_(std::random_device{}()),
+    : config_(config), listener_(listener), passwords_(1'000'000, 60),
+      gen_(std::random_device{}()),
       genDistrib_(1, std::numeric_limits<uint64_t>::max()),
       spamFilter_(1'000'000, 3, config.spamThreshold, 3600),
       instanceName_(config.instanceName) {
@@ -72,12 +72,15 @@ Minx::~Minx() {
   LOGTRACE << "~Minx stop worker and engines";
   {
     std::lock_guard lock(enginesMutex_);
-    stopWorker_ = true;
     auto it = engines_.begin();
     while (it != engines_.end()) {
       it->second->stop();
       ++it;
     }
+  }
+  {
+    std::lock_guard lock(queueMutex_);
+    stopWorker_ = true;
   }
   LOGTRACE << "~Minx join worker";
   queueCondVar_.notify_one();
