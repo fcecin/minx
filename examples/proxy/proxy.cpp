@@ -2,6 +2,7 @@
 
 #include <boost/asio.hpp>
 
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -47,14 +48,16 @@ int main(int argc, char* argv[]) {
   auto upstreamEp =
     asio::ip::udp::endpoint(asio::ip::make_address(upstreamAddr), upstreamPort);
 
-  asio::io_context io;
-
-  minx::MinxProxy proxy(io, listenEp, upstreamEp, config);
+  minx::MinxProxy proxy(listenEp, upstreamEp, config);
 
   std::cout << "minxproxy listening on " << listenEp << " -> upstream "
             << upstreamEp << " (" << config.numChannels << " channels)\n";
 
-  io.run();
+  // Block until SIGINT/SIGTERM.
+  asio::io_context sigIO;
+  asio::signal_set signals(sigIO, SIGINT, SIGTERM);
+  signals.async_wait([&](auto, auto) { proxy.stop(); });
+  sigIO.run();
 
   return 0;
 }

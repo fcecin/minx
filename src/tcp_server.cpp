@@ -7,9 +7,6 @@ namespace minx {
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
-// =====================================================================
-// TcpSession
-// =====================================================================
 
 TcpSession::TcpSession(tcp::socket sock, TcpServer& server, size_t maxMsgSize)
     : sock_(std::move(sock)), server_(server), maxMsgSize_(maxMsgSize),
@@ -144,9 +141,6 @@ void TcpSession::readBody(uint16_t len) {
                    });
 }
 
-// =====================================================================
-// TcpServer
-// =====================================================================
 
 TcpServer::TcpServer(asio::io_context& io, const tcp::endpoint& listenEp,
                      TcpServerHandler& handler, size_t maxMsgSize,

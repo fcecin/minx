@@ -20,7 +20,7 @@ using tcp = asio::ip::tcp;
 // Minimal TCP client for talking to the proxy.
 class ProxyTestClient {
 public:
-  ProxyTestClient(asio::io_context& io) : sock_(io) {}
+  ProxyTestClient() : sock_(io_) {}
 
   void connect(uint16_t port) {
     sock_.connect(
@@ -114,6 +114,7 @@ public:
   tcp::socket& socket() { return sock_; }
 
 private:
+  asio::io_context io_;
   tcp::socket sock_;
 };
 
@@ -134,11 +135,8 @@ inline minx::MinxProxyConfig testProxyConfig() {
   return cfg;
 }
 
-// Fixture: server node + proxy + proxyIO polling.
+// Fixture: server node polling. Proxy runs its own thread.
 struct ProxyTestFixture : MinxMockFixture {
-  boost::asio::io_context proxyIO;
-  boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
-    proxyWorkGuard{proxyIO.get_executor()};
 
   void pollAllWithProxy(int cycles = 1) {
     for (int i = 0; i < cycles; ++i) {
@@ -147,7 +145,6 @@ struct ProxyTestFixture : MinxMockFixture {
         if (node->minx->checkPoWEngine(node->key))
           node->processPoW();
       }
-      proxyIO.poll();
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   }
@@ -193,7 +190,7 @@ BOOST_AUTO_TEST_CASE(TestProxyGetInfo) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   // Wait for proxy to get its initial INFO cache.
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
@@ -201,7 +198,7 @@ BOOST_AUTO_TEST_CASE(TestProxyGetInfo) {
 
   // TCP client connects and sends GET_INFO.
   auto proxyPort = proxy.port();
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxyPort);
   pollAllWithProxy(5);
 
@@ -255,14 +252,14 @@ BOOST_AUTO_TEST_CASE(TestProxyMultipleClientsGetInfo) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
   // Two clients send GET_INFO.
   auto proxyPort = proxy.port();
-  ProxyTestClient c1(proxyIO);
-  ProxyTestClient c2(proxyIO);
+  ProxyTestClient c1;
+  ProxyTestClient c2;
   c1.connect(proxyPort);
   c2.connect(proxyPort);
   pollAllWithProxy(5);
@@ -325,7 +322,7 @@ BOOST_AUTO_TEST_CASE(TestProxyFullPoWFlow) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
@@ -339,7 +336,7 @@ BOOST_AUTO_TEST_CASE(TestProxyFullPoWFlow) {
 
   // TCP client sends the PROVE_WORK through proxy.
   auto proxyPort = proxy.port();
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxyPort);
   pollAllWithProxy(5);
 
@@ -388,12 +385,12 @@ BOOST_AUTO_TEST_CASE(TestProxyClientDisconnectCleansUp) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
   auto proxyPort = proxy.port();
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxyPort);
   pollAllWithProxy(5);
   BOOST_TEST(proxy.clientCount() == 1);
@@ -433,7 +430,7 @@ BOOST_AUTO_TEST_CASE(TestProxyCachedGetInfo) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
@@ -444,7 +441,7 @@ BOOST_AUTO_TEST_CASE(TestProxyCachedGetInfo) {
   auto proxyPort = proxy.port();
 
   // Client 1 sends GET_INFO — should be served from cache.
-  ProxyTestClient c1(proxyIO);
+  ProxyTestClient c1;
   c1.connect(proxyPort);
   pollAllWithProxy(5);
   c1.sendGetInfo(0x1111);
@@ -453,7 +450,7 @@ BOOST_AUTO_TEST_CASE(TestProxyCachedGetInfo) {
   BOOST_TEST(r1[0] == minx::MINX_INFO);
 
   // Client 2 also sends GET_INFO — also from cache.
-  ProxyTestClient c2(proxyIO);
+  ProxyTestClient c2;
   c2.connect(proxyPort);
   pollAllWithProxy(5);
   c2.sendGetInfo(0x2222);
@@ -499,12 +496,12 @@ BOOST_AUTO_TEST_CASE(TestProxyInitSwallowed) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
   // Client sends INIT through proxy.
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxy.port());
   pollAllWithProxy(5);
 
@@ -547,13 +544,13 @@ BOOST_AUTO_TEST_CASE(TestProxyMaxClientsRejection) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   auto proxyPort = proxy.port();
 
   // Client 1 connects OK.
-  ProxyTestClient c1(proxyIO);
+  ProxyTestClient c1;
   c1.connect(proxyPort);
   pollAllWithProxy(5);
   BOOST_TEST(proxy.clientCount() == 1);
@@ -565,7 +562,7 @@ BOOST_AUTO_TEST_CASE(TestProxyMaxClientsRejection) {
   BOOST_TEST(r1[0] == minx::MINX_INFO);
 
   // Client 2 should be rejected (maxClients=1).
-  ProxyTestClient c2(proxyIO);
+  ProxyTestClient c2;
   c2.connect(proxyPort);
   pollAllWithProxy(10);
 
@@ -604,14 +601,14 @@ BOOST_AUTO_TEST_CASE(TestProxyClientDisconnectAndReconnect) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   auto proxyPort = proxy.port();
 
   // Client 1 connects, gets INFO, then disconnects.
   {
-    ProxyTestClient c1(proxyIO);
+    ProxyTestClient c1;
     c1.connect(proxyPort);
     pollAllWithProxy(5);
     BOOST_TEST(proxy.clientCount() == 1);
@@ -628,7 +625,7 @@ BOOST_AUTO_TEST_CASE(TestProxyClientDisconnectAndReconnect) {
   BOOST_TEST(proxy.clientCount() == 0);
 
   // New client connects and works fine.
-  ProxyTestClient c2(proxyIO);
+  ProxyTestClient c2;
   c2.connect(proxyPort);
   pollAllWithProxy(5);
   BOOST_TEST(proxy.clientCount() == 1);
@@ -683,7 +680,7 @@ BOOST_AUTO_TEST_CASE(TestProxyMultipleConcurrentProveWork) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
@@ -702,8 +699,8 @@ BOOST_AUTO_TEST_CASE(TestProxyMultipleConcurrentProveWork) {
 
   // Two TCP clients submit PoWs through proxy.
   auto proxyPort = proxy.port();
-  ProxyTestClient c1(proxyIO);
-  ProxyTestClient c2(proxyIO);
+  ProxyTestClient c1;
+  ProxyTestClient c2;
   c1.connect(proxyPort);
   c2.connect(proxyPort);
   pollAllWithProxy(5);
@@ -776,11 +773,11 @@ BOOST_AUTO_TEST_CASE(TestProxyMessageRelay) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxy.port());
   pollAllWithProxy(5);
 
@@ -852,7 +849,7 @@ BOOST_AUTO_TEST_CASE(TestProxyStressManyClients) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   auto proxyPort = proxy.port();
@@ -864,7 +861,7 @@ BOOST_AUTO_TEST_CASE(TestProxyStressManyClients) {
 
   // Connect all clients.
   for (int i = 0; i < N; ++i) {
-    clients.push_back(std::make_unique<ProxyTestClient>(proxyIO));
+    clients.push_back(std::make_unique<ProxyTestClient>());
     clients.back()->connect(proxyPort);
   }
   pollAllWithProxy(10);
@@ -981,7 +978,7 @@ BOOST_AUTO_TEST_CASE(TestProxyStressRapidConnectDisconnect) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   auto proxyPort = proxy.port();
@@ -989,7 +986,7 @@ BOOST_AUTO_TEST_CASE(TestProxyStressRapidConnectDisconnect) {
   // 30 cycles of connect, send GET_INFO, get response, disconnect.
   constexpr int CYCLES = 30;
   for (int i = 0; i < CYCLES; ++i) {
-    ProxyTestClient client(proxyIO);
+    ProxyTestClient client;
     client.connect(proxyPort);
     pollAllWithProxy(3);
 
@@ -1008,7 +1005,7 @@ BOOST_AUTO_TEST_CASE(TestProxyStressRapidConnectDisconnect) {
   BOOST_TEST(proxy.clientCount() == 0);
 
   // One more client should work fine after the stress.
-  ProxyTestClient finalClient(proxyIO);
+  ProxyTestClient finalClient;
   finalClient.connect(proxyPort);
   pollAllWithProxy(5);
   finalClient.sendGetInfo(0xF1A1);
@@ -1047,20 +1044,20 @@ BOOST_AUTO_TEST_CASE(TestProxyMaxClientsReconnectAfterSlotFrees) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   auto proxyPort = proxy.port();
 
   // Fill both slots.
-  ProxyTestClient c1(proxyIO), c2(proxyIO);
+  ProxyTestClient c1, c2;
   c1.connect(proxyPort);
   c2.connect(proxyPort);
   pollAllWithProxy(5);
   BOOST_TEST(proxy.clientCount() == 2);
 
   // Third client should be rejected.
-  ProxyTestClient c3(proxyIO);
+  ProxyTestClient c3;
   c3.connect(proxyPort);
   pollAllWithProxy(10);
   BOOST_TEST(proxy.clientCount() == 2);
@@ -1071,7 +1068,7 @@ BOOST_AUTO_TEST_CASE(TestProxyMaxClientsReconnectAfterSlotFrees) {
   waitForProxy([&]() { return proxy.clientCount() == 1; }, 10);
 
   // New client should now be accepted.
-  ProxyTestClient c4(proxyIO);
+  ProxyTestClient c4;
   c4.connect(proxyPort);
   pollAllWithProxy(5);
   BOOST_TEST(proxy.clientCount() == 2);
@@ -1115,13 +1112,13 @@ BOOST_AUTO_TEST_CASE(TestProxyMalformedMessage) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   auto proxyPort = proxy.port();
 
   // Bad client sends various malformed messages.
-  ProxyTestClient badClient(proxyIO);
+  ProxyTestClient badClient;
   badClient.connect(proxyPort);
   pollAllWithProxy(5);
 
@@ -1137,7 +1134,7 @@ BOOST_AUTO_TEST_CASE(TestProxyMalformedMessage) {
   pollAllWithProxy(10);
 
   // Good client should still work fine.
-  ProxyTestClient goodClient(proxyIO);
+  ProxyTestClient goodClient;
   goodClient.connect(proxyPort);
   pollAllWithProxy(5);
 
@@ -1186,11 +1183,11 @@ BOOST_AUTO_TEST_CASE(TestProxyBurstMessagesFromSingleClient) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxy.port());
   pollAllWithProxy(5);
 
@@ -1275,11 +1272,11 @@ BOOST_AUTO_TEST_CASE(TestProxyInterleavedMessageTypes) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
 
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxy.port());
   pollAllWithProxy(5);
 
@@ -1357,12 +1354,12 @@ BOOST_AUTO_TEST_CASE(TestProxyChannelRecoveryAfterTimeout) {
     tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
   auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
     asio::ip::address::from_string("127.0.0.1"), serverNode.boundPort());
-  minx::MinxProxy proxy(proxyIO, proxyListenEp, proxyUpstreamEp, proxyCfg);
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
 
   waitForProxy([&]() { return proxy.hasCachedInfo(); }, 10);
   waitForProxy([&]() { return proxy.readyChannelCount() == 4; }, 10);
 
-  ProxyTestClient client(proxyIO);
+  ProxyTestClient client;
   client.connect(proxy.port());
   pollAllWithProxy(5);
 

@@ -33,26 +33,15 @@ class TcpSession;
 class TcpServer;
 using TcpSessionPtr = std::shared_ptr<TcpSession>;
 
-// ---------------------------------------------------------------------
-// TcpServerHandler — callback interface
-// ---------------------------------------------------------------------
 struct TcpServerHandler {
   virtual ~TcpServerHandler() = default;
 
-  /** Called when a new client connects. */
   virtual void onConnect(const TcpSessionPtr& session) = 0;
-
-  /** Called when a complete message is received from a client. */
   virtual void onMessage(const TcpSessionPtr& session, const uint8_t* data,
                          size_t len) = 0;
-
-  /** Called when a client disconnects (or an error closes the session). */
   virtual void onDisconnect(const TcpSessionPtr& session) = 0;
 };
 
-// ---------------------------------------------------------------------
-// TcpSession
-// ---------------------------------------------------------------------
 class TcpSession : public std::enable_shared_from_this<TcpSession> {
 public:
   TcpSession(boost::asio::ip::tcp::socket sock, TcpServer& server,
@@ -63,7 +52,6 @@ public:
   bool isClosed() const { return closed_; }
   const std::string& label() const { return label_; }
 
-  /** Send a length-prefixed message to this client. */
   void send(const uint8_t* data, size_t len);
   void send(const std::vector<uint8_t>& data);
   boost::asio::ip::tcp::socket& socket() { return sock_; }
@@ -92,9 +80,6 @@ private:
   static constexpr size_t FRAME_POOL_MAX_SIZE = 1024;
 };
 
-// ---------------------------------------------------------------------
-// TcpServer
-// ---------------------------------------------------------------------
 class TcpServer {
 public:
   TcpServer(boost::asio::io_context& io,
