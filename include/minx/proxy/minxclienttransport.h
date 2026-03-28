@@ -28,9 +28,11 @@ public:
   /**
    * Construct in UDP mode (direct connection to server).
    * @param listener Callback receiver for incoming messages.
+   * @param serverEndpoint UDP endpoint of the MINX server.
    * @param config Minx configuration.
    */
   MinxClientTransport(MinxListener* listener,
+                      const boost::asio::ip::udp::endpoint& serverEndpoint,
                       const MinxConfig& config = MinxConfig{"cl"});
 
   /**
@@ -64,12 +66,11 @@ public:
   void stop();
 
   // -- Send methods --
-  // The addr parameter is used in UDP mode to address the server.
-  // In TCP mode it is ignored (the proxy is the only peer).
+  // Destination is set at construction (server endpoint or proxy endpoint).
 
-  void sendGetInfo(const SockAddr& addr, const MinxGetInfo& msg);
-  void sendMessage(const SockAddr& addr, const MinxMessage& msg);
-  void sendProveWork(const SockAddr& addr, const MinxProveWork& msg);
+  void sendGetInfo(const MinxGetInfo& msg);
+  void sendMessage(const MinxMessage& msg);
+  void sendProveWork(const MinxProveWork& msg);
 
   /** Generate a random password for ticket exchange. */
   uint64_t generatePassword();
@@ -88,6 +89,7 @@ public:
 private:
   // UDP mode members (null in TCP mode)
   std::unique_ptr<Minx> udp_;
+  SockAddr serverAddr_;
   IOContext netIO_;
   IOContext taskIO_;
   std::unique_ptr<

@@ -10,9 +10,12 @@ namespace minx {
 // Construction
 // =============================================================================
 
-MinxClientTransport::MinxClientTransport(MinxListener* listener,
-                                         const MinxConfig& config)
-  : listener_(listener) {
+MinxClientTransport::MinxClientTransport(
+  MinxListener* listener,
+  const boost::asio::ip::udp::endpoint& serverEndpoint,
+  const MinxConfig& config)
+  : listener_(listener),
+    serverAddr_(serverEndpoint.address(), serverEndpoint.port()) {
   udp_ = std::make_unique<Minx>(listener, config);
 }
 
@@ -69,22 +72,19 @@ void MinxClientTransport::stop() {
 // Send methods
 // =============================================================================
 
-void MinxClientTransport::sendGetInfo(const SockAddr& addr,
-                                      const MinxGetInfo& msg) {
-  if (udp_) udp_->sendGetInfo(addr, msg);
-  else if (tcp_) tcp_->sendGetInfo(addr, msg);
+void MinxClientTransport::sendGetInfo(const MinxGetInfo& msg) {
+  if (udp_) udp_->sendGetInfo(serverAddr_, msg);
+  else if (tcp_) tcp_->sendGetInfo(serverAddr_, msg);
 }
 
-void MinxClientTransport::sendMessage(const SockAddr& addr,
-                                      const MinxMessage& msg) {
-  if (udp_) udp_->sendMessage(addr, msg);
-  else if (tcp_) tcp_->sendMessage(addr, msg);
+void MinxClientTransport::sendMessage(const MinxMessage& msg) {
+  if (udp_) udp_->sendMessage(serverAddr_, msg);
+  else if (tcp_) tcp_->sendMessage(serverAddr_, msg);
 }
 
-void MinxClientTransport::sendProveWork(const SockAddr& addr,
-                                        const MinxProveWork& msg) {
-  if (udp_) udp_->sendProveWork(addr, msg);
-  else if (tcp_) tcp_->sendProveWork(addr, msg);
+void MinxClientTransport::sendProveWork(const MinxProveWork& msg) {
+  if (udp_) udp_->sendProveWork(serverAddr_, msg);
+  else if (tcp_) tcp_->sendProveWork(serverAddr_, msg);
 }
 
 uint64_t MinxClientTransport::generatePassword() {
