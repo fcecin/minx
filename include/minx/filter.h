@@ -121,7 +121,7 @@ private:
  */
 class SpamFilter {
 public:
-  SpamFilter(size_t width, size_t depth, uint8_t threshold, int durationSecs)
+  SpamFilter(size_t width, size_t depth, uint16_t threshold, int durationSecs)
       : currentIndex_(0),
         rotationInterval_(std::chrono::seconds(durationSecs)) {
     buckets_[0] = std::make_unique<PacketGuard>(width, depth, threshold);

@@ -295,9 +295,18 @@ struct MinxConfig {
 
   /**
    * Number of non-handshaked packets that will be received from same IP block
-   * in the spam filter's window (which defaults to 1 hour)
+   * in the spam filter's window (which defaults to 1 hour).
+   * Protects against amplification attacks on unconfirmed senders.
    */
   uint16_t spamThreshold = DEFAULT_SPAM_THRESHOLD;
+
+  /**
+   * If > 0, sample 1 in every N handshaked packets for spam scoring.
+   * Protects against sustained abuse from ticket-holding senders.
+   * Effective budget per IP block per window: spamThreshold * spamSampleRate.
+   * 0 disables handshaked packet scoring (default).
+   */
+  uint16_t spamSampleRate = 0;
 
   /**
    * If `true`, packets received from loopback addresses will be trusted and not
@@ -403,6 +412,7 @@ private:
   std::uniform_int_distribution<uint64_t> genDistrib_;
 
   SpamFilter spamFilter_;
+  uint64_t spamSampleCounter_ = 0;
 
   uint64_t updatePoWSpendCacheInternal(uint64_t epochSecs = 0);
 

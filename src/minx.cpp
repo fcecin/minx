@@ -917,6 +917,16 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   buffer_.setReadPos(0);
   code = buffer_.get<uint8_t>();
 
+  if (config_.spamSampleRate > 0 && code != MINX_INIT &&
+      code != MINX_GET_INFO) {
+    if (++spamSampleCounter_ % config_.spamSampleRate == 0) {
+      if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
+          spamFilter_.updateAndCheck(remoteAddr_.address())) {
+        return;
+      }
+    }
+  }
+
   switch (code) {
   case MINX_INIT: {
     if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&

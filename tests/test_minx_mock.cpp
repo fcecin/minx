@@ -299,4 +299,103 @@ BOOST_AUTO_TEST_CASE(TestParallelPoWBurst) {
   BOOST_TEST_MESSAGE("--- Parallel Burst Test Complete ---");
 }
 
+BOOST_AUTO_TEST_CASE(TestSampledSpamBlocking) {
+  minx::MinxConfig cfg;
+  cfg.spamThreshold = 2;
+  cfg.spamSampleRate = 4;
+  cfg.trustLoopback = false;
+
+  TestNode serverNode("Server", "127.0.0.1", 9100, cfg);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+
+  TestNode clientNode("Client", "127.0.0.1", 9101);
+  registerNode(clientNode);
+  clientNode.startNetwork();
+
+  serverNode.listener.onIsConnected = [](const minx::SockAddr&) {
+    return true;
+  };
+
+  const int TOTAL = 200;
+  for (int i = 0; i < TOTAL; ++i) {
+    minx::MinxMessage msg{0, 0, 0, {(char)0xAB}};
+    clientNode.minx->sendMessage(serverNode.addr, msg);
+  }
+
+  waitForCondition([&]() { return serverNode.listener.stats.message >= 1; }, 3);
+
+  pollAll(50);
+
+  int received = serverNode.listener.stats.message;
+  BOOST_TEST_MESSAGE("Received " << received << " / " << TOTAL);
+  BOOST_TEST(received > 0, "Should receive some messages");
+  BOOST_TEST(received < TOTAL, "Should have dropped some messages");
+}
+
+BOOST_AUTO_TEST_CASE(TestNoSamplingWhenDisabled) {
+  minx::MinxConfig cfg;
+  cfg.spamThreshold = 2;
+  cfg.spamSampleRate = 0;
+  cfg.trustLoopback = false;
+
+  TestNode serverNode("Server", "127.0.0.1", 9110, cfg);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+
+  TestNode clientNode("Client", "127.0.0.1", 9111);
+  registerNode(clientNode);
+  clientNode.startNetwork();
+
+  serverNode.listener.onIsConnected = [](const minx::SockAddr&) {
+    return true;
+  };
+
+  const int TOTAL = 200;
+  for (int i = 0; i < TOTAL; ++i) {
+    minx::MinxMessage msg{0, 0, 0, {(char)0xAB}};
+    clientNode.minx->sendMessage(serverNode.addr, msg);
+  }
+
+  waitForCondition([&]() { return serverNode.listener.stats.message >= 1; }, 3);
+
+  pollAll(50);
+
+  int received = serverNode.listener.stats.message;
+  BOOST_TEST_MESSAGE("Received " << received << " / " << TOTAL);
+  BOOST_TEST(received == TOTAL,
+             "All messages should pass when sampling is disabled");
+}
+
+BOOST_AUTO_TEST_CASE(TestInitStillFilteredIndependently) {
+  minx::MinxConfig cfg;
+  cfg.spamThreshold = 2;
+  cfg.spamSampleRate = 0;
+  cfg.trustLoopback = false;
+
+  TestNode serverNode("Server", "127.0.0.1", 9120, cfg);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+
+  TestNode clientNode("Client", "127.0.0.1", 9121);
+  registerNode(clientNode);
+  clientNode.startNetwork();
+
+  const int TOTAL = 100;
+  for (int i = 0; i < TOTAL; ++i) {
+    minx::MinxInit msg{0, 0, {}};
+    clientNode.minx->sendInit(serverNode.addr, msg);
+  }
+
+  waitForCondition([&]() { return serverNode.listener.stats.init >= 1; }, 3);
+
+  pollAll(50);
+
+  int received = serverNode.listener.stats.init;
+  BOOST_TEST_MESSAGE("INIT received " << received << " / " << TOTAL);
+  BOOST_TEST(received > 0, "Should receive some INITs");
+  BOOST_TEST(received < TOTAL,
+             "INIT should be rate-limited by amplification filter");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

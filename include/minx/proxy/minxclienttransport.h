@@ -81,29 +81,29 @@ public:
   void createPoWEngine(const Hash& key);
   bool checkPoWEngine(const Hash& key);
 
-  std::optional<MinxProveWork>
-  proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
-            int difficulty, int numThreads = 1, uint64_t startNonce = 0,
-            uint64_t maxIters = 0);
+  std::optional<MinxProveWork> proveWork(const Hash& myKey, const Hash& hdata,
+                                         const Hash& targetKey, int difficulty,
+                                         int numThreads = 1,
+                                         uint64_t startNonce = 0,
+                                         uint64_t maxIters = 0);
 
 private:
+  MinxListener* listener_;
+  bool useDataset_ = true;
+
   // UDP mode members (null in TCP mode)
   std::unique_ptr<Minx> udp_;
   SockAddr serverAddr_;
   IOContext netIO_;
   IOContext taskIO_;
-  std::unique_ptr<
-    boost::asio::executor_work_guard<IOContext::executor_type>> taskIOWorkGuard_;
+  std::unique_ptr<boost::asio::executor_work_guard<IOContext::executor_type>>
+    taskIOWorkGuard_;
   std::thread netIOThread_;
   std::thread taskIOThread_;
 
   // TCP mode members (null in UDP mode)
   std::unique_ptr<MinxProxyClient> tcp_;
   boost::asio::ip::tcp::endpoint proxyEndpoint_;
-
-  // Shared
-  MinxListener* listener_;
-  bool useDataset_ = true;
 };
 
 } // namespace minx
