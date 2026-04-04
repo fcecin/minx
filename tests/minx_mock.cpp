@@ -15,7 +15,9 @@ minx::Hash makeKey() {
 TestNode::TestNode(std::string n, std::string ip, uint16_t port)
     : name(n), addr(boost::asio::ip::address::from_string(ip), port),
       key(makeKey()) {
-  minx = std::make_unique<minx::Minx>(&listener, minx::MinxConfig{});
+  minx::MinxConfig cfg;
+  cfg.trustLoopback = true;
+  minx = std::make_unique<minx::Minx>(&listener, cfg);
 }
 
 TestNode::TestNode(std::string n, std::string ip, uint16_t port,

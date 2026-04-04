@@ -120,7 +120,9 @@ BOOST_AUTO_TEST_CASE(TestDoubleSpendRejection) {
 BOOST_AUTO_TEST_CASE(TestBannedIP) {
   BOOST_TEST_MESSAGE("--- Starting IP Ban Test ---");
 
-  TestNode serverNode("Server", "127.0.0.1", 9000);
+  minx::MinxConfig cfg;
+  cfg.trustLoopback = false;
+  TestNode serverNode("Server", "127.0.0.1", 9000, cfg);
   registerNode(serverNode);
   serverNode.startNetwork();
 
@@ -303,7 +305,7 @@ BOOST_AUTO_TEST_CASE(TestSampledSpamBlocking) {
   minx::MinxConfig cfg;
   cfg.spamThreshold = 2;
   cfg.spamSampleRate = 4;
-  cfg.trustLoopback = false;
+  cfg.trustLoopback = true; // bypass tickets, but NOT spam (isConnected=false)
 
   TestNode serverNode("Server", "127.0.0.1", 9100, cfg);
   registerNode(serverNode);
@@ -312,10 +314,6 @@ BOOST_AUTO_TEST_CASE(TestSampledSpamBlocking) {
   TestNode clientNode("Client", "127.0.0.1", 9101);
   registerNode(clientNode);
   clientNode.startNetwork();
-
-  serverNode.listener.onIsConnected = [](const minx::SockAddr&) {
-    return true;
-  };
 
   const int TOTAL = 200;
   for (int i = 0; i < TOTAL; ++i) {

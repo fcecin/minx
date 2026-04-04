@@ -873,7 +873,8 @@ void Minx::onReceivePacket(size_t slotIndex,
   try {
     if (error || bytes_transferred < sizeof(uint8_t) ||
         bytes_transferred == MAX_UDP_BYTES ||
-        ((!config_.trustLoopback ||
+        (!listener_->isConnected(slot.remoteAddr_) &&
+         (!config_.trustLoopback ||
           !slot.remoteAddr_.address().is_loopback()) &&
          ipFilter_.checkIP(slot.remoteAddr_.address()))) {
       LOGDEBUG << "onReceivePacket drop" << SVAR(error)
@@ -917,11 +918,15 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   buffer_.setReadPos(0);
   code = buffer_.get<uint8_t>();
 
-  if (config_.spamSampleRate > 0 && code != MINX_INIT &&
+  const bool connected = listener_->isConnected(remoteAddr_);
+  const bool loopback = config_.trustLoopback &&
+    remoteAddr_.address().is_loopback();
+
+  // Sampled spam scoring for handshaked packets (skip for connected)
+  if (!connected && config_.spamSampleRate > 0 && code != MINX_INIT &&
       code != MINX_GET_INFO) {
     if (++spamSampleCounter_ % config_.spamSampleRate == 0) {
-      if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
-          spamFilter_.updateAndCheck(remoteAddr_.address())) {
+      if (spamFilter_.updateAndCheck(remoteAddr_.address())) {
         return;
       }
     }
@@ -929,7 +934,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   switch (code) {
   case MINX_INIT: {
-    if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
+    if (!connected &&
         spamFilter_.updateAndCheck(remoteAddr_.address())) {
       LOGTRACE << "onProcessPacket MINX_INIT spam filtered"
                << SVAR(remoteAddr_);
@@ -964,7 +969,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     const uint64_t spassword = buffer_.get<uint64_t>();
     bool password_matched = spassword > 0 && spendPassword(spassword);
     if (!password_matched) {
-      if (!listener_->isConnected(remoteAddr_)) {
+      if (!connected && !loopback) {
         LOGTRACE << "onProcessPacket MINX_MESSAGE not connected"
                  << VAR(HEXU64(spassword));
         lastError_ = MINX_ERROR_NOT_CONNECTED;
@@ -979,7 +984,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   }
 
   case MINX_GET_INFO: {
-    if (!(config_.trustLoopback && remoteAddr_.address().is_loopback()) &&
+    if (!connected &&
         spamFilter_.updateAndCheck(remoteAddr_.address())) {
       LOGTRACE << "onProcessPacket MINX_GET_INFO spam filtered"
                << SVAR(remoteAddr_);
@@ -1021,7 +1026,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     const uint64_t spassword = buffer_.get<uint64_t>();
     bool password_matched = spassword > 0 && spendPassword(spassword);
     if (!password_matched) {
-      if (!listener_->isConnected(remoteAddr_)) {
+      if (!connected && !loopback) {
         LOGTRACE << "onProcessPacket MINX_INFO not connected"
                  << VAR(HEXU64(spassword));
         lastError_ = MINX_ERROR_NOT_CONNECTED;
@@ -1065,7 +1070,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
       buffer_.getRemainingBytes<std::vector<char>>(MAX_DATA_SIZE);
     bool password_matched = spassword > 0 && spendPassword(spassword);
     if (!password_matched) {
-      if (!listener_->isConnected(remoteAddr_)) {
+      if (!connected && !loopback) {
         LOGTRACE << "onProcessPacket MINX_PROVE_WORK not connected"
                  << VAR(HEXU64(spassword));
         lastError_ = MINX_ERROR_NOT_CONNECTED;

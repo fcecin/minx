@@ -159,10 +159,13 @@ struct MinxProveWork {
 class MinxListener {
 public:
   /**
-   * Check if the application considers a remote address whitelisted.
+   * Check if the application vouches for a remote address.
+   * Returning `true` bypasses spam filtering, IP banning, and the
+   * ticket requirement for this packet. The application is responsible
+   * for authenticating the source at a higher layer (e.g., signature
+   * verification on the message payload).
    * @param addr Remote UDP socket sender address.
-   * @return `true` if `addr` is authorized for communication by the
-   * application, `false` otherwise.
+   * @return `true` if `addr` is trusted, `false` otherwise.
    */
   virtual bool isConnected(const SockAddr& /*addr*/) { return false; }
 

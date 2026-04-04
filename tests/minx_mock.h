@@ -28,7 +28,7 @@ public:
     onApplication;
 
   bool isConnected(const minx::SockAddr& addr) override {
-    return onIsConnected ? onIsConnected(addr) : true;
+    return onIsConnected ? onIsConnected(addr) : false;
   }
   void incomingInit(const minx::SockAddr& addr,
                     const minx::MinxInit& msg) override {
