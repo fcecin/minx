@@ -3,6 +3,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <map>
 #include <queue>
 #include <random>
@@ -13,6 +14,7 @@
 
 #include <minx/bucketcache.h>
 #include <minx/buffer.h>
+#include <minx/csprng.h>
 #include <minx/filter.h>
 #include <minx/powengine.h>
 #include <minx/types.h>
@@ -228,14 +230,6 @@ public:
                                  const int /*difficulty*/) {}
 
   /**
-   * Receive EXTENSION message.
-   * @param addr Remote UDP socket sender address.
-   * @param data Extension data.
-   */
-  virtual void incomingExtension(const SockAddr& /*addr*/,
-                                 const Bytes& /*data*/) {}
-
-  /**
    * Receive APPLICATION message.
    * @param addr Remote UDP socket sender address.
    * @param code The specific application message code.
@@ -245,6 +239,11 @@ public:
                                    const uint8_t /*code*/,
                                    const Bytes& /*data*/) {}
 };
+
+/**
+ * MINX_EXTENSION handle function pointer.
+ */
+using MinxExtensionHandler = std::function<void(const SockAddr&, const Bytes&)>;
 
 /**
  * Configuration parameters for the Minx instance.
@@ -361,6 +360,8 @@ private:
 
   MinxListener* listener_ = nullptr;
 
+  MinxExtensionHandler extensionHandler_;
+
   std::shared_timed_mutex socketStateMutex_;
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
   std::atomic<bool> socketClosing_ = false;
@@ -411,8 +412,7 @@ private:
   std::atomic<uint64_t> lastError_;
 
   std::mutex genMutex_;
-  std::mt19937_64 gen_;
-  std::uniform_int_distribution<uint64_t> genDistrib_;
+  Csprng csprng_;
 
   SpamFilter spamFilter_;
   uint64_t spamSampleCounter_ = 0;
@@ -608,6 +608,13 @@ public:
    * @param data Extension data.
    */
   void sendExtension(const SockAddr& addr, const Bytes& data);
+
+  /**
+   * Install the handler invoked for every incoming EXTENSION packet.
+   * If no handler is set, EXTENSION packets are dropped.
+   * @param handler Callable invoked with (sender address, payload bytes).
+   */
+  void setExtensionHandler(MinxExtensionHandler handler);
 
   /**
    * Send APPLICATION message.

@@ -9,12 +9,12 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <vector>
 
 #include <cppsiphash/siphash.hpp>
 
 #include <minx/bucketcache.h>
+#include <minx/csprng.h>
 #include <minx/types.h>
 
 namespace minx {
@@ -90,12 +90,11 @@ public:
 
 private:
   void genKeys() {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
+    Csprng rng; // fresh entropy via the OS CSPRNG, then SipHash CTR
     keys_.clear();
     keys_.reserve(depth_);
     for (size_t i = 0; i < depth_; ++i) {
-      keys_.push_back({gen(), gen()});
+      keys_.push_back({rng.next(), rng.next()});
     }
   }
 

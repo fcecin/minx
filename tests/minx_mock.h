@@ -60,8 +60,7 @@ public:
     if (onProveWork)
       onProveWork(addr, msg, diff);
   }
-  void incomingExtension(const minx::SockAddr& addr,
-                         const minx::Bytes& data) override {
+  void handleExtension(const minx::SockAddr& addr, const minx::Bytes& data) {
     stats.extension++;
     if (onExtension)
       onExtension(addr, data);

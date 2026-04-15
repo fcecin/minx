@@ -25,7 +25,7 @@ static constexpr size_t HASH_INPUT_SIZE =
 // =============================================================================
 
 MinxProxyClient::MinxProxyClient(MinxListener* listener, bool useDataset)
-  : listener_(listener), useDataset_(useDataset), socket_(io_) {}
+    : listener_(listener), useDataset_(useDataset), socket_(io_) {}
 
 MinxProxyClient::~MinxProxyClient() { disconnect(); }
 
@@ -41,8 +41,9 @@ bool MinxProxyClient::connect(const tcp::endpoint& proxyEp) {
   }
 
   connected_ = true;
-  workGuard_ = std::make_unique<asio::executor_work_guard<
-    asio::io_context::executor_type>>(io_.get_executor());
+  workGuard_ = std::make_unique<
+    asio::executor_work_guard<asio::io_context::executor_type>>(
+    io_.get_executor());
 
   startRead();
   ioThread_ = std::thread([this]() { io_.run(); });
@@ -115,11 +116,12 @@ void MinxProxyClient::sendProveWork(const SockAddr& /*addr*/,
   appendHash(buf, msg.solution);
   // msg.data is std::vector<char>, convert for append
   buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(msg.data.data()),
-             reinterpret_cast<const uint8_t*>(msg.data.data()) + msg.data.size());
+             reinterpret_cast<const uint8_t*>(msg.data.data()) +
+               msg.data.size());
   sendRaw(buf);
 }
 
-uint64_t MinxProxyClient::generatePassword() { return distrib_(rng_); }
+uint64_t MinxProxyClient::generatePassword() { return rng_.nextNonZero(); }
 
 // =============================================================================
 // PoW mining (local)
@@ -141,11 +143,9 @@ bool MinxProxyClient::checkPoWEngine(const Hash& key) {
   return powEngine_->isReady();
 }
 
-std::optional<MinxProveWork>
-MinxProxyClient::proveWork(const Hash& myKey, const Hash& hdata,
-                           const Hash& targetKey, int difficulty,
-                           int numThreads, uint64_t startNonce,
-                           uint64_t maxIters) {
+std::optional<MinxProveWork> MinxProxyClient::proveWork(
+  const Hash& myKey, const Hash& hdata, const Hash& targetKey, int difficulty,
+  int numThreads, uint64_t startNonce, uint64_t maxIters) {
   if (!powEngine_ || powEngineKey_ != targetKey)
     throw std::runtime_error("PoWEngine not found");
   if (!powEngine_->isReady())
@@ -153,9 +153,8 @@ MinxProxyClient::proveWork(const Hash& myKey, const Hash& hdata,
 
   std::atomic<bool> solution_found = false;
   std::atomic<uint64_t> nonce_counter = startNonce;
-  uint64_t maxNonce = maxIters > 0
-    ? startNonce + maxIters
-    : std::numeric_limits<uint64_t>::max();
+  uint64_t maxNonce =
+    maxIters > 0 ? startNonce + maxIters : std::numeric_limits<uint64_t>::max();
 
   std::optional<MinxProveWork> result;
   std::mutex result_mutex;
@@ -175,8 +174,7 @@ MinxProxyClient::proveWork(const Hash& myKey, const Hash& hdata,
 
       while (true) {
         uint64_t nonce = nonce_counter.fetch_add(1, std::memory_order_relaxed);
-        if (solution_found.load(std::memory_order_relaxed) ||
-            nonce >= maxNonce)
+        if (solution_found.load(std::memory_order_relaxed) || nonce >= maxNonce)
           break;
 
         const uint64_t time = getSecsSinceEpoch();
@@ -191,8 +189,8 @@ MinxProxyClient::proveWork(const Hash& myKey, const Hash& hdata,
                                input.getSize(), solution_hash.data());
 
         if (getDifficulty(solution_hash) >= difficulty) {
-          bool already = solution_found.exchange(true,
-                                                 std::memory_order_acq_rel);
+          bool already =
+            solution_found.exchange(true, std::memory_order_acq_rel);
           if (!already) {
             std::lock_guard<std::mutex> lock(result_mutex);
             result.emplace(MinxProveWork{
@@ -225,16 +223,22 @@ void MinxProxyClient::sendRaw(const std::vector<uint8_t>& data) {
 
   boost::system::error_code ec;
   asio::write(socket_, asio::buffer(header, 2), ec);
-  if (ec) { disconnect(); return; }
+  if (ec) {
+    disconnect();
+    return;
+  }
   asio::write(socket_, asio::buffer(data), ec);
-  if (ec) { disconnect(); return; }
+  if (ec) {
+    disconnect();
+    return;
+  }
 }
 
 void MinxProxyClient::startRead() {
   asio::async_read(socket_, asio::buffer(headerBuf_, 2),
-    [this](boost::system::error_code ec, size_t bytes) {
-      onReadHeader(ec, bytes);
-    });
+                   [this](boost::system::error_code ec, size_t bytes) {
+                     onReadHeader(ec, bytes);
+                   });
 }
 
 void MinxProxyClient::onReadHeader(boost::system::error_code ec, size_t) {
@@ -253,7 +257,8 @@ void MinxProxyClient::onReadHeader(boost::system::error_code ec, size_t) {
   }
 
   auto buf = std::make_shared<std::vector<uint8_t>>(len);
-  asio::async_read(socket_, asio::buffer(*buf),
+  asio::async_read(
+    socket_, asio::buffer(*buf),
     [this, buf, len](boost::system::error_code ec, size_t bytes) {
       onReadBody(ec, bytes, len);
       if (!ec)
@@ -286,7 +291,8 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
   switch (code) {
 
   case MINX_INFO: {
-    if (len < 1 + 1 + 8 + 8 + 32 + 1) break;
+    if (len < 1 + 1 + 8 + 8 + 32 + 1)
+      break;
     uint8_t version = data[off++];
     uint64_t gpassword, spassword;
     std::memcpy(&gpassword, &data[off], 8);
@@ -307,7 +313,8 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
   }
 
   case MINX_MESSAGE: {
-    if (len < 1 + 1 + 8 + 8) break;
+    if (len < 1 + 1 + 8 + 8)
+      break;
     uint8_t version = data[off++];
     uint64_t gpassword, spassword;
     std::memcpy(&gpassword, &data[off], 8);
@@ -324,7 +331,8 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
   }
 
   case MINX_PROVE_WORK: {
-    if (len < 1 + 1 + 8 + 8 + 32 + 32 + 8 + 8 + 32) break;
+    if (len < 1 + 1 + 8 + 8 + 32 + 32 + 8 + 8 + 32)
+      break;
     uint8_t version = data[off++];
     uint64_t gpassword, spassword;
     std::memcpy(&gpassword, &data[off], 8);
@@ -334,8 +342,10 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
     spassword = boost::endian::big_to_native(spassword);
     off += 8;
     Hash ckey, pwHdata;
-    std::memcpy(ckey.data(), &data[off], 32); off += 32;
-    std::memcpy(pwHdata.data(), &data[off], 32); off += 32;
+    std::memcpy(ckey.data(), &data[off], 32);
+    off += 32;
+    std::memcpy(pwHdata.data(), &data[off], 32);
+    off += 32;
     uint64_t time, nonce;
     std::memcpy(&time, &data[off], 8);
     time = boost::endian::big_to_native(time);
@@ -344,12 +354,13 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
     nonce = boost::endian::big_to_native(nonce);
     off += 8;
     Hash solution;
-    std::memcpy(solution.data(), &data[off], 32); off += 32;
+    std::memcpy(solution.data(), &data[off], 32);
+    off += 32;
     // MinxProveWork::data is std::vector<char>
     std::vector<char> extra(reinterpret_cast<const char*>(data + off),
                             reinterpret_cast<const char*>(data + len));
-    MinxProveWork msg{version, gpassword, spassword,
-                      ckey, pwHdata, time, nonce, solution, extra};
+    MinxProveWork msg{version, gpassword, spassword, ckey, pwHdata,
+                      time,    nonce,     solution,  extra};
     listener_->incomingProveWork(fakeAddr, msg, getDifficulty(solution));
     break;
   }

@@ -18,6 +18,10 @@ TestNode::TestNode(std::string n, std::string ip, uint16_t port)
   minx::MinxConfig cfg;
   cfg.trustLoopback = true;
   minx = std::make_unique<minx::Minx>(&listener, cfg);
+  minx->setExtensionHandler(
+    [this](const minx::SockAddr& a, const minx::Bytes& d) {
+      listener.handleExtension(a, d);
+    });
 }
 
 TestNode::TestNode(std::string n, std::string ip, uint16_t port,
@@ -25,6 +29,10 @@ TestNode::TestNode(std::string n, std::string ip, uint16_t port,
     : name(n), addr(boost::asio::ip::address::from_string(ip), port),
       key(makeKey()) {
   minx = std::make_unique<minx::Minx>(&listener, config);
+  minx->setExtensionHandler(
+    [this](const minx::SockAddr& a, const minx::Bytes& d) {
+      listener.handleExtension(a, d);
+    });
 }
 
 TestNode::~TestNode() {

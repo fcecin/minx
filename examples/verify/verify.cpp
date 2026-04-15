@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <iostream>
 #include <minx/blog.h>
+#include <minx/csprng.h>
 #include <minx/minxrunner.h>
 #include <mutex>
 #include <optional>
@@ -17,12 +18,8 @@ const int PRESSURE_BATCH_SIZE = 20;
 
 minx::Hash generateRandomHash() {
   minx::Hash hash;
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<uint64_t> dis;
-  for (size_t i = 0; i < hash.size() / sizeof(uint64_t); ++i) {
-    reinterpret_cast<uint64_t*>(hash.data())[i] = dis(gen);
-  }
+  minx::Csprng rng;
+  rng.fill(hash.data(), hash.size());
   return hash;
 }
 

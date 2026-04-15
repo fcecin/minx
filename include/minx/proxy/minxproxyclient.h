@@ -23,6 +23,7 @@
  * Owns its own io_context and thread for async I/O.
  */
 
+#include <minx/csprng.h>
 #include <minx/minx.h>
 #include <minx/powengine.h>
 
@@ -32,7 +33,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <random>
 #include <thread>
 #include <vector>
 
@@ -117,15 +117,16 @@ private:
 
   // IO
   boost::asio::io_context io_;
-  std::unique_ptr<boost::asio::executor_work_guard<
-    boost::asio::io_context::executor_type>> workGuard_;
+  std::unique_ptr<
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
+    workGuard_;
   std::thread ioThread_;
   boost::asio::ip::tcp::socket socket_;
   uint8_t headerBuf_[2]{};
 
-  // RNG for password generation
-  std::mt19937_64 rng_{std::random_device{}()};
-  std::uniform_int_distribution<uint64_t> distrib_;
+  // CSPRNG for password generation (SipHash counter mode seeded
+  // from the OS CSPRNG once at construction).
+  Csprng rng_;
 
   // PoW engine (one at a time)
   std::shared_ptr<PoWEngine> powEngine_;

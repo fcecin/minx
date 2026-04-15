@@ -16,7 +16,12 @@ print_help() {
     echo ""
     echo "Options:"
     echo "  --asan          Enables AddressSanitizer."
-    echo "  --test          Runs the unit tests after building."
+    echo "  --test [FILTER] Runs the unit tests after building. Optional Boost.Test filter."
+    echo "                  Examples:"
+    echo "                    --test                Run all tests"
+    echo "                    --test RudpSuite      Run one suite"
+    echo "                    --test RudpSuite/*    Run by wildcard"
+    echo "                    --test */TestRudpHandshakeHappyPath  Run one case"
     echo "  --clean         Cleans the target before building."
     echo "  --rm            Deletes 'build/' dir before building."
     echo "  --help, -h      Print help and exit."
@@ -142,7 +147,23 @@ run_tests() {
             echo "👻 Running with AddressSanitizer enabled..."
         fi
 
-        "${FOUND_BIN}" --log_level=test_suite --color_output=yes
+        local BOOST_ARGS="--log_level=test_suite --color_output=yes"
+        local LABEL="All Tests"
+        if [ -n "$TEST_FILTER" ]; then
+            BOOST_ARGS="$BOOST_ARGS --run_test=$TEST_FILTER"
+            LABEL="Tests ($TEST_FILTER)"
+        fi
+        echo "--- Running $LABEL ---"
+        set +e
+        "${FOUND_BIN}" $BOOST_ARGS
+        local rc=$?
+        set -e
+        if [ $rc -ne 0 ]; then
+            echo "❌ $LABEL FAILED (exit code $rc)"
+            exit 1
+        else
+            echo "✅ $LABEL passed."
+        fi
     else
         echo "❌ No Boost.Test executable found in: ${TEST_DIR}"
         echo "   Make sure the build succeeded."
@@ -159,11 +180,16 @@ TARGET="debug"
 CAMEL_TARGET="Debug"
 ACTION="build"
 RUN_TESTS=false
+TEST_FILTER=""
 DO_CLEAN=false
 ENABLE_ASAN=false
 DO_DEEP_CLEAN=false
 
-for arg in "$@"; do
+# Parse arguments — --test may optionally consume the next arg as a filter.
+ARGS=("$@")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+    arg="${ARGS[$i]}"
     LOWER_ARG=$(echo "$arg" | tr '[:upper:]' '[:lower:]')
 
     case "$LOWER_ARG" in
@@ -173,6 +199,19 @@ for arg in "$@"; do
             ;;
         --test)
             RUN_TESTS=true
+            # Check if next arg is a filter (not another flag, not a target)
+            next_i=$((i + 1))
+            if [ $next_i -lt ${#ARGS[@]} ]; then
+                next="${ARGS[$next_i]}"
+                case "$next" in
+                    --*|debug|release|relwithdebinfo|minsizerel|clean|rm)
+                        ;; # not a filter
+                    *)
+                        TEST_FILTER="$next"
+                        i=$next_i
+                        ;;
+                esac
+            fi
             ;;
         --clean)
             DO_CLEAN=true
@@ -212,6 +251,7 @@ for arg in "$@"; do
             exit 1
             ;;
     esac
+    i=$((i + 1))
 done
 
 case "$ACTION" in

@@ -48,8 +48,6 @@ std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
 
 Minx::Minx(MinxListener* listener, const MinxConfig config)
     : config_(config), listener_(listener), passwords_(1'000'000, 60),
-      gen_(std::random_device{}()),
-      genDistrib_(1, std::numeric_limits<uint64_t>::max()),
       spamFilter_(1'000'000, 3, config.spamThreshold, 3600),
       instanceName_(config.instanceName) {
   LOGTRACE << "Minx";
@@ -93,7 +91,7 @@ Minx::~Minx() {
 uint64_t Minx::generatePassword() {
   std::lock_guard<std::mutex> lock(genMutex_);
   while (true) {
-    uint64_t val = genDistrib_(gen_);
+    uint64_t val = csprng_.nextNonZero();
     if (!passwords_.get(val)) {
       return val;
     }
@@ -333,6 +331,10 @@ void Minx::sendExtension(const SockAddr& addr, const Bytes& data) {
   buf->put<uint8_t>(0x0);
   buf->put(std::span{data});
   doSocketSend(addr, buf);
+}
+
+void Minx::setExtensionHandler(MinxExtensionHandler handler) {
+  extensionHandler_ = std::move(handler);
 }
 
 int Minx::queryPoW(const uint64_t time, const Hash& solution,
@@ -919,8 +921,8 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   code = buffer_.get<uint8_t>();
 
   const bool connected = listener_->isConnected(remoteAddr_);
-  const bool loopback = config_.trustLoopback &&
-    remoteAddr_.address().is_loopback();
+  const bool loopback =
+    config_.trustLoopback && remoteAddr_.address().is_loopback();
 
   // Sampled spam scoring for handshaked packets (skip for connected)
   if (!connected && config_.spamSampleRate > 0 && code != MINX_INIT &&
@@ -934,8 +936,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   switch (code) {
   case MINX_INIT: {
-    if (!connected &&
-        spamFilter_.updateAndCheck(remoteAddr_.address())) {
+    if (!connected && spamFilter_.updateAndCheck(remoteAddr_.address())) {
       LOGTRACE << "onProcessPacket MINX_INIT spam filtered"
                << SVAR(remoteAddr_);
       break;
@@ -984,8 +985,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   }
 
   case MINX_GET_INFO: {
-    if (!connected &&
-        spamFilter_.updateAndCheck(remoteAddr_.address())) {
+    if (!connected && spamFilter_.updateAndCheck(remoteAddr_.address())) {
       LOGTRACE << "onProcessPacket MINX_GET_INFO spam filtered"
                << SVAR(remoteAddr_);
       break;
@@ -1096,17 +1096,19 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
   }
 
   case MINX_EXTENSION: {
-    uint8_t version;
-    size_t bytes_expected = sizeof(code) + sizeof(version);
-    if (bytes_transferred < bytes_expected) {
-      LOGTRACE << "onProcessPacket MINX_EXTENSION message too short"
-               << VAR(bytes_transferred) << VAR(bytes_expected);
-      lastError_ = MINX_ERROR_BAD_EXTENSION;
-      break;
+    if (extensionHandler_) {
+      uint8_t version;
+      size_t bytes_expected = sizeof(code) + sizeof(version);
+      if (bytes_transferred < bytes_expected) {
+        LOGTRACE << "onProcessPacket MINX_EXTENSION message too short"
+                 << VAR(bytes_transferred) << VAR(bytes_expected);
+        lastError_ = MINX_ERROR_BAD_EXTENSION;
+        break;
+      }
+      version = buffer_.get<uint8_t>();
+      auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
+      extensionHandler_(remoteAddr_, {data.begin(), data.end()});
     }
-    version = buffer_.get<uint8_t>();
-    auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
-    listener_->incomingExtension(remoteAddr_, {data.begin(), data.end()});
     break;
   }
 

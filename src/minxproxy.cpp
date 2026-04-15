@@ -40,13 +40,11 @@ static constexpr size_t WIRE_MIN_SIZE = WIRE_GPASSWORD_OFF;
 MinxProxy::MinxProxy(const tcp::endpoint& listenEp,
                      const udp::endpoint& upstreamEp,
                      const MinxProxyConfig& config)
-    : io_(), config_(config),
-      workGuard_(boost::asio::make_work_guard(io_)),
+    : io_(), config_(config), workGuard_(boost::asio::make_work_guard(io_)),
       upstreamAddr_(udp::endpoint(upstreamEp.address(), upstreamEp.port())),
       minx_(this, config.minxConfig),
       server_(io_, listenEp, *this, MAX_UDP_BYTES, config.maxClients),
-      sweepTimer_(io_), rng_(std::random_device{}()),
-      distrib_(1, std::numeric_limits<uint64_t>::max()) {
+      sweepTimer_(io_) {
   LOGINFO << "proxy starting, upstream=" << upstreamEp
           << " channels=" << config.numChannels;
 
@@ -312,7 +310,8 @@ void MinxProxy::forwardProveWork(const TcpSessionPtr& session,
   ch.sentAt = steady_clock::now();
   ch.spendable = 0;
 
-  pendingResponses_[proxyGPw] = {session, msg.gpassword, chIdx, MINX_PROVE_WORK};
+  pendingResponses_[proxyGPw] = {session, msg.gpassword, chIdx,
+                                 MINX_PROVE_WORK};
 
   minx_.sendProveWork(upstreamAddr_,
                       {msg.version, proxyGPw, spassword, msg.ckey, msg.hdata,
@@ -335,7 +334,8 @@ void MinxProxy::incomingInfo(const SockAddr& /*addr*/, const MinxInfo& msg) {
   cachedInfo_.push_back(MINX_INFO);
   cachedInfo_.push_back(msg.version);
   cachedInfo_.resize(cachedInfo_.size() + sizeof(MinxInfo::gpassword) +
-                     sizeof(MinxInfo::spassword), 0);
+                       sizeof(MinxInfo::spassword),
+                     0);
   upstreamSkey_ = msg.skey;
   cachedInfo_.insert(cachedInfo_.end(), msg.skey.begin(), msg.skey.end());
   cachedInfo_.push_back(msg.difficulty);
@@ -379,7 +379,7 @@ void MinxProxy::incomingMessage(const SockAddr& /*addr*/,
     std::vector<uint8_t> buf;
     buf.push_back(MINX_MESSAGE);
     buf.push_back(msg.version);
-    appendBE64(buf, distrib_(rng_) & ~LOSS_BIT);
+    appendBE64(buf, rng_.nextNonZero() & ~LOSS_BIT);
     appendBE64(buf, pending.clientGPassword);
     buf.insert(buf.end(), msg.data.begin(), msg.data.end());
     pending.client->send(buf);
@@ -410,7 +410,7 @@ void MinxProxy::incomingProveWork(const SockAddr& /*addr*/,
     std::vector<uint8_t> buf;
     buf.push_back(MINX_PROVE_WORK);
     buf.push_back(msg.version);
-    appendBE64(buf, distrib_(rng_) & ~LOSS_BIT);
+    appendBE64(buf, rng_.nextNonZero() & ~LOSS_BIT);
     appendBE64(buf, pending.clientGPassword);
     buf.insert(buf.end(), msg.ckey.begin(), msg.ckey.end());
     buf.insert(buf.end(), msg.hdata.begin(), msg.hdata.end());
@@ -435,7 +435,7 @@ void MinxProxy::buildAndSendInfo(const TcpSessionPtr& session,
 
   std::vector<uint8_t> buf = cachedInfo_;
 
-  uint64_t freshGPw = distrib_(rng_);
+  uint64_t freshGPw = rng_.nextNonZero();
   uint64_t gpw_be = boost::endian::native_to_big(freshGPw);
   std::memcpy(&buf[WIRE_GPASSWORD_OFF], &gpw_be, sizeof(MinxInfo::gpassword));
 

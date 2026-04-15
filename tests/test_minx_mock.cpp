@@ -1,5 +1,7 @@
 #include <boost/test/unit_test.hpp>
 
+#include <minx/stdext.h>
+
 #include "minx_mock.h"
 
 using namespace minx_test;
@@ -394,6 +396,169 @@ BOOST_AUTO_TEST_CASE(TestInitStillFilteredIndependently) {
   BOOST_TEST(received > 0, "Should receive some INITs");
   BOOST_TEST(received < TOTAL,
              "INIT should be rate-limited by amplification filter");
+}
+
+// Helper: build a raw EXTENSION payload in the std-extension wire format
+// — 8 bytes of routing key (uint64 big-endian) followed by body — and
+// return it as a minx::Bytes that can be handed to Minx::sendExtension.
+static minx::Bytes makeStdExtPacket(uint64_t key,
+                                    const std::vector<uint8_t>& body) {
+  minx::Bytes out;
+  minx::MinxStdExtensions::appendKey(out, key);
+  for (uint8_t b : body)
+    out.push_back(static_cast<char>(b));
+  return out;
+}
+
+BOOST_AUTO_TEST_CASE(TestStdExtensionsBuilderDispatch) {
+  BOOST_TEST_MESSAGE("--- Starting StdExtensions Builder Dispatch Test ---");
+
+  // Round-trip the key helpers before touching the network.
+  {
+    using SE = minx::MinxStdExtensions;
+    constexpr uint64_t composed = SE::makeKey(0x0107, 0xCE53AABBCCDDULL);
+    static_assert(composed == 0x0107CE53AABBCCDDULL);
+    static_assert(SE::metaOf(composed) == 0x0107);
+    static_assert(SE::idOf(composed) == 0xCE53AABBCCDDULL);
+    // makeKey must mask high bits of the id argument
+    static_assert(SE::makeKey(0x0001, 0xFFFFCE53AABBCCDDULL) ==
+                  0x0001CE53AABBCCDDULL);
+    // appendKey + readKey round-trip via boost::endian
+    minx::Bytes buf;
+    SE::appendKey(buf, composed);
+    BOOST_TEST(buf.size() == SE::KEY_SIZE);
+    BOOST_TEST(SE::readKey(buf) == composed);
+    // readKey on a too-short buffer returns 0
+    minx::Bytes shortBuf;
+    shortBuf.push_back((char)0xAA);
+    BOOST_TEST(SE::readKey(shortBuf) == 0u);
+  }
+
+  TestNode serverNode("Server", "127.0.0.1", 9200);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+
+  TestNode clientNode("Client", "127.0.0.1", 9201);
+  registerNode(clientNode);
+  clientNode.startNetwork();
+
+  // Two distinct extensions, registered with the canonical "high 2 bytes
+  // zero" form. Wire packets will arrive with non-zero meta in the high
+  // bytes and must still dispatch correctly thanks to the KEY_MASK.
+  const uint64_t KEY_A = 0xCE53AABBCCDDULL; // 0x0000CE53AABBCCDD
+  const uint64_t KEY_B = 0xFF1122334455ULL; // 0x0000FF1122334455
+  // A third key that nobody registers — must be dropped silently.
+  const uint64_t KEY_UNKNOWN = 0xDEADBEEF0001ULL;
+
+  std::atomic<int> handlerACalls{0};
+  std::atomic<int> handlerBCalls{0};
+  std::atomic<uint64_t> lastKeyA{0};
+  std::atomic<uint64_t> lastKeyB{0};
+  minx::Bytes lastPayloadA;
+  minx::Bytes lastPayloadB;
+  std::mutex payloadMutex;
+
+  // Scope the builder explicitly to prove it can die immediately after
+  // build() and the closure inside Minx still works.
+  {
+    minx::MinxStdExtensions stdExt;
+
+    stdExt.registerExtension(KEY_A,
+                             [&](const minx::SockAddr& /*addr*/, uint64_t key,
+                                 const minx::Bytes& payload) {
+                               ++handlerACalls;
+                               lastKeyA = key;
+                               std::lock_guard<std::mutex> lock(payloadMutex);
+                               lastPayloadA = payload;
+                             });
+
+    stdExt.registerExtension(KEY_B,
+                             [&](const minx::SockAddr& /*addr*/, uint64_t key,
+                                 const minx::Bytes& payload) {
+                               ++handlerBCalls;
+                               lastKeyB = key;
+                               std::lock_guard<std::mutex> lock(payloadMutex);
+                               lastPayloadB = payload;
+                             });
+
+    // Registering with junk in the high 2 bytes must collapse to the
+    // same masked entry — the second register replaces, not duplicates.
+    stdExt.registerExtension(
+      0xFFFFCE53AABBCCDDULL,
+      [&](const minx::SockAddr&, uint64_t, const minx::Bytes&) {
+        ++handlerACalls; // sentinel: should never actually fire if the
+                         // real KEY_A handler below replaces it
+      });
+    stdExt.registerExtension(KEY_A,
+                             [&](const minx::SockAddr& /*addr*/, uint64_t key,
+                                 const minx::Bytes& payload) {
+                               ++handlerACalls;
+                               lastKeyA = key;
+                               std::lock_guard<std::mutex> lock(payloadMutex);
+                               lastPayloadA = payload;
+                             });
+
+    BOOST_TEST(stdExt.size() == 2); // A and B, masked-collapsed
+
+    // Move-consume the builder. After this, stdExt is an empty husk.
+    serverNode.minx->setExtensionHandler(std::move(stdExt).build());
+  } // stdExt dies here — closure inside Minx must keep working
+
+  // Send packet for KEY_A with meta=0x0107 packed into the high 2 bytes
+  // of the wire key. The router must mask, find KEY_A, dispatch.
+  {
+    auto pkt =
+      makeStdExtPacket(0x0107CE53AABBCCDDULL, {0xDE, 0xAD, 0xBE, 0xEF});
+    clientNode.minx->sendExtension(serverNode.addr, pkt);
+  }
+
+  // Send packet for KEY_B with meta=0x0203 in the high 2 bytes.
+  {
+    auto pkt = makeStdExtPacket(0x0203FF1122334455ULL, {0x11, 0x22, 0x33});
+    clientNode.minx->sendExtension(serverNode.addr, pkt);
+  }
+
+  // Send packet for an unknown key — must be silently dropped, even with
+  // junk in the meta bytes.
+  {
+    auto pkt = makeStdExtPacket(0xFFFFULL << 48 | KEY_UNKNOWN, {0x99});
+    clientNode.minx->sendExtension(serverNode.addr, pkt);
+  }
+
+  // Send a too-short packet (only 4 bytes of the 8-byte key) — drop.
+  {
+    minx::Bytes shortPkt;
+    shortPkt.push_back((char)0x00);
+    shortPkt.push_back((char)0x00);
+    shortPkt.push_back((char)0xCE);
+    shortPkt.push_back((char)0x53);
+    clientNode.minx->sendExtension(serverNode.addr, shortPkt);
+  }
+
+  waitForCondition([&]() { return handlerACalls == 1 && handlerBCalls == 1; },
+                   5);
+
+  // Drain a few cycles to let any rogue callbacks land if the dispatcher
+  // is leaky.
+  pollAll(20);
+
+  BOOST_TEST(handlerACalls == 1);
+  BOOST_TEST(handlerBCalls == 1);
+  // Handler must receive the FULL unmasked wire key, including the meta.
+  BOOST_TEST(lastKeyA.load() == 0x0107CE53AABBCCDDULL);
+  BOOST_TEST(lastKeyB.load() == 0x0203FF1122334455ULL);
+
+  {
+    std::lock_guard<std::mutex> lock(payloadMutex);
+    BOOST_TEST(lastPayloadA.size() == 4u);
+    BOOST_TEST(lastPayloadB.size() == 3u);
+    BOOST_TEST((uint8_t)lastPayloadA[0] == 0xDE);
+    BOOST_TEST((uint8_t)lastPayloadA[3] == 0xEF);
+    BOOST_TEST((uint8_t)lastPayloadB[0] == 0x11);
+    BOOST_TEST((uint8_t)lastPayloadB[2] == 0x33);
+  }
+
+  BOOST_TEST_MESSAGE("--- StdExtensions Builder Dispatch Test Complete ---");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -28,6 +28,7 @@
  * construct it and call stop() when done.
  */
 
+#include <minx/csprng.h>
 #include <minx/minx.h>
 #include <minx/powengine.h>
 #include <minx/proxy/tcp_server.h>
@@ -39,7 +40,6 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
-#include <random>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -203,8 +203,7 @@ private:
   };
   std::deque<QueuedRequest> queue_;
 
-  std::mt19937_64 rng_;
-  std::uniform_int_distribution<uint64_t> distrib_;
+  Csprng rng_;
 
   static constexpr uint64_t LOSS_BIT = uint64_t(1) << 63;
   size_t lossFwdCount_ = 0;
