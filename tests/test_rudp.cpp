@@ -696,9 +696,11 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseDropsChannel) {
   BOOST_REQUIRE_EQUAL(alice.channelCount(bA), 1u);
   BOOST_REQUIRE_EQUAL(bob.channelCount(aA), 1u);
 
-  // close() on a non-existent channel is a no-op.
+  // close() on a non-existent channel is a no-op — no packet emitted.
+  BOOST_REQUIRE_EQUAL(wire.pending(), 0u);
   alice.close(bA, 999);
   BOOST_TEST(alice.channelCount(bA) == 1u);
+  BOOST_TEST(wire.pending() == 0u);
 
   // Close the real channel. State is gone from alice immediately,
   // AND the peer entry is pruned because it had no other channels.
@@ -707,13 +709,190 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseDropsChannel) {
   BOOST_TEST(alice.peerCount() == 0u);
   BOOST_TEST(!alice.isEstablished(bA, 7));
 
-  // Bob is unaffected — close() didn't emit any wire packet.
+  // Bob is still established — the HS_CLOSE packet is queued but not
+  // yet delivered. Until deliverAll() runs it, bob's side is intact.
   BOOST_TEST(bob.isEstablished(aA, 7) == true);
   BOOST_TEST(bob.channelCount(aA) == 1u);
+  BOOST_TEST(wire.pending() == 1u);
 
-  // Repeated close is also a no-op.
+  // Deliver the HS_CLOSE. Bob tears down synchronously.
+  wire.deliverAll(now);
+  BOOST_TEST(!bob.isEstablished(aA, 7));
+  BOOST_TEST(bob.channelCount(aA) == 0u);
+  BOOST_TEST(bob.peerCount() == 0u);
+
+  // Repeated close is also a no-op — no packet emitted.
   alice.close(bA, 7);
   BOOST_TEST(alice.peerCount() == 0u);
+  BOOST_TEST(wire.pending() == 0u);
+}
+
+// ---------------------------------------------------------------------------
+// 12b'. HS_CLOSE wire behavior: close() on ESTABLISHED emits exactly one
+// HS_CLOSE, peer's onChannelDestroyed fires on receive, subsequent stray
+// CHANNEL packets addressed to the torn-down channel are dropped as
+// unknown.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseEmitsHsCloseToPeer) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xC105A;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xC105B;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(9930), bA = makeAddr(9931);
+  FakeWire wire(alice, bob, aA, bA);
+
+  uint64_t now = 1000;
+  alice.push(bA, 3, B("hi"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 3));
+  BOOST_REQUIRE(bob.isEstablished(aA, 3));
+
+  // Install destroyed callbacks on both sides to observe the teardown.
+  size_t aliceDestroyed = 0, bobDestroyed = 0;
+  alice.setChannelDestroyedCallback(bA, 3, [&]() { ++aliceDestroyed; });
+  bob.setChannelDestroyedCallback(aA, 3, [&]() { ++bobDestroyed; });
+
+  // alice.close() fires alice's destroyed synchronously and queues one
+  // HS_CLOSE on the wire. bob hasn't been notified yet.
+  alice.close(bA, 3);
+  BOOST_TEST(aliceDestroyed == 1u);
+  BOOST_TEST(bobDestroyed == 0u);
+  BOOST_TEST(wire.pending() == 1u);
+
+  // Deliver the HS_CLOSE: bob fires destroyed and state is gone.
+  wire.deliverAll(now);
+  BOOST_TEST(bobDestroyed == 1u);
+  BOOST_TEST(!bob.isEstablished(aA, 3));
+  BOOST_TEST(bob.channelCount(aA) == 0u);
+
+  // No more packets in flight, no retry.
+  BOOST_TEST(wire.pending() == 0u);
+
+  // A stray push from bob to the now-gone channel starts a fresh
+  // handshake (channel_id 3 is reusable — nothing remembers it).
+  bob.push(aA, 3, B("still there?"), true);
+  bob.tick(now);
+  BOOST_TEST(wire.pending() >= 1u);
+  wire.clearQueue();
+}
+
+// ---------------------------------------------------------------------------
+// 12b''. close() on a non-ESTABLISHED channel emits no HS_CLOSE.
+// Non-ESTABLISHED states have no mutually-known session_token, so the
+// peer couldn't authenticate a close even if we sent one.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseOnNonEstablishedEmitsNothing) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xC106A;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xC106B;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(9940), bA = makeAddr(9941);
+  FakeWire wire(alice, bob, aA, bA);
+
+  // Push creates a channel in IDLE and queues an OPEN on first tick.
+  alice.push(bA, 5, B("hi"), true);
+  alice.tick(1000);
+  BOOST_REQUIRE_EQUAL(wire.pending(), 1u); // the OPEN
+  wire.clearQueue();
+  BOOST_REQUIRE(!alice.isEstablished(bA, 5));
+
+  // Close while in OPEN_SENT. No HS_CLOSE emitted.
+  alice.close(bA, 5);
+  BOOST_TEST(wire.pending() == 0u);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+}
+
+// ---------------------------------------------------------------------------
+// 12b'''. An HS_CLOSE with a mismatched session_token is dropped
+// silently. This is the off-path spoofing defense: without the 64-bit
+// session_token, an attacker observing or forging source addresses
+// cannot tear down an ESTABLISHED channel.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpHsCloseWrongTokenIsDropped) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xC107A;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xC107B;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(9950), bA = makeAddr(9951);
+  FakeWire wire(alice, bob, aA, bA);
+
+  uint64_t now = 1000;
+  alice.push(bA, 11, B("x"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 11));
+
+  // Hand-craft a forged HS_CLOSE with a wrong session_token and feed
+  // it to bob directly as if it had arrived over the wire.
+  const uint64_t real_token = bob.sessionToken(aA, 11);
+  const uint64_t wrong_token = real_token ^ 0xDEADBEEFCAFEBABEULL;
+
+  Bytes fake;
+  fake.resize(4 + 1 + 8);
+  minx::Buffer fbuf(fake);
+  fbuf.put<uint32_t>(11);
+  fbuf.put<uint8_t>(static_cast<uint8_t>(Rudp::HS_CLOSE));
+  fbuf.put<uint64_t>(wrong_token);
+  fake.resize(fbuf.getSize());
+
+  size_t bobDestroyed = 0;
+  bob.setChannelDestroyedCallback(aA, 11, [&]() { ++bobDestroyed; });
+
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, fake, now);
+
+  // The forged close was dropped; bob is still established.
+  BOOST_TEST(bob.isEstablished(aA, 11));
+  BOOST_TEST(bobDestroyed == 0u);
+
+  // The legitimate close still works.
+  alice.close(bA, 11);
+  wire.deliverAll(now);
+  BOOST_TEST(!bob.isEstablished(aA, 11));
+  BOOST_TEST(bobDestroyed == 1u);
+}
+
+// ---------------------------------------------------------------------------
+// 12b''''. An HS_CLOSE for a channel that doesn't exist does NOT
+// auto-create the channel. This prevents a spoofer from exhausting
+// channel slots by flooding HS_CLOSE packets for fabricated channel_ids.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpHsCloseForUnknownChannelDropped) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xC108A;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(9960);
+
+  // Forge an HS_CLOSE for a channel bob has never heard of.
+  Bytes fake;
+  fake.resize(4 + 1 + 8);
+  minx::Buffer fbuf(fake);
+  fbuf.put<uint32_t>(42);
+  fbuf.put<uint8_t>(static_cast<uint8_t>(Rudp::HS_CLOSE));
+  fbuf.put<uint64_t>(0x1234567890ABCDEFULL);
+  fake.resize(fbuf.getSize());
+
+  BOOST_REQUIRE_EQUAL(bob.peerCount(), 0u);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, fake, 1000);
+
+  // No channel was created.
+  BOOST_TEST(bob.peerCount() == 0u);
+  BOOST_TEST(bob.channelCount(aA) == 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +911,7 @@ BOOST_AUTO_TEST_CASE(TestRudpGcIdleThreshold) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.channelInactivityTimeout = std::chrono::seconds(3600); // backstop off
+  cfg.maxChannelsPerPeer = 3; // this test exercises multi-channel eviction
   cfg.rngSeed = 0x6C6C;
   Rudp alice(cfg);
   cfg.rngSeed = 0x6C6D;
@@ -1769,6 +1949,521 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkWithLoss) {
     now += 1000;
   }
   BOOST_TEST(wire.pending() == 0u);
+}
+
+// ===========================================================================
+// Per-channel token bucket
+// ===========================================================================
+
+// Negotiation: effective bucket is min(local, peer) per parameter.
+// alice advertises a SMALL burst, bob advertises a LARGE burst; alice
+// also has a very low rate so the bucket can't refill meaningfully
+// during the test. The observable consequence on bob's send side is
+// that bob can only emit ~min(alice.burst, bob.burst) = alice.burst
+// bytes before the bucket latches.
+BOOST_AUTO_TEST_CASE(TestRudpBucketNegotiationSmallerWins) {
+  minx::RudpConfig aliceCfg;
+  aliceCfg.baseTickInterval = std::chrono::microseconds::zero();
+  aliceCfg.rngSeed = 0xB0C1;
+  aliceCfg.perChannelBytesPerSecond = 1;      // effectively no refill
+  aliceCfg.perChannelBurstBytes = 4000;       // the small side
+  Rudp alice(aliceCfg);
+
+  minx::RudpConfig bobCfg;
+  bobCfg.baseTickInterval = std::chrono::microseconds::zero();
+  bobCfg.rngSeed = 0xB0C2;
+  bobCfg.perChannelBytesPerSecond = 1'000'000; // generous local config
+  bobCfg.perChannelBurstBytes = 1'000'000;     // the large side
+  Rudp bob(bobCfg);
+
+  SockAddr aA = makeAddr(10000), bA = makeAddr(10001);
+  FakeWire wire(alice, bob, aA, bA);
+
+  // Establish a channel. The handshake OPEN/ACCEPT carries each side's
+  // advertised params; both sides freeze their effective bucket at
+  // handshake completion.
+  uint64_t now = 1000;
+  alice.push(bA, 1, B("warmup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  BOOST_REQUIRE(bob.isEstablished(aA, 1));
+
+  // Now hammer bob's outbound: push many full-size reliable messages.
+  // bob's effective bucket is min(1MB, 4000) = 4000 bytes. Each packet
+  // carries a channel header (~29 bytes) plus the reliable message
+  // payload (≤1245). So the bucket should allow at most ~4 packets'
+  // worth of bytes before latching.
+  Bytes big = Bn('x', Rudp::MAX_MESSAGE_SIZE);
+  for (int i = 0; i < 50; ++i) {
+    bob.push(aA, 1, big, true);
+  }
+  wire.clearQueue();
+
+  // Tick bob at FIXED `now` (no dt between calls). At dt=0 the bucket
+  // refill is a no-op, so once the bucket exhausts after the first
+  // burst, emission stops for good. This is the clean way to measure
+  // the "burst capacity before any refill" ceiling.
+  size_t emittedBytes = 0;
+  for (int i = 0; i < 20; ++i) {
+    bob.tick(now);
+    while (!wire.queue.empty()) {
+      emittedBytes += wire.queue.front().bytes.size();
+      wire.queue.pop_front();
+    }
+  }
+
+  // Emitted bytes should be bounded by the effective burst PLUS at most
+  // one packet of overshoot (the one-packet overshoot design).
+  const size_t ceiling =
+    aliceCfg.perChannelBurstBytes + Rudp::MAX_PACKET_SIZE;
+  BOOST_TEST(emittedBytes <= ceiling);
+  BOOST_TEST(emittedBytes > 0u);
+}
+
+// Exhaustion + refill: after the bucket latches, bob stops emitting.
+// Advancing time enough to refill unlatches and lets more bytes flow.
+BOOST_AUTO_TEST_CASE(TestRudpBucketExhaustionAndRefill) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xB0C3;
+  cfg.perChannelBytesPerSecond = 10'000; // 10 KB/sec refill
+  cfg.perChannelBurstBytes = 2000;       // 2 KB initial burst
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xB0C4;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10010), bA = makeAddr(10011);
+  FakeWire wire(alice, bob, aA, bA);
+
+  uint64_t now = 1000;
+  alice.push(bA, 1, B("warmup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+
+  // Push a lot of data into alice's sendBuf.
+  Bytes big = Bn('A', Rudp::MAX_MESSAGE_SIZE);
+  for (int i = 0; i < 30; ++i) {
+    alice.push(bA, 1, big, true);
+  }
+
+  // Phase 1: fixed `now` so the bucket can't refill. Once the initial
+  // capacity is drained and the charge latches, emission stops.
+  wire.clearQueue();
+  size_t phase1Bytes = 0;
+  for (int i = 0; i < 20; ++i) {
+    alice.tick(now);
+    while (!wire.queue.empty()) {
+      phase1Bytes += wire.queue.front().bytes.size();
+      wire.queue.pop_front();
+    }
+  }
+  const size_t ceiling1 = cfg.perChannelBurstBytes + Rudp::MAX_PACKET_SIZE;
+  BOOST_TEST(phase1Bytes <= ceiling1);
+  BOOST_TEST(phase1Bytes > 0u);
+
+  // Remember how much was emitted before the bucket latched.
+  const size_t beforeRefill = phase1Bytes;
+
+  // Phase 2: advance time by 500ms. At 10 KB/s that's ~5 KB of tokens,
+  // more than enough to top off the 2 KB capacity and allow another
+  // burst's worth of emission.
+  now += 500'000;
+  size_t phase2Bytes = 0;
+  for (int i = 0; i < 20; ++i) {
+    alice.tick(now);
+    while (!wire.queue.empty()) {
+      phase2Bytes += wire.queue.front().bytes.size();
+      wire.queue.pop_front();
+    }
+  }
+  // After refill, alice can emit more. The total over both phases
+  // should exceed the initial burst (strict proof that refill cleared
+  // the latch).
+  BOOST_TEST(phase2Bytes > 0u);
+  BOOST_TEST(beforeRefill + phase2Bytes > cfg.perChannelBurstBytes);
+}
+
+// Both sides advertise PER_CHANNEL_UNLIMITED for both parameters (i.e.
+// default config on both). initChannelBucket's short-circuit at
+// rudp.cpp:140 disables pacing entirely when EITHER effective parameter
+// is still UNLIMITED after the min(local, peer) reduction — so with both
+// sides at UNLIMITED the bucket is disabled and any amount of data
+// flows without latching.
+BOOST_AUTO_TEST_CASE(TestRudpBucketBothUnlimitedPacingDisabled) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xB0C7;
+  // defaults: perChannelBytesPerSecond == perChannelBurstBytes ==
+  // PER_CHANNEL_UNLIMITED
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xB0C8;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10030), bA = makeAddr(10031);
+  FakeWire wire(alice, bob, aA, bA);
+
+  uint64_t now = 1000;
+  alice.push(bA, 1, B("warmup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+
+  // Push way more than any finite burst would allow, at time=now+1us
+  // so a finite rate couldn't have refilled.
+  Bytes big = Bn('X', Rudp::MAX_MESSAGE_SIZE);
+  for (int i = 0; i < 50; ++i) {
+    alice.push(bA, 1, big, true);
+  }
+  wire.clearQueue();
+  size_t emitted = 0;
+  for (int i = 0; i < 80; ++i) {
+    alice.tick(now);
+    while (!wire.queue.empty()) {
+      emitted += wire.queue.front().bytes.size();
+      wire.queue.pop_front();
+    }
+    now += 1;
+  }
+  // With pacing disabled, bob receives everything. Worst case with a
+  // finite bucket would have been ~(burst + MTU). We've pushed ~50
+  // MTUs, so exceeding any small-burst ceiling proves pacing is off.
+  BOOST_TEST(emitted > static_cast<size_t>(20 * Rudp::MAX_MESSAGE_SIZE));
+}
+
+// ===========================================================================
+// Simultaneous open — both sides push first, HS_OPENs cross on the wire
+// ===========================================================================
+
+// Both sides push() before any handshake traffic crosses. Both emit
+// HS_OPEN. When the peer's OPEN arrives while we're in OPEN_SENT, the
+// code (rudp.cpp:849) treats it as simultaneous-open, reuses our
+// already-generated nonce as N_b, and promotes to ESTABLISHED. Both
+// sides end up with the same session_token (deriveSessionToken is
+// commutative under XOR, see rudp.cpp:426).
+BOOST_AUTO_TEST_CASE(TestRudpSimultaneousOpenBothSidesPush) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0x51A1;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0x51A2;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10100), bA = makeAddr(10101);
+  FakeWire wire(alice, bob, aA, bA);
+
+  // Both sides push before the other's OPEN arrives. tick() on each
+  // emits HS_OPEN; they race through the queue.
+  alice.push(bA, 77, B("from-alice"), true);
+  bob.push(aA, 77, B("from-bob"), true);
+  alice.tick(1000);
+  bob.tick(1000);
+  // Wire now has two queued HS_OPENs — one from each side.
+  BOOST_REQUIRE_EQUAL(wire.pending(), 2u);
+
+  // Deliver. Each side's OPEN triggers the simultaneous-open path on
+  // the other, which emits an ACCEPT. Then the ACCEPTs are ignored
+  // (because state is already ESTABLISHED by the simultaneous-open
+  // path), but re-acking is harmless.
+  wire.deliverAll(1000);
+
+  BOOST_TEST(alice.isEstablished(bA, 77));
+  BOOST_TEST(bob.isEstablished(aA, 77));
+  // The session_token is derived from both nonces and is symmetric
+  // (XOR), so both sides agree.
+  BOOST_TEST(alice.sessionToken(bA, 77) == bob.sessionToken(aA, 77));
+  BOOST_TEST(alice.sessionToken(bA, 77) != 0u);
+
+  // Drive a few more ticks + delivers so each side's pushed message
+  // drains and gets delivered to the peer's ReceiveFn.
+  for (int i = 0; i < 10; ++i) {
+    alice.tick(1000 + i);
+    bob.tick(1000 + i);
+    wire.deliverAll(1000 + i);
+  }
+  BOOST_TEST(!wire.aliceRecv.empty());
+  BOOST_TEST(!wire.bobRecv.empty());
+}
+
+// ===========================================================================
+// Pulse machinery: deadline advancement, halving, catchup
+// ===========================================================================
+
+// With a non-zero baseTickInterval, nextDeadlineUs advances from 0 to
+// (now + interval) on the first external call that initializes the
+// pulse. Subsequent tick()s before the deadline don't fire pulses
+// and don't move the deadline.
+BOOST_AUTO_TEST_CASE(TestRudpPulseDeadlineAdvances) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(100); // 100_000 us
+  cfg.rngSeed = 0xBEAD;
+  Rudp r(cfg);
+  // Install callbacks so sendFn/receiveFn are non-null (doPulseWork
+  // returns early if sendFn is unset).
+  r.setSendCallback([](const SockAddr&, const Bytes&) {});
+  r.setReceiveCallback([](const SockAddr&, uint32_t, const Bytes&, bool) {});
+
+  // Before any call, deadline is the init sentinel (0).
+  BOOST_TEST(r.nextDeadlineUs() == 0u);
+
+  // First tick arms the deadline = now + interval.
+  r.tick(1'000'000);
+  BOOST_TEST(r.nextDeadlineUs() == 1'000'000u + 100'000u);
+
+  // tick() well before the deadline does NOT move it.
+  r.tick(1'050'000);
+  BOOST_TEST(r.nextDeadlineUs() == 1'000'000u + 100'000u);
+
+  // tick() AT the deadline fires a pulse and resets to now + interval.
+  r.tick(1'100'000);
+  BOOST_TEST(r.nextDeadlineUs() == 1'100'000u + 100'000u);
+}
+
+// onPacket with "novel" content calls scheduleHalvedFire, which cuts
+// the remaining time until the next deadline in half. The effect is
+// exponential acceleration under sustained inbound traffic.
+BOOST_AUTO_TEST_CASE(TestRudpPulseHalvingOnInbound) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(100);
+  cfg.rngSeed = 0xBEA1;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xBEA2;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10200), bA = makeAddr(10201);
+  FakeWire wire(alice, bob, aA, bA);
+
+  // Establish a channel so that later inbound novelty events land on a
+  // real ESTABLISHED channel (novelty check only fires on successful
+  // packet handling that produced new state).
+  uint64_t now = 1'000'000;
+  alice.push(bA, 1, B("warmup"), true);
+  alice.tick(now);
+  // bob hasn't seen the OPEN yet; bob's pulse isn't initialized until
+  // the next call, so arm it with a no-op tick first.
+  bob.tick(now);
+  const uint64_t bobDeadlineBeforeHandshake = bob.nextDeadlineUs();
+  BOOST_TEST(bobDeadlineBeforeHandshake == now + 100'000u);
+
+  // Deliver alice's OPEN → bob. bob emits ACCEPT in response; onPacket
+  // called scheduleHalvedFire because the handshake was novel.
+  // Remaining time from 1_000_000 to 1_100_000 was 100_000; halved is
+  // 50_000, so new deadline is 1_050_000.
+  wire.deliverAll(now);
+  BOOST_TEST(bob.nextDeadlineUs() < bobDeadlineBeforeHandshake);
+  BOOST_TEST(bob.nextDeadlineUs() == now + 50'000u);
+}
+
+// tick() that's overdue by N intervals fires catchup pulses — each
+// pulse gets its own per-channel packet-emission budget, so a long-
+// slept caller can emit multiple packets on a single tick(). Bounded
+// by an internal cap (MAX_PULSES_PER_CALL = 100).
+//
+// The key observable: a single tick() after a long idle period emits
+// MORE than one packet on a channel with many full-size messages
+// queued, because each caught-up pulse adds one packet to the per-
+// channel budget.
+BOOST_AUTO_TEST_CASE(TestRudpPulseCatchupOnOverdue) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(10); // 10ms interval
+  cfg.rngSeed = 0xBEA3;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xBEA4;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10210), bA = makeAddr(10211);
+  FakeWire wire(alice, bob, aA, bA);
+
+  // Establish the channel and drain the warmup traffic by running a
+  // few tick/deliver cycles with time advancing well past the 10ms
+  // interval. After this loop alice.sendBuf and the wire are both
+  // empty and both sides have up-to-date deadlines.
+  uint64_t now = 1'000'000;
+  alice.push(bA, 1, B("warmup"), true);
+  for (int i = 0; i < 10; ++i) {
+    alice.tick(now);
+    bob.tick(now);
+    wire.deliverAll(now);
+    now += 20'000; // 2 intervals per loop
+  }
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  wire.clearQueue();
+
+  // Push 10 full-size reliable messages. At MAX_MESSAGE_SIZE each,
+  // only one fits per packet — so N packets emitted ≈ N pulses fired.
+  Bytes big = Bn('C', Rudp::MAX_MESSAGE_SIZE);
+  for (int i = 0; i < 10; ++i) {
+    alice.push(bA, 1, big, true);
+  }
+
+  // Jump time forward by 100ms = 10 intervals past alice's current
+  // deadline (already set to ~now + 10ms from the last tick()). A
+  // single tick() here must fire multiple catchup pulses and emit
+  // multiple packets — strictly more than the "one packet per pulse"
+  // that a non-overdue tick would produce.
+  now += 100'000;
+  alice.tick(now);
+  const size_t overdueTickPackets = wire.pending();
+  BOOST_TEST(overdueTickPackets >= 2u); // proves catchup > one pulse
+  BOOST_TEST(overdueTickPackets <= 100u); // capped at MAX_PULSES_PER_CALL
+}
+
+// ===========================================================================
+// Edge cases: symmetric close, close vs peer-restart race, sendBuf full
+// ===========================================================================
+
+// Both sides call close() simultaneously. Each emits an HS_CLOSE; the
+// HS_CLOSEs cross on the wire. Each side's inbound HS_CLOSE arrives
+// for a channel the receiving side has already erased, so it's
+// dropped at findChannel (no crash, no double-destroyed fire).
+BOOST_AUTO_TEST_CASE(TestRudpSymmetricCloseIsIdempotent) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xEDC1;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xEDC2;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10300), bA = makeAddr(10301);
+  FakeWire wire(alice, bob, aA, bA);
+
+  uint64_t now = 1000;
+  alice.push(bA, 2, B("x"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 2));
+  BOOST_REQUIRE(bob.isEstablished(aA, 2));
+
+  size_t aliceDestroyed = 0, bobDestroyed = 0;
+  alice.setChannelDestroyedCallback(bA, 2, [&]() { ++aliceDestroyed; });
+  bob.setChannelDestroyedCallback(aA, 2, [&]() { ++bobDestroyed; });
+
+  // Both close BEFORE delivering either HS_CLOSE — each HS_CLOSE is
+  // queued on the wire with the other side still live.
+  alice.close(bA, 2);
+  bob.close(aA, 2);
+  BOOST_TEST(aliceDestroyed == 1u);
+  BOOST_TEST(bobDestroyed == 1u);
+  BOOST_TEST(wire.pending() == 2u);
+
+  // Deliver both crossed HS_CLOSEs. Each targets a channel the
+  // receiver has already erased — they're dropped at findChannel.
+  // No callbacks fire again; the counters stay at 1.
+  wire.deliverAll(now);
+  BOOST_TEST(aliceDestroyed == 1u);
+  BOOST_TEST(bobDestroyed == 1u);
+  BOOST_TEST(alice.peerCount() == 0u);
+  BOOST_TEST(bob.peerCount() == 0u);
+}
+
+// Peer-restart race: alice has an ESTABLISHED channel, then bob forgets
+// state and sends a fresh HS_OPEN with a new nonce. Before alice
+// processes bob's OPEN, a stale HS_CLOSE (with the OLD session_token)
+// would arrive from the network — it must NOT tear down the
+// newly-restarted channel.
+//
+// We simulate: bob restarts (re-construct), sends fresh OPEN; alice
+// processes it (fires destroyed for old session, accepts new session);
+// then a stale HS_CLOSE bearing the OLD token arrives — must be dropped
+// on the session_token mismatch check.
+BOOST_AUTO_TEST_CASE(TestRudpStaleHsCloseAfterPeerRestartIsDropped) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xEDC3;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xEDC4;
+  std::unique_ptr<Rudp> bob(new Rudp(cfg));
+
+  SockAddr aA = makeAddr(10310), bA = makeAddr(10311);
+  FakeWire wire(alice, *bob, aA, bA);
+
+  uint64_t now = 1000;
+  alice.push(bA, 3, B("hi"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 3));
+  const uint64_t oldToken = alice.sessionToken(bA, 3);
+  BOOST_REQUIRE(oldToken != 0u);
+
+  // Simulate peer restart: drop the old bob and construct a fresh one
+  // with different RNG (so new nonce, new token). Rewire.
+  bob.reset();
+  cfg.rngSeed = 0xEDC5;
+  bob.reset(new Rudp(cfg));
+  FakeWire wire2(alice, *bob, aA, bA);
+
+  // Fresh bob pushes → emits a new HS_OPEN with a new nonce.
+  bob->push(aA, 3, B("reborn"), true);
+  bob->tick(now);
+  wire2.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 3));
+  const uint64_t newToken = alice.sessionToken(bA, 3);
+  BOOST_REQUIRE(newToken != 0u);
+  BOOST_TEST(oldToken != newToken);
+
+  // Inject a stale HS_CLOSE carrying the OLD token directly to alice
+  // (as if it had been delayed in the network and arrives now).
+  Bytes stale;
+  stale.resize(4 + 1 + 8);
+  minx::Buffer sbuf(stale);
+  sbuf.put<uint32_t>(3);
+  sbuf.put<uint8_t>(static_cast<uint8_t>(Rudp::HS_CLOSE));
+  sbuf.put<uint64_t>(oldToken);
+  stale.resize(sbuf.getSize());
+
+  size_t aliceDestroyed = 0;
+  alice.setChannelDestroyedCallback(bA, 3, [&]() { ++aliceDestroyed; });
+
+  alice.onPacket(bA, Rudp::KEY_V0_HANDSHAKE, stale, now);
+
+  // Stale HS_CLOSE bounced on token mismatch. New channel still live.
+  BOOST_TEST(alice.isEstablished(bA, 3));
+  BOOST_TEST(aliceDestroyed == 0u);
+  BOOST_TEST(alice.sessionToken(bA, 3) == newToken);
+}
+
+// push() returns false when sendBuf hits its cap on an ESTABLISHED
+// channel (not the preEstablishedQueue path). The channel is already
+// up; the ack window hasn't drained yet; a burst that outpaces the
+// acks must fail push() rather than overflow sendBuf.
+BOOST_AUTO_TEST_CASE(TestRudpPushFailsWhenSendBufFullOnEstablished) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.maxReorderMessagesPerChannel = 3; // tiny cap to force the condition
+  cfg.rngSeed = 0xEDC6;
+  Rudp alice(cfg);
+  cfg.rngSeed = 0xEDC7;
+  Rudp bob(cfg);
+
+  SockAddr aA = makeAddr(10320), bA = makeAddr(10321);
+  FakeWire wire(alice, bob, aA, bA);
+
+  // Establish the channel with a trivial warm-up that gets acked.
+  uint64_t now = 1000;
+  alice.push(bA, 1, B("warmup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  // Drive until the warm-up is fully acked and sendBuf is empty.
+  for (int i = 0; i < 5; ++i) {
+    alice.tick(now);
+    bob.tick(now);
+    wire.deliverAll(now);
+  }
+
+  // Intercept the wire so alice's outbound packets can't be acked:
+  // we just drop everything. alice's sendBuf grows without draining.
+  wire.clearQueue();
+  wire.dropEveryNthAtoB = 1; // drop every alice→bob packet
+
+  // First 3 pushes fill sendBuf up to the cap of 3.
+  BOOST_TEST(alice.push(bA, 1, B("m0"), true) == true);
+  BOOST_TEST(alice.push(bA, 1, B("m1"), true) == true);
+  BOOST_TEST(alice.push(bA, 1, B("m2"), true) == true);
+  // Fourth push is rejected — sendBuf is full on an ESTABLISHED
+  // channel. Not a preEstablishedQueue path: the channel is live.
+  BOOST_TEST(alice.push(bA, 1, B("m3"), true) == false);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -327,6 +327,13 @@ void Rudp::close(const SockAddr& peer, uint32_t channel_id) {
   if (cit == peerState.channels.end())
     return;
   LOGTRACE << "close" << SVAR(peer) << VAR(channel_id);
+  // Best-effort teardown hint to the peer. Only meaningful once both
+  // sides agree on a session_token — emit for ESTABLISHED only. Other
+  // states have no mutually-known token, so silently drop as before
+  // (the peer's handshake retry / idle-GC will notice on its own).
+  if (cit->second.handshakeState == HandshakeState::ESTABLISHED) {
+    emitHandshakeClose(peer, channel_id, cit->second.sessionToken);
+  }
   // Fire the destroyed callback BEFORE erase so the callback still
   // has a live ChannelState reference if it needs to inspect anything.
   fireChannelDestroyed(cit->second);
@@ -785,29 +792,86 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
 // Inbound HANDSHAKE
 // ===========================================================================
 //
-// HANDSHAKE packet body (after the stdext routing key, which onPacket
-// has already consumed):
+// HANDSHAKE packets share a 5-byte header and then vary by kind:
 //
-//   [channel_id       : uint32 BE]
-//   [kind             : uint8    ]   // HS_OPEN or HS_ACCEPT
+//   [channel_id : uint32 BE]
+//   [kind       : uint8    ]
+//
+// Kind = HS_OPEN / HS_ACCEPT (21-byte body total):
 //   [nonce            : uint64 BE]
 //   [advertised_rate  : uint32 BE]   // bytes/sec, UNLIMITED = no cap
 //   [advertised_burst : uint32 BE]   // bytes, UNLIMITED = no cap
 //
-// Total: 21 bytes.
+// Kind = HS_CLOSE (13-byte body total):
+//   [session_token : uint64 BE]     // authenticates the close
+//
+// HS_CLOSE deliberately never auto-creates a channel and is dropped
+// silently unless the named channel exists, is ESTABLISHED, and the
+// session_token matches. That keeps an off-path spoofer from allocating
+// channel slots or tearing down unrelated sessions.
 // ===========================================================================
 
 bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
-  // Pre-length-check before ConstBuffer reads, matching minx.cpp's
-  // inbound style (src/minx.cpp:944-970). 21 = 4 + 1 + 8 + 4 + 4.
-  static constexpr size_t HANDSHAKE_BODY_SIZE = 4 + 1 + 8 + 4 + 4;
-  if (payload.size() < HANDSHAKE_BODY_SIZE) {
-    LOGDEBUG << "drop: handshake packet too short" << VAR(payload.size());
+  static constexpr size_t HANDSHAKE_HEADER_SIZE = 4 + 1;
+  static constexpr size_t HANDSHAKE_OPEN_ACCEPT_BODY_SIZE =
+    HANDSHAKE_HEADER_SIZE + 8 + 4 + 4; // 21
+  static constexpr size_t HANDSHAKE_CLOSE_BODY_SIZE =
+    HANDSHAKE_HEADER_SIZE + 8; // 13
+
+  if (payload.size() < HANDSHAKE_HEADER_SIZE) {
+    LOGDEBUG << "drop: handshake packet too short for header"
+             << VAR(payload.size());
     return false;
   }
   ConstBuffer buf(payload);
   const uint32_t channel_id = buf.get<uint32_t>();
   const uint8_t kind = buf.get<uint8_t>();
+
+  // HS_CLOSE is parsed and dispatched separately because it never
+  // creates a channel (unlike HS_OPEN/HS_ACCEPT which go through
+  // getOrCreateChannel) and has its own wire shape.
+  if (kind == HS_CLOSE) {
+    if (payload.size() < HANDSHAKE_CLOSE_BODY_SIZE) {
+      LOGDEBUG << "drop: HS_CLOSE packet too short" << VAR(payload.size());
+      return false;
+    }
+    const uint64_t session_token = buf.get<uint64_t>();
+    ChannelState* cs = findChannel(peer, channel_id);
+    if (!cs) {
+      LOGTRACE << "drop: HS_CLOSE for unknown channel" << VAR(channel_id);
+      return false;
+    }
+    // Only ESTABLISHED channels have a mutually-known session_token.
+    // Anything else (IDLE, OPEN_SENT, ACCEPT_SENT, CLOSED) is either
+    // a race against our own close() or a stale/spoofed packet; drop.
+    if (cs->handshakeState != HandshakeState::ESTABLISHED) {
+      LOGTRACE << "drop: HS_CLOSE in non-ESTABLISHED state"
+               << VAR(channel_id)
+               << VAR(static_cast<int>(cs->handshakeState));
+      return false;
+    }
+    if (cs->sessionToken != session_token) {
+      LOGTRACE << "drop: HS_CLOSE with mismatched session_token"
+               << VAR(channel_id);
+      return false;
+    }
+    LOGTRACE << "received HS_CLOSE, tearing down channel"
+             << VAR(channel_id);
+    fireChannelDestroyed(*cs);
+    auto pit = peers_.find(peer);
+    if (pit != peers_.end()) {
+      pit->second.channels.erase(channel_id);
+      if (pit->second.channels.empty()) {
+        peers_.erase(pit);
+      }
+    }
+    return true; // novel: channel torn down by peer
+  }
+
+  if (payload.size() < HANDSHAKE_OPEN_ACCEPT_BODY_SIZE) {
+    LOGDEBUG << "drop: handshake packet too short" << VAR(payload.size());
+    return false;
+  }
   const uint64_t nonce = buf.get<uint64_t>();
   const uint32_t peerRate = buf.get<uint32_t>();
   const uint32_t peerBurst = buf.get<uint32_t>();
@@ -1184,6 +1248,34 @@ void Rudp::emitHandshake(const SockAddr& peer, uint32_t channel_id,
   cs.lastActivityUs = currentTimeUs_;
   LOGTRACE << "emit handshake" << VAR(channel_id) << VAR(static_cast<int>(kind))
            << VAR(pkt.size());
+  sendFn_(peer, pkt);
+}
+
+// HS_CLOSE wire layout (after the 8-byte stdext routing key consumed by
+// onPacket):
+//
+//   [channel_id    : uint32 BE]
+//   [kind          : uint8    ]   // HS_CLOSE = 0x02
+//   [session_token : uint64 BE]
+//
+// Total body: 13 bytes. No nonce, no bucket advertisements — HS_CLOSE is
+// a terminal packet, there is nothing left to negotiate. The token is
+// the authenticator: only the two sides of an ESTABLISHED channel know
+// it, so an off-path attacker forging a close is blocked by the
+// session_token check on receipt.
+void Rudp::emitHandshakeClose(const SockAddr& peer, uint32_t channel_id,
+                              uint64_t session_token) {
+  if (!sendFn_)
+    return;
+  Bytes pkt;
+  pkt.resize(pkt.max_size());
+  Buffer buf(pkt);
+  buf.put<uint64_t>(KEY_V0_HANDSHAKE);
+  buf.put<uint32_t>(channel_id);
+  buf.put<uint8_t>(static_cast<uint8_t>(HS_CLOSE));
+  buf.put<uint64_t>(session_token);
+  pkt.resize(buf.getSize());
+  LOGTRACE << "emit HS_CLOSE" << VAR(channel_id) << VAR(pkt.size());
   sendFn_(peer, pkt);
 }
 

@@ -66,11 +66,16 @@ struct RudpConfig {
 
   /// Per-peer channel cap. Hard ceiling on peers_[addr].channels.size().
   /// Reaching it makes new channel allocation fail at push() / inbound time.
-  size_t maxChannelsPerPeer = 8;
+  /// Default 1 is deliberately tight — a peer only gets one multiplexed
+  /// stream unless the app explicitly bumps this. Worst-case per-peer
+  /// buffer budget scales linearly with this value (see the reorder caps
+  /// below), so leaving it at 1 keeps a freshly-accepted peer bounded at
+  /// roughly one reorder buffer's worth of RAM.
+  size_t maxChannelsPerPeer = 1;
 
   /// Per-channel reorder buffer caps. Either bound trips first.
-  size_t maxReorderMessagesPerChannel = 2048;
-  size_t maxReorderBytesPerChannel = 2 * 1024 * 1024; // 2 MB
+  size_t maxReorderMessagesPerChannel = 1024;
+  size_t maxReorderBytesPerChannel = 1024 * 1024; // 1 MB
 
   /// Channel idle GC. Drop stale (peer_addr, channel_id) entries after
   /// this long with no traffic in either direction. NAT mappings die
@@ -203,6 +208,12 @@ public:
   enum HandshakeKind : uint8_t {
     HS_OPEN = 0x00,
     HS_ACCEPT = 0x01,
+    // Fire-and-forget teardown hint emitted by close() on an ESTABLISHED
+    // channel. Carries only (channel_id, session_token) — the token
+    // authenticates the close and prevents off-path spoofing. One-shot,
+    // no retry; if lost, the peer falls back to its own idle-GC. See
+    // src/rudp.cpp for the wire layout.
+    HS_CLOSE = 0x02,
   };
 
   // -----------------------------------------------------------------------
@@ -298,16 +309,15 @@ public:
   // Local state management
   // -----------------------------------------------------------------------
   //
-  // close() and gc() are memory-management verbs, not wire verbs. They
-  // drop channel state locally without sending any teardown packet —
-  // there is no teardown wire format and none is planned. The peer
-  // discovers that a channel is gone by silence, or by the next stray
-  // packet failing a session-token check. This is deliberate: the two
-  // sides of a RUDP conversation are responsible for noticing, at the
-  // application layer, when a session is finished. The server's
-  // obligation is to provision for the memory capacity it intends to
-  // serve, and when that capacity is pressured it evicts the oldest
-  // idle channels itself — the client doesn't get a say.
+  // close() optionally emits a single HS_CLOSE teardown hint to the
+  // peer before dropping local state — see below. gc() and the pulse
+  // idle-GC do NOT emit any wire packet; they silently drop state and
+  // let the peer's own idle-GC notice. The asymmetry is deliberate:
+  // close() is the app's unilateral teardown signal (bad header, policy
+  // rejection, protocol error) where the peer would otherwise hang
+  // until its own ~60s idle-GC fires; gc() is memory pressure where
+  // the peer will hit its own idle-GC at roughly the same time anyway
+  // and the extra packets per channel are wasteful.
 
   /// Drop a single channel immediately. Whatever state the channel
   /// was in (IDLE, OPEN_SENT, ACCEPT_SENT, ESTABLISHED, CLOSED),
@@ -316,6 +326,15 @@ public:
   /// dropped as "unknown channel." If the peer has no other channels
   /// left, its PeerState entry is also evicted. No-op if the channel
   /// doesn't exist.
+  ///
+  /// If the channel was ESTABLISHED, a single HS_CLOSE packet is
+  /// emitted to the peer carrying the channel's session_token. The
+  /// peer verifies the token against its current session and tears
+  /// down its own side synchronously (fires onChannelDestroyed,
+  /// erases state). This avoids the ~60s hang where the peer keeps
+  /// retransmitting pending sends into the void. Fire-and-forget:
+  /// HS_CLOSE is not retried, and loss of that single packet just
+  /// falls back to the peer's normal idle-GC.
   void close(const SockAddr& peer, uint32_t channel_id);
 
   /// Evict every channel whose last activity is older than
@@ -325,6 +344,10 @@ public:
   /// peers are also pruned. Use this under memory pressure: walk the
   /// threshold down from "relaxed" (say 60s) toward "aggressive" (say
   /// 3s) until enough slots free up to accept new channels.
+  ///
+  /// Does NOT emit HS_CLOSE (unlike close()). The peer discovers the
+  /// eviction via its own idle-GC or via the session-token check on
+  /// the next stray packet.
   ///
   /// The backstop idle GC inside the pulse machinery — which fires at
   /// config_.channelInactivityTimeout (60s by default) every pulse —
@@ -575,6 +598,11 @@ private:
   // Outbound builders / emitters
   void emitHandshake(const SockAddr& peer, uint32_t channel_id,
                      ChannelState& cs, HandshakeKind kind);
+  // Separate emitter for HS_CLOSE: shorter wire layout (no nonce, no
+  // bucket advertisements, just the session_token that authenticates
+  // the close). One-shot, no retry, best effort.
+  void emitHandshakeClose(const SockAddr& peer, uint32_t channel_id,
+                          uint64_t session_token);
   // Burst-aware channel emitter. Emits up to `maxPackets` CHANNEL
   // packets in this call, advancing a local cursor through sendBuf so
   // consecutive packets carry different message ranges. The first
