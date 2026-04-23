@@ -21,6 +21,9 @@
 
 #include <boost/endian/conversion.hpp>
 
+#include <crc32c/crc32c.h>
+#include <array>
+
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -212,6 +215,40 @@ static Bytes Bn(uint8_t b, size_t n) {
 // equality, not by routing.
 static SockAddr makeAddr(uint16_t port) {
   return SockAddr(boost::asio::ip::make_address("127.0.0.1"), port);
+}
+
+// --- BE appenders + CRC trailer helper, used by forged-packet tests.
+// RUDP expects every on-wire packet to carry a CRC32C trailer covering
+// [routing_key_BE][body]. Forged bodies fed directly to onPacket()
+// need the same trailer or they're dropped at the CRC check.
+
+static void pushU8(minx::Bytes& b, uint8_t v) {
+  b.push_back(static_cast<char>(v));
+}
+static void pushU16BE(minx::Bytes& b, uint16_t v) {
+  pushU8(b, static_cast<uint8_t>((v >> 8) & 0xFF));
+  pushU8(b, static_cast<uint8_t>(v & 0xFF));
+}
+static void pushU32BE(minx::Bytes& b, uint32_t v) {
+  pushU8(b, static_cast<uint8_t>((v >> 24) & 0xFF));
+  pushU8(b, static_cast<uint8_t>((v >> 16) & 0xFF));
+  pushU8(b, static_cast<uint8_t>((v >> 8) & 0xFF));
+  pushU8(b, static_cast<uint8_t>((v) & 0xFF));
+}
+static void pushU64BE(minx::Bytes& b, uint64_t v) {
+  for (int i = 7; i >= 0; --i)
+    pushU8(b, static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+}
+
+static void appendCrcTrailer(uint64_t key, minx::Bytes& body) {
+  std::array<uint8_t, 8> kb{};
+  for (int i = 0; i < 8; ++i)
+    kb[i] = static_cast<uint8_t>((key >> ((7 - i) * 8)) & 0xFF);
+  uint32_t acc = ::crc32c_value(kb.data(), 8);
+  if (!body.empty())
+    acc = ::crc32c_extend(
+      acc, reinterpret_cast<const uint8_t*>(body.data()), body.size());
+  pushU32BE(body, acc);
 }
 
 } // namespace
@@ -847,6 +884,7 @@ BOOST_AUTO_TEST_CASE(TestRudpHsCloseWrongTokenIsDropped) {
   fbuf.put<uint8_t>(static_cast<uint8_t>(Rudp::HS_CLOSE));
   fbuf.put<uint64_t>(wrong_token);
   fake.resize(fbuf.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, fake);
 
   size_t bobDestroyed = 0;
   bob.setChannelDestroyedCallback(aA, 11, [&]() { ++bobDestroyed; });
@@ -886,6 +924,7 @@ BOOST_AUTO_TEST_CASE(TestRudpHsCloseForUnknownChannelDropped) {
   fbuf.put<uint8_t>(static_cast<uint8_t>(Rudp::HS_CLOSE));
   fbuf.put<uint64_t>(0x1234567890ABCDEFULL);
   fake.resize(fbuf.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, fake);
 
   BOOST_REQUIRE_EQUAL(bob.peerCount(), 0u);
   bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, fake, 1000);
@@ -1356,6 +1395,7 @@ BOOST_AUTO_TEST_CASE(TestRudpPeerRestartFiresFullTriad) {
   fb.put<uint32_t>(0xFFFFFFFFu);           // advertised rate (unlimited)
   fb.put<uint32_t>(0xFFFFFFFFu);           // advertised burst (unlimited)
   body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
 
   bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, now);
 
@@ -1406,25 +1446,6 @@ static uint32_t extractPayloadIndex(const minx::Bytes& b) {
          (static_cast<uint32_t>(static_cast<uint8_t>(b[3])));
 }
 
-// Append a big-endian uint to a Bytes buffer.
-static void pushU8(minx::Bytes& b, uint8_t v) {
-  b.push_back(static_cast<char>(v));
-}
-static void pushU16BE(minx::Bytes& b, uint16_t v) {
-  pushU8(b, static_cast<uint8_t>((v >> 8) & 0xFF));
-  pushU8(b, static_cast<uint8_t>(v & 0xFF));
-}
-static void pushU32BE(minx::Bytes& b, uint32_t v) {
-  pushU8(b, static_cast<uint8_t>((v >> 24) & 0xFF));
-  pushU8(b, static_cast<uint8_t>((v >> 16) & 0xFF));
-  pushU8(b, static_cast<uint8_t>((v >> 8) & 0xFF));
-  pushU8(b, static_cast<uint8_t>((v) & 0xFF));
-}
-static void pushU64BE(minx::Bytes& b, uint64_t v) {
-  for (int i = 7; i >= 0; --i)
-    pushU8(b, static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
-}
-
 // Forge a CHANNEL packet body (the bytes onPacket receives — i.e. AFTER
 // the 8-byte stdext routing key has been stripped). Wire layout matches
 // local/rudp.md exactly.
@@ -1444,6 +1465,7 @@ static minx::Bytes forgeChannelBody(
     for (auto c : body)
       out.push_back(c);
   }
+  appendCrcTrailer(minx::Rudp::KEY_V0_CHANNEL, out);
   return out;
 }
 
@@ -2379,6 +2401,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStaleHsCloseAfterPeerRestartIsDropped) {
   sbuf.put<uint8_t>(static_cast<uint8_t>(Rudp::HS_CLOSE));
   sbuf.put<uint64_t>(oldToken);
   stale.resize(sbuf.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, stale);
 
   size_t aliceDestroyed = 0;
   alice.setChannelDestroyedCallback(bA, 3, [&]() { ++aliceDestroyed; });

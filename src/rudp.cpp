@@ -5,10 +5,96 @@ LOG_MODULE_DISABLED("rudp")
 
 #include <minx/buffer.h>
 
+#include <crc32c/crc32c.h>
+
 #include <algorithm>
+#include <cstring>
 #include <span>
 
 namespace minx {
+
+// ===========================================================================
+// CRC32C wire integrity
+// ===========================================================================
+//
+// Every RUDP datagram carries a 4-byte CRC32C trailer covering the
+// entire on-wire packet (routing key + body). The trailer is appended
+// by the send path (appendCrc32cTrailer) and checked + stripped by
+// onPacket (verifyAndStripCrc32cTrailer). Corruption that sneaks past
+// UDP's 16-bit checksum — router bit flips, memory corruption, etc.
+// — is caught here and the packet is dropped as if it had never
+// arrived; RUDP's retransmit handles recovery transparently.
+//
+// The CRC covers the routing key (8 bytes, serialized BE) + the body
+// bytes (what MinxStdExtensions hands to onPacket() as `payload`,
+// minus the last 4 bytes which ARE the trailer). Computing with
+// crc32c_extend lets us hash the two ranges as a single logical
+// stream without a copy.
+//
+// Hardware-accelerated on x86-64 via SSE4.2 (detected at runtime by
+// the google/crc32c library). Sub-microsecond per packet; free
+// compared to a UDP send.
+
+// Serialize a u64 key to 8 BE bytes using minx's Buffer (identical
+// endianness to the put<uint64_t>() calls in the emit functions).
+static void serializeKeyBE(uint64_t key,
+                           std::array<uint8_t, 8>& out) {
+  // Wrap a scratch Bytes around the output span. Bytes is a
+  // static_vector<char, MAX_DATA_SIZE>; we just need 8 bytes of
+  // addressable storage for the Buffer to write into.
+  Bytes scratch;
+  scratch.resize(8);
+  Buffer b(scratch);
+  b.put<uint64_t>(key);
+  std::memcpy(out.data(),
+              reinterpret_cast<const uint8_t*>(scratch.data()), 8);
+}
+
+static uint32_t computeCrc32cOverKeyAndBody(
+    uint64_t key, const uint8_t* body, size_t bodyLen) {
+  std::array<uint8_t, 8> kb{};
+  serializeKeyBE(key, kb);
+  uint32_t acc = ::crc32c_value(kb.data(), 8);
+  if (bodyLen > 0)
+    acc = ::crc32c_extend(acc, body, bodyLen);
+  return acc;
+}
+
+// Called by every emit function after pkt is fully built. pkt at
+// this point is the full on-wire datagram (routing key + body),
+// which is what the peer's UDP socket will see. We compute CRC32C
+// over it and append 4 BE bytes via Buffer — same serialization the
+// put<uint32_t>() calls in the emit functions use, so receivers
+// decode the trailer with the same ConstBuffer primitives. Caller
+// must have left CRC_SIZE of headroom in whatever budget math it
+// did.
+static void appendCrc32cTrailer(Bytes& pkt) {
+  const auto* data = reinterpret_cast<const uint8_t*>(pkt.data());
+  uint32_t crc = ::crc32c_value(data, pkt.size());
+  const size_t oldSize = pkt.size();
+  pkt.resize(oldSize + Rudp::CRC_SIZE);
+  Buffer tail(pkt);
+  tail.setWritePos(oldSize);
+  tail.put<uint32_t>(crc);
+}
+
+// Returns true if the trailer checks out; `payload` is mutated to
+// remove the 4-byte trailer. Returns false on length-too-short or
+// mismatch; in the false case payload may have been truncated.
+// Caller must treat "false" as "drop the packet, take no action".
+static bool verifyAndStripCrc32cTrailer(
+    uint64_t key, Bytes& payload) {
+  if (payload.size() < Rudp::CRC_SIZE) return false;
+  const size_t bodyLen = payload.size() - Rudp::CRC_SIZE;
+  const auto* data = reinterpret_cast<const uint8_t*>(payload.data());
+  uint32_t expected = computeCrc32cOverKeyAndBody(key, data, bodyLen);
+  ConstBuffer tail(payload);
+  tail.setReadPos(bodyLen);
+  uint32_t got = tail.get<uint32_t>();
+  if (expected != got) return false;
+  payload.resize(bodyLen);
+  return true;
+}
 
 // ===========================================================================
 // File-static helpers
@@ -736,6 +822,12 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
     return;
   }
 
+  // Verify the CRC32C trailer. Corrupted packets are dropped
+  // silently — RUDP's retransmit path recovers, and logging every
+  // miss would spam under any non-trivial loss profile.
+  Bytes body = payload; // copy so we can truncate the trailer
+  if (!verifyAndStripCrc32cTrailer(key, body)) return;
+
   // Process the packet. Each handler returns a "novel" bool that used
   // to feed a scheduleHalvedFire() deadline tweak; that tweak only
   // shifted one pulse earlier by < base and reverted to normal
@@ -744,10 +836,10 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
   // is kept in the handler signatures for potential future use.
   switch (subproto) {
   case SUBPROTO_HANDSHAKE:
-    (void)handleHandshakePacket(peer, payload);
+    (void)handleHandshakePacket(peer, body);
     break;
   case SUBPROTO_CHANNEL:
-    (void)handleChannelPacket(peer, payload);
+    (void)handleChannelPacket(peer, body);
     break;
   default:
     LOGDEBUG << "drop: unknown RUDP sub-proto" << VAR(subproto);
@@ -1217,6 +1309,7 @@ void Rudp::emitHandshake(const SockAddr& peer, uint32_t channel_id,
   pkt.resize(buf.getSize());
 
   cs.lastActivityUs = currentTimeUs_;
+  appendCrc32cTrailer(pkt);
   LOGTRACE << "emit handshake" << VAR(channel_id) << VAR(static_cast<int>(kind))
            << VAR(pkt.size());
   sendFn_(peer, pkt);
@@ -1246,6 +1339,7 @@ void Rudp::emitHandshakeClose(const SockAddr& peer, uint32_t channel_id,
   buf.put<uint8_t>(static_cast<uint8_t>(HS_CLOSE));
   buf.put<uint64_t>(session_token);
   pkt.resize(buf.getSize());
+  appendCrc32cTrailer(pkt);
   LOGTRACE << "emit HS_CLOSE" << VAR(channel_id) << VAR(pkt.size());
   sendFn_(peer, pkt);
 }
@@ -1281,9 +1375,12 @@ size_t Rudp::emitChannel(const SockAddr& peer, uint32_t channel_id,
     // this packet (and leave `budget` pointing at the bytes remaining
     // after them, which is the room available for the unreliable
     // tail). No bytes written yet; `it` is not advanced here.
+    //
+    // CRC_SIZE is reserved at the tail because appendCrc32cTrailer
+    // runs after we serialize the body.
     const size_t headerSize =
       MinxStdExtensions::KEY_SIZE + 4 + 8 + 4 + 4 + 1; // 29
-    size_t budget = MAX_PACKET_SIZE - headerSize;
+    size_t budget = MAX_PACKET_SIZE - headerSize - CRC_SIZE;
     size_t reliableCount = 0;
     auto itScan = it;
     while (itScan != cs.sendBuf.end() &&
@@ -1333,6 +1430,7 @@ size_t Rudp::emitChannel(const SockAddr& peer, uint32_t channel_id,
     }
 
     pkt.resize(buf.getSize());
+    appendCrc32cTrailer(pkt);
 
     LOGTRACE << "emit channel" << VAR(channel_id) << VAR(reliableCount)
              << VAR(pkt.size()) << VAR(packetsEmitted);

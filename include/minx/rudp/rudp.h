@@ -171,6 +171,13 @@ public:
   /// MINX EXTENSION DATA budget RUDP gets to fill (= MAX_DATA_SIZE).
   static constexpr size_t MAX_PACKET_SIZE = 1280;
 
+  /// Every RUDP datagram carries a CRC32C trailer covering the
+  /// routing key + body. Corrupted packets are dropped at the top of
+  /// onPacket() before any parsing — cheap defense in depth against
+  /// UDP's 16-bit checksum and router-level bit flips. Hardware-
+  /// accelerated on x86-64 (SSE4.2), so the cost is nanoseconds.
+  static constexpr size_t CRC_SIZE = 4;
+
   /// Header overhead of a CHANNEL packet, including the 8-byte stdext
   /// routing key. See local/rudp.md for the byte-by-byte breakdown.
   ///   8  routing key
@@ -188,12 +195,12 @@ public:
   /// Maximum bytes available for application payload (reliable messages
   /// + opaque unreliable tail) inside one CHANNEL packet.
   static constexpr size_t MAX_PAYLOAD_PER_PACKET =
-    MAX_PACKET_SIZE - CHANNEL_HEADER_SIZE; // 1251
+    MAX_PACKET_SIZE - CHANNEL_HEADER_SIZE - CRC_SIZE; // 1247
 
   /// Maximum size of a single reliable message that can ride in one
   /// packet. push() rejects anything larger.
   static constexpr size_t MAX_MESSAGE_SIZE =
-    MAX_PAYLOAD_PER_PACKET - RELIABLE_MESSAGE_OVERHEAD; // 1245
+    MAX_PAYLOAD_PER_PACKET - RELIABLE_MESSAGE_OVERHEAD; // 1241
 
   /// Maximum reliable messages per packet (uint8 count field).
   static constexpr size_t MAX_RELIABLE_PER_PACKET = 255;
