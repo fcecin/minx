@@ -553,9 +553,7 @@ void Rudp::flush() {
 //
 // RUDP knows TIME but does not own a TIMER. tick() and onPacket() are the
 // only two ways time advances. Both call runPulses() which checks the
-// deadline and fires the appropriate amount of work. The deadline is
-// halved by scheduleHalvedFire() when an inbound packet introduces new
-// information that wants a faster outbound response.
+// deadline and fires the appropriate amount of work.
 // ===========================================================================
 
 void Rudp::initPulseDeadlineIfNeeded(uint64_t now_us) {
@@ -604,27 +602,8 @@ void Rudp::runPulses(uint64_t now_us) {
 
   doPulseWork(now_us, intervalsBudget);
 
-  // Reset the deadline to one full interval ahead of now. Subsequent
-  // onPackets may pull this earlier via scheduleHalvedFire().
+  // Reset the deadline to one full interval ahead of now.
   nextDeadlineUs_ = now_us + baseTickIntervalUs_;
-}
-
-void Rudp::scheduleHalvedFire() {
-  if (!pulseInitialized_)
-    return;
-  if (baseTickIntervalUs_ == 0)
-    return; // no pacing → no halving
-  if (nextDeadlineUs_ <= currentTimeUs_)
-    return; // already overdue
-  const uint64_t remaining = nextDeadlineUs_ - currentTimeUs_;
-  const uint64_t halved = remaining / 2;
-  // Sub-100us halving is meaningless because no realistic external
-  // call cadence can resolve below that. Snap to "fire on next call."
-  if (halved < 100) {
-    nextDeadlineUs_ = currentTimeUs_;
-  } else {
-    nextDeadlineUs_ = currentTimeUs_ + halved;
-  }
 }
 
 void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
@@ -757,34 +736,26 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
     return;
   }
 
-  // Process the packet. Each handler returns `true` if the packet
-  // introduced new information (a new message we didn't have, an ack
-  // that actually shrank sendBuf, a handshake state transition).
-  // Pure retransmits of data we already had return `false`.
-  bool novel = false;
+  // Process the packet. Each handler returns a "novel" bool that used
+  // to feed a scheduleHalvedFire() deadline tweak; that tweak only
+  // shifted one pulse earlier by < base and reverted to normal
+  // cadence afterwards, so it was a sub-millisecond latency micro-
+  // optimization with no throughput effect. Removed. The bool return
+  // is kept in the handler signatures for potential future use.
   switch (subproto) {
   case SUBPROTO_HANDSHAKE:
-    novel = handleHandshakePacket(peer, payload);
+    (void)handleHandshakePacket(peer, payload);
     break;
   case SUBPROTO_CHANNEL:
-    novel = handleChannelPacket(peer, payload);
+    (void)handleChannelPacket(peer, payload);
     break;
   default:
     LOGDEBUG << "drop: unknown RUDP sub-proto" << VAR(subproto);
     break;
   }
 
-  // Halve the deadline only on novel input. A duplicate packet shouldn't
-  // accelerate our pulse — we'd just waste cycles re-emitting the same
-  // ack info we already sent. Novelty means: there's something new the
-  // peer needs to learn about (or, on the sender side, there's now room
-  // in sendBuf to send the next batch).
-  if (novel) {
-    scheduleHalvedFire();
-  }
-
-  // Run pulses if the deadline has now passed (either because we just
-  // halved past it, or because enough time elapsed since the last call).
+  // Run pulses if the deadline has now passed (i.e. enough time has
+  // elapsed since the last call).
   runPulses(now_us);
 }
 
@@ -1095,9 +1066,9 @@ bool Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
   //                     ack" signal; it is NOT back-pressure relief
   //                     and must NOT wake a pending write.
   //
-  // Either kind counts as novelty for the pulse halving decision in
-  // onPacket (both mean there's genuine new state to propagate), so
-  // the return value is the OR of the two.
+  // The bool return (OR of the two) is legacy: it used to drive a
+  // deadline-halving tweak in onPacket that's since been removed. It
+  // remains in the handler signature for potential future use.
   bool ackedSomething = false;
   bool receivedNew = false;
 

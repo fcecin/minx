@@ -1103,8 +1103,11 @@ BOOST_AUTO_TEST_CASE(TestRudpDestroyedFiresFromAllPaths) {
     BOOST_REQUIRE(alice.isEstablished(bA, 1));
     BOOST_TEST(destroyed == 0u);
 
-    // Jump time past the idle timeout and tick.
-    now += 50'000;
+    // Jump time past the idle timeout AND past the next pulse
+    // deadline so that tick() runs doPulseWork (which is what
+    // actually sweeps idle channels). The default baseTickInterval
+    // is 100 ms, so advance at least that far.
+    now += 150'000;
     alice.tick(now);
     BOOST_TEST(destroyed == 1u);
   }
@@ -2187,7 +2190,7 @@ BOOST_AUTO_TEST_CASE(TestRudpSimultaneousOpenBothSidesPush) {
 }
 
 // ===========================================================================
-// Pulse machinery: deadline advancement, halving, catchup
+// Pulse machinery: deadline advancement, catchup
 // ===========================================================================
 
 // With a non-zero baseTickInterval, nextDeadlineUs advances from 0 to
@@ -2218,41 +2221,6 @@ BOOST_AUTO_TEST_CASE(TestRudpPulseDeadlineAdvances) {
   // tick() AT the deadline fires a pulse and resets to now + interval.
   r.tick(1'100'000);
   BOOST_TEST(r.nextDeadlineUs() == 1'100'000u + 100'000u);
-}
-
-// onPacket with "novel" content calls scheduleHalvedFire, which cuts
-// the remaining time until the next deadline in half. The effect is
-// exponential acceleration under sustained inbound traffic.
-BOOST_AUTO_TEST_CASE(TestRudpPulseHalvingOnInbound) {
-  minx::RudpConfig cfg;
-  cfg.baseTickInterval = std::chrono::milliseconds(100);
-  cfg.rngSeed = 0xBEA1;
-  Rudp alice(cfg);
-  cfg.rngSeed = 0xBEA2;
-  Rudp bob(cfg);
-
-  SockAddr aA = makeAddr(10200), bA = makeAddr(10201);
-  FakeWire wire(alice, bob, aA, bA);
-
-  // Establish a channel so that later inbound novelty events land on a
-  // real ESTABLISHED channel (novelty check only fires on successful
-  // packet handling that produced new state).
-  uint64_t now = 1'000'000;
-  alice.push(bA, 1, B("warmup"), true);
-  alice.tick(now);
-  // bob hasn't seen the OPEN yet; bob's pulse isn't initialized until
-  // the next call, so arm it with a no-op tick first.
-  bob.tick(now);
-  const uint64_t bobDeadlineBeforeHandshake = bob.nextDeadlineUs();
-  BOOST_TEST(bobDeadlineBeforeHandshake == now + 100'000u);
-
-  // Deliver alice's OPEN → bob. bob emits ACCEPT in response; onPacket
-  // called scheduleHalvedFire because the handshake was novel.
-  // Remaining time from 1_000_000 to 1_100_000 was 100_000; halved is
-  // 50_000, so new deadline is 1_050_000.
-  wire.deliverAll(now);
-  BOOST_TEST(bob.nextDeadlineUs() < bobDeadlineBeforeHandshake);
-  BOOST_TEST(bob.nextDeadlineUs() == now + 50'000u);
 }
 
 // tick() that's overdue by N intervals fires catchup pulses — each

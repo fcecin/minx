@@ -95,33 +95,30 @@ struct RudpConfig {
   /// the same seed produce the same nonce stream.
   uint64_t rngSeed = 0;
 
-  /// Internal "pulse" cadence — RUDP's flow-control primitive. The
-  /// protocol wants to fire its work (GC + flush) AT MOST this often
-  /// per call. The application can call tick() and onPacket() at any
-  /// rate it likes:
+  /// Internal "pulse" cadence — RUDP's rate-limit primitive. Each
+  /// pulse emits up to one packet per channel-with-data; a channel's
+  /// steady-state packet rate is therefore 1 / baseTickInterval.
+  /// The application can call tick() and onPacket() at any rate it
+  /// likes:
   ///
   ///   * Slower than this interval — RUDP catches up by firing N
   ///     pulses per call, where N = elapsed intervals. Each pulse
   ///     emits up to one packet per channel-with-data, advancing
   ///     a per-channel cursor through sendBuf so consecutive packets
   ///     in the same call carry different message ranges (not
-  ///     duplicates).
+  ///     duplicates). N is capped (see MAX_PULSES_PER_CALL in
+  ///     rudp.cpp) to bound the burst; as long as tick() is called
+  ///     at least every `cap * base`, no rate is lost to the cap.
   ///
   ///   * Faster than this interval — most calls do nothing (the
   ///     deadline check finds we're not yet due). Cheap.
   ///
-  ///   * Bursty inbound traffic — onPacket calls scheduleHalvedFire()
-  ///     internally, which halves the remaining time until the next
-  ///     pulse boundary. Multiple inbound packets within one window
-  ///     accelerate the next pulse exponentially toward "fire now,"
-  ///     without ever firing instantly. This is Nagle's batching done
-  ///     right: coalesces under load, instant under tight cadence.
-  ///
-  /// The default of 100ms (10 Hz) is the right floor for most
-  /// applications. Lower it for tighter latency on lightly-loaded
-  /// links; raise it for very sparse traffic where 10 Hz is
-  /// wasteful. There is no "fast path" knob: the halving mechanism
-  /// adapts the effective rate to actual load automatically.
+  /// Default 100 ms (10 Hz) = 10 pkt/s/channel ceiling. Good for
+  /// interactive / low-bandwidth. Bulk callers (file stores,
+  /// compute streaming) will drop this to 1-10 ms depending on the
+  /// throughput they need. The timer cadence on the calling side
+  /// can stay coarse — e.g. base=1 ms + timer=10 ms gives 1000
+  /// pkt/s/channel with only 100 wakeups/sec.
   std::chrono::microseconds baseTickInterval = std::chrono::milliseconds(100);
 };
 
@@ -287,22 +284,19 @@ public:
   /// microseconds. RUDP uses it for the same time-dependent state
   /// transitions tick() uses (idle GC, handshake retries, pulse
   /// scheduling). Importantly: onPacket may run a pulse INLINE if
-  /// the inbound packet (or its halving effect) brings the next
-  /// pulse deadline to "now or earlier" — so the application does
-  /// NOT need to call tick() right after onPacket(). The reactive
-  /// fast path is "packet arrives → process → emit response on the
-  /// same call stack," with no scheduler round-trip required.
+  /// enough time has elapsed since the last pulse to cross the
+  /// deadline — so the application does NOT need to call tick()
+  /// right after onPacket(). The reactive fast path is "packet
+  /// arrives → process → emit response on the same call stack," with
+  /// no scheduler round-trip required.
   void onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
                 uint64_t now_us);
 
   /// Hint: the absolute timestamp (microseconds) at which the
   /// application's scheduler should call tick() at the latest if no
   /// onPacket() arrives in the meantime. Use this to set the next
-  /// fire of a boost::asio::steady_timer. The deadline can move
-  /// EARLIER on every onPacket() call (because of the halving
-  /// mechanism), so re-read this and re-arm the timer after each
-  /// onPacket. The timer is a fallback; reactive emits from
-  /// onPacket cover the steady state.
+  /// fire of a boost::asio::steady_timer. The timer is a fallback;
+  /// reactive emits from onPacket cover the steady state.
   uint64_t nextDeadlineUs() const noexcept { return nextDeadlineUs_; }
 
   // -----------------------------------------------------------------------
@@ -586,12 +580,13 @@ private:
   const ChannelState* findChannel(const SockAddr& peer,
                                   uint32_t channel_id) const;
 
-  // Inbound dispatch. Each returns `true` if the inbound packet
-  // introduced NEW information (a new message we didn't have, an ack
-  // that actually shrank sendBuf, a handshake state transition). The
-  // caller (onPacket) uses this to decide whether to call
-  // scheduleHalvedFire() — a pure retransmit of data we already have
-  // is NOT news and should not accelerate the next pulse.
+  // Inbound dispatch. Historically these returned a "novel"/"not
+  // novel" flag used by a deadline-halving tweak in onPacket; the
+  // halving only moved one pulse earlier by < base and reset to the
+  // normal cadence afterwards, so it was a latency micro-tweak with
+  // no throughput effect and has been removed. The bool return value
+  // is preserved for potential future use (and because some tests
+  // inspect it) but is otherwise unused by callers.
   bool handleHandshakePacket(const SockAddr& peer, const Bytes& payload);
   bool handleChannelPacket(const SockAddr& peer, const Bytes& payload);
 
@@ -666,8 +661,6 @@ private:
   // nextDeadlineUs_ is the wall-clock timestamp at which RUDP wants
   // to fire its next pulse. tick() and onPacket() both check it and
   // catch up if overdue, firing N pulses where N = (elapsed / base).
-  // onPacket additionally calls scheduleHalvedFire() to bring the
-  // deadline closer when state changes mid-window.
   uint64_t nextDeadlineUs_ = 0;
   uint64_t baseTickIntervalUs_ = 0; // cached from config_.baseTickInterval
   bool pulseInitialized_ = false;   // first tick/onPacket arms the deadline
@@ -680,7 +673,6 @@ private:
   void initPulseDeadlineIfNeeded(uint64_t now_us);
   void runPulses(uint64_t now_us);
   void doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel);
-  void scheduleHalvedFire();
 
   RudpConfig config_;
   std::map<SockAddr, PeerState>
