@@ -50,54 +50,280 @@ struct CapturedPacket {
   Bytes bytes;
 };
 
-// One delivered application message via ReceiveFn.
-struct DeliveredMessage {
-  SockAddr peer;
-  uint32_t channelId;
-  Bytes data;
-  bool reliable;
+class TestListener; // fwd
+
+// TestChannelHandler — Rudp::ChannelHandler subclass that captures the
+// per-channel lifecycle into easily-inspectable members. Carries a
+// back-pointer to its TestListener so the listener can fire
+// listener-level hooks (with the (peer, cid) tag) for tests that
+// don't want to fish out the handler first.
+class TestChannelHandler : public Rudp::ChannelHandler {
+public:
+  // Set by TestListener at handler-creation time.
+  TestListener* listener = nullptr;
+  std::pair<SockAddr, uint32_t> key{}; // (peer, cid) — duplicated from
+                                       // base accessors so listener-
+                                       // level hooks can dispatch
+                                       // before onOpened has populated
+                                       // the base's peer_/cid_ (it
+                                       // hasn't yet at construction).
+
+  bool opened = false;
+  bool established = false;
+  bool closed = false;
+  std::optional<Rudp::CloseReason> closedReason;
+  std::vector<Bytes> reliableMessages;
+  std::vector<Bytes> unreliableMessages;
+  std::size_t writableCount = 0;
+
+  // Per-handler hooks. Tests that want behavior on a specific
+  // (peer, cid) install these on the matching handler.
+  std::function<void()> openedHook;
+  std::function<void()> establishedHook;
+  std::function<void()> writableHook;
+  std::function<void(Rudp::CloseReason)> closedHook;
+
+  void onOpened() override;
+  void onEstablished() override;
+  void onReliableMessage(const Bytes& m) override;
+  void onUnreliableMessage(const Bytes& m) override;
+  void onWritable() override;
+  void onClosed(Rudp::CloseReason r) override;
 };
 
-// FakeWire — a synchronous in-memory transport between two Rudp instances.
-// Captures sends, lets the test choose when to deliver them (deliverAll,
-// dropNext, etc.), no real IO.
+// TestListener — Rudp::Listener subclass with default-construct-and-
+// stash semantics for inbound channels. onAccept creates a fresh
+// TestChannelHandler and remembers it in `handlers` keyed by
+// (peer, cid). Tests inspect with `handler(p, c)`.
+//
+// For outbound (we initiate), tests use `registerChannel(rudp, p, c)`
+// which constructs a handler, calls rudp.registerChannel, and stashes
+// the handler in the same map.
+class TestListener : public Rudp::Listener {
+public:
+  // FakeWire installs this to route outbound packets into its queue.
+  std::function<void(const SockAddr&, const Bytes&)> sink;
+
+  // (peer, cid) → handler map. Holds shared_ptr to keep the handler
+  // alive even after Rudp drops its ref (e.g. so tests can inspect
+  // a channel's final state post-close). Replaced on peer-restart;
+  // for events that survive map mutations, see the flat logs below.
+  std::map<std::pair<SockAddr, uint32_t>,
+           std::shared_ptr<TestChannelHandler>> handlers;
+
+  // Flat event logs across all handlers ever owned by this listener,
+  // in event order. Survive handler replacement (peer-restart). Used
+  // by tests that just want "did N events happen" without caring
+  // which channel.
+  struct DeliveredMessage {
+    SockAddr peer;
+    uint32_t channelId;
+    Bytes data;
+    bool reliable;
+  };
+  std::vector<DeliveredMessage> received;
+  std::vector<std::pair<SockAddr, uint32_t>> opens;        // onOpened
+  std::vector<std::pair<SockAddr, uint32_t>> establishes;  // onEstablished
+  std::vector<std::pair<SockAddr, uint32_t>> writables;
+  struct ClosedEvent {
+    SockAddr peer;
+    uint32_t cid;
+    Rudp::CloseReason reason;
+  };
+  std::vector<ClosedEvent> closes;
+
+  // Captured non-channel events.
+  std::vector<std::pair<SockAddr, uint32_t>> acceptCalls;
+  struct AbuseEvent {
+    SockAddr peer;
+    uint32_t cid;
+    Rudp::AbuseSignal signal;
+  };
+  std::vector<AbuseEvent> abuses;
+
+  // Optional pre-decision predicate. If set and returns false,
+  // onAccept rejects (returns nullptr to Rudp). If unset, default
+  // is to accept and construct a handler.
+  std::function<bool(const SockAddr&, uint32_t)> acceptPredicate;
+
+  // Optional handler factory. If set, called by onAccept to make
+  // the handler instead of the default `std::make_shared<TestChannelHandler>()`.
+  // Useful when a test wants to install hooks before onOpened fires.
+  std::function<std::shared_ptr<TestChannelHandler>(const SockAddr&,
+                                                    uint32_t)>
+    handlerFactory;
+
+  // Listener-level hooks. These fire from the matching event method
+  // on every TestChannelHandler this listener owns, with the (peer,
+  // cid) tag for filtering. Installed AFTER channel registration still
+  // applies to existing channels (handlers fire via the back-pointer
+  // every time, not at construction time).
+  std::function<void(const SockAddr&, uint32_t)> openedHook;
+  std::function<void(const SockAddr&, uint32_t)> establishedHook;
+  std::function<void(const SockAddr&, uint32_t)> writableHook;
+  std::function<void(const SockAddr&, uint32_t, Rudp::CloseReason)> closedHook;
+
+  // Listener overrides.
+  void onSend(const SockAddr& peer, const Bytes& bytes) override {
+    if (sink) sink(peer, bytes);
+  }
+  std::shared_ptr<Rudp::ChannelHandler> onAccept(
+    const SockAddr& peer, uint32_t cid) override {
+    acceptCalls.emplace_back(peer, cid);
+    if (acceptPredicate && !acceptPredicate(peer, cid)) {
+      return nullptr;
+    }
+    auto h = handlerFactory ? handlerFactory(peer, cid)
+                            : std::make_shared<TestChannelHandler>();
+    h->listener = this;
+    h->key = {peer, cid};
+    handlers[{peer, cid}] = h;
+    return h;
+  }
+  void onAbuse(const SockAddr& peer, uint32_t cid,
+               Rudp::AbuseSignal sig) override {
+    abuses.push_back({peer, cid, sig});
+  }
+
+  // ---- Test helpers ----
+
+  /// Outbound registration helper: construct a TestChannelHandler,
+  /// register it on the channel via rudp.registerChannel, and stash it
+  /// in handlers[]. Returns the handler (or nullptr if registration
+  /// failed, e.g. cap exhausted).
+  std::shared_ptr<TestChannelHandler> registerChannel(Rudp& r, const SockAddr& peer,
+                                            uint32_t cid) {
+    auto h = std::make_shared<TestChannelHandler>();
+    h->listener = this;
+    h->key = {peer, cid};
+    if (!r.registerChannel(peer, cid, h)) return nullptr;
+    handlers[{peer, cid}] = h;
+    return h;
+  }
+
+  /// Look up a handler by (peer, cid). Returns nullptr if not found.
+  std::shared_ptr<TestChannelHandler> handler(const SockAddr& peer,
+                                              uint32_t cid) const {
+    auto it = handlers.find({peer, cid});
+    return (it != handlers.end()) ? it->second : nullptr;
+  }
+
+  /// Test-side push helper: idempotently register the channel (with a
+  /// default TestChannelHandler) on first call, then forward to
+  /// rudp.push. Consults Rudp's authoritative view of channel
+  /// existence (not our local map) so a previously-closed channel
+  /// gets a fresh registration rather than reusing a dead handler.
+  bool push(Rudp& r, const SockAddr& peer, uint32_t cid,
+            const Bytes& msg, bool reliable) {
+    if (!r.channelHandler(peer, cid)) {
+      if (!registerChannel(r, peer, cid)) return false;
+    }
+    return r.push(peer, cid, msg, reliable);
+  }
+
+  /// Reset all captured messages (flat log + per-handler).
+  void clearMessages() {
+    received.clear();
+    for (auto& [_, h] : handlers) {
+      h->reliableMessages.clear();
+      h->unreliableMessages.clear();
+    }
+  }
+
+  /// Convenience aggregators kept for tests that read count-only.
+  std::size_t establishedCount() const { return establishes.size(); }
+  std::size_t closedCount() const { return closes.size(); }
+};
+
+// Out-of-line TestChannelHandler definitions: dispatch listener-level
+// hooks AND populate the listener's flat event logs via the back-
+// pointer. Both interfaces are kept in sync; tests use whichever fits.
+inline void TestChannelHandler::onOpened() {
+  opened = true;
+  if (listener) {
+    listener->opens.emplace_back(key.first, key.second);
+  }
+  if (openedHook) openedHook();
+  if (listener && listener->openedHook) {
+    listener->openedHook(key.first, key.second);
+  }
+}
+
+inline void TestChannelHandler::onEstablished() {
+  established = true;
+  if (listener) {
+    listener->establishes.emplace_back(key.first, key.second);
+  }
+  if (establishedHook) establishedHook();
+  if (listener && listener->establishedHook) {
+    listener->establishedHook(key.first, key.second);
+  }
+}
+
+inline void TestChannelHandler::onReliableMessage(const Bytes& m) {
+  reliableMessages.push_back(m);
+  if (listener) {
+    listener->received.push_back({key.first, key.second, m, /*reliable=*/true});
+  }
+}
+
+inline void TestChannelHandler::onUnreliableMessage(const Bytes& m) {
+  unreliableMessages.push_back(m);
+  if (listener) {
+    listener->received.push_back({key.first, key.second, m, /*reliable=*/false});
+  }
+}
+
+inline void TestChannelHandler::onWritable() {
+  ++writableCount;
+  if (listener) {
+    listener->writables.emplace_back(key.first, key.second);
+  }
+  if (writableHook) writableHook();
+  if (listener && listener->writableHook) {
+    listener->writableHook(key.first, key.second);
+  }
+}
+
+inline void TestChannelHandler::onClosed(Rudp::CloseReason r) {
+  closed = true;
+  closedReason = r;
+  if (listener) {
+    listener->closes.push_back({key.first, key.second, r});
+  }
+  if (closedHook) closedHook(r);
+  if (listener && listener->closedHook) {
+    listener->closedHook(key.first, key.second, r);
+  }
+}
+
+// FakeWire — synchronous in-memory transport between two Rudp instances.
+// Owns no Rudp; the test constructs the Rudp pair externally with their
+// own TestListener instances and hands references to the wire.
 struct FakeWire {
   Rudp& alice;
   Rudp& bob;
+  TestListener& aliceL;
+  TestListener& bobL;
   SockAddr aliceAddr;
   SockAddr bobAddr;
-  std::deque<CapturedPacket> queue; // FIFO of captured outbound packets
-  std::vector<DeliveredMessage> aliceRecv;
-  std::vector<DeliveredMessage> bobRecv;
+  std::deque<CapturedPacket> queue;
   size_t dropNextAtoB = 0;
   size_t dropNextBtoA = 0;
-  // "Drop every Nth packet in this direction" — sustained loss pattern,
-  // independent of dropNext*. 0 disables. Counters track total packets
-  // considered (whether dropped or delivered) per direction so the pattern
-  // is consistent across deliverAll calls.
   size_t dropEveryNthAtoB = 0;
   size_t dropEveryNthBtoA = 0;
   size_t aToBSeq = 0;
   size_t bToASeq = 0;
 
-  FakeWire(Rudp& a, Rudp& b, SockAddr aa, SockAddr ba)
-      : alice(a), bob(b), aliceAddr(aa), bobAddr(ba) {
-
-    alice.setSendCallback([this](const SockAddr& peer, const Bytes& bytes) {
+  FakeWire(Rudp& a, TestListener& al, Rudp& b, TestListener& bl, SockAddr aa,
+           SockAddr ba)
+      : alice(a), bob(b), aliceL(al), bobL(bl), aliceAddr(aa), bobAddr(ba) {
+    aliceL.sink = [this](const SockAddr& peer, const Bytes& bytes) {
       queue.push_back({aliceAddr, peer, bytes});
-    });
-    bob.setSendCallback([this](const SockAddr& peer, const Bytes& bytes) {
+    };
+    bobL.sink = [this](const SockAddr& peer, const Bytes& bytes) {
       queue.push_back({bobAddr, peer, bytes});
-    });
-
-    alice.setReceiveCallback([this](const SockAddr& peer, uint32_t cid,
-                                    const Bytes& data, bool reliable) {
-      aliceRecv.push_back({peer, cid, data, reliable});
-    });
-    bob.setReceiveCallback([this](const SockAddr& peer, uint32_t cid,
-                                  const Bytes& data, bool reliable) {
-      bobRecv.push_back({peer, cid, data, reliable});
-    });
+    };
   }
 
   // Drain everything currently captured AND anything that gets
@@ -217,38 +443,29 @@ static SockAddr makeAddr(uint16_t port) {
   return SockAddr(boost::asio::ip::make_address("127.0.0.1"), port);
 }
 
-// --- BE appenders + CRC trailer helper, used by forged-packet tests.
-// RUDP expects every on-wire packet to carry a CRC32C trailer covering
-// [routing_key_BE][body]. Forged bodies fed directly to onPacket()
-// need the same trailer or they're dropped at the CRC check.
-
-static void pushU8(minx::Bytes& b, uint8_t v) {
-  b.push_back(static_cast<char>(v));
-}
-static void pushU16BE(minx::Bytes& b, uint16_t v) {
-  pushU8(b, static_cast<uint8_t>((v >> 8) & 0xFF));
-  pushU8(b, static_cast<uint8_t>(v & 0xFF));
-}
-static void pushU32BE(minx::Bytes& b, uint32_t v) {
-  pushU8(b, static_cast<uint8_t>((v >> 24) & 0xFF));
-  pushU8(b, static_cast<uint8_t>((v >> 16) & 0xFF));
-  pushU8(b, static_cast<uint8_t>((v >> 8) & 0xFF));
-  pushU8(b, static_cast<uint8_t>((v) & 0xFF));
-}
-static void pushU64BE(minx::Bytes& b, uint64_t v) {
-  for (int i = 7; i >= 0; --i)
-    pushU8(b, static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
-}
-
+// CRC trailer helper, used by forged-packet tests. RUDP expects every
+// on-wire packet to carry a CRC32C trailer covering [routing_key_BE]
+// [body]. Forged bodies fed directly to onPacket() need the same
+// trailer or they're dropped at the CRC check.
+//
+// Both the key serialization and the trailer go through minx::Buffer
+// to guarantee the same BE encoding the wire-side appendCrc32cTrailer
+// (in src/rudp.cpp) uses — no hand-rolled byte shuffling.
 static void appendCrcTrailer(uint64_t key, minx::Bytes& body) {
-  std::array<uint8_t, 8> kb{};
-  for (int i = 0; i < 8; ++i)
-    kb[i] = static_cast<uint8_t>((key >> ((7 - i) * 8)) & 0xFF);
-  uint32_t acc = ::crc32c_value(kb.data(), 8);
+  minx::Bytes keyScratch;
+  keyScratch.resize(8);
+  minx::Buffer kb(keyScratch);
+  kb.put<uint64_t>(key);
+  uint32_t acc = ::crc32c_value(
+    reinterpret_cast<const uint8_t*>(keyScratch.data()), 8);
   if (!body.empty())
     acc = ::crc32c_extend(
       acc, reinterpret_cast<const uint8_t*>(body.data()), body.size());
-  pushU32BE(body, acc);
+  const size_t oldSize = body.size();
+  body.resize(oldSize + 4);
+  minx::Buffer tail(body);
+  tail.setWritePos(oldSize);
+  tail.put<uint32_t>(acc);
 }
 
 } // namespace
@@ -289,7 +506,8 @@ BOOST_AUTO_TEST_CASE(TestRudpConstructDestroy) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0x12345678; // deterministic
-  Rudp r(cfg);
+  TestListener listener;
+  Rudp r(&listener, cfg);
   BOOST_TEST(r.peerCount() == 0u);
 }
 
@@ -301,18 +519,24 @@ BOOST_AUTO_TEST_CASE(TestRudpHandshakeHappyPath) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xA11CE;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xB0B;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9000), bA = makeAddr(9001);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
 
-  // Alice pushes a reliable message — this triggers OPEN_SENT and
-  // queues the message until the handshake completes.
-  BOOST_TEST(alice.push(bA, /*channel=*/42, B("hello"), /*reliable=*/true));
+  // Adopt + push: app constructs a handler, registers it on (peer,
+  // cid), then queues a message. The push triggers OPEN_SENT and
+  // holds the message until the handshake completes.
+  auto aliceH = aliceL.registerChannel(alice, bA, /*channel=*/42);
+  BOOST_REQUIRE(aliceH);
+  BOOST_TEST(aliceH->opened); // onOpened fires on registration
+  BOOST_TEST(aliceL.push(alice, bA,/*channel=*/42, B("hello"), /*reliable=*/true));
   BOOST_REQUIRE_EQUAL(alice.peerCount(), 1u);
   BOOST_REQUIRE_EQUAL(alice.channelCount(bA), 1u);
   BOOST_REQUIRE(!alice.isEstablished(bA, 42));
@@ -341,13 +565,14 @@ BOOST_AUTO_TEST_CASE(TestRudpHandshakeHappyPath) {
   BOOST_TEST(alice.sessionToken(bA, 42) != 0u);
   BOOST_TEST(alice.sessionToken(bA, 42) == bob.sessionToken(aA, 42));
 
-  // Bob delivered the message via ReceiveFn during the cascade.
-  BOOST_REQUIRE(wire.bobRecv.size() >= 1u);
-  BOOST_TEST(wire.bobRecv[0].peer == aA);
-  BOOST_TEST(wire.bobRecv[0].channelId == 42u);
-  BOOST_TEST(wire.bobRecv[0].reliable == true);
-  BOOST_TEST(std::string(wire.bobRecv[0].data.begin(),
-                         wire.bobRecv[0].data.end()) == "hello");
+  // Bob's onAccept auto-created a handler; check it received the
+  // message reliably.
+  auto bobH = bobL.handler(aA, 42);
+  BOOST_REQUIRE(bobH);
+  BOOST_TEST(bobH->established);
+  BOOST_REQUIRE(bobH->reliableMessages.size() >= 1u);
+  BOOST_TEST(std::string(bobH->reliableMessages[0].begin(),
+                         bobH->reliableMessages[0].end()) == "hello");
 }
 
 // ---------------------------------------------------------------------------
@@ -360,15 +585,17 @@ BOOST_AUTO_TEST_CASE(TestRudpHandshakeRetry) {
   cfg.rngSeed = 0x111;
   cfg.handshakeRetryInterval = std::chrono::milliseconds(50);
   cfg.handshakeMaxRetries = 3;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x222;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9100), bA = makeAddr(9101);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
-  alice.push(bA, 1, B("ping"), true);
+  aliceL.push(alice, bA,1, B("ping"), true);
   alice.tick(now);
   BOOST_TEST(wire.pending() == 1u);
 
@@ -402,15 +629,17 @@ BOOST_AUTO_TEST_CASE(TestRudpHandshakeExhaustion) {
   cfg.rngSeed = 0x333;
   cfg.handshakeRetryInterval = std::chrono::milliseconds(50);
   cfg.handshakeMaxRetries = 3;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x444;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9200), bA = makeAddr(9201);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
-  alice.push(bA, 1, B("nope"), true);
+  aliceL.push(alice, bA,1, B("nope"), true);
 
   // Drop all the way through. We need: first OPEN + 3 retries = 4 sends.
   wire.dropNextAtoB = 1000; // drop everything
@@ -434,26 +663,28 @@ BOOST_AUTO_TEST_CASE(TestRudpSingleReliableMessage) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xAAA;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xBBB;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9300), bA = makeAddr(9301);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
-  alice.push(bA, 7, B("payload-zero"), true);
+  aliceL.push(alice, bA,7, B("payload-zero"), true);
   alice.tick(now);
   wire.deliverAll(); // OPEN -> bob
   wire.deliverAll(); // ACCEPT -> alice
   alice.tick(now);   // alice flushes the queued message
   wire.deliverAll(); // CHANNEL -> bob
 
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 1u);
-  BOOST_TEST(wire.bobRecv[0].channelId == 7u);
-  BOOST_TEST(wire.bobRecv[0].reliable == true);
-  BOOST_TEST(std::string(wire.bobRecv[0].data.begin(),
-                         wire.bobRecv[0].data.end()) == "payload-zero");
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 1u);
+  BOOST_TEST(bobL.received[0].channelId == 7u);
+  BOOST_TEST(bobL.received[0].reliable == true);
+  BOOST_TEST(std::string(bobL.received[0].data.begin(),
+                         bobL.received[0].data.end()) == "payload-zero");
 }
 
 // ---------------------------------------------------------------------------
@@ -464,16 +695,18 @@ BOOST_AUTO_TEST_CASE(TestRudpCumulativeAck) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xCCC;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xDDD;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9400), bA = makeAddr(9401);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
   for (int i = 0; i < 5; ++i) {
-    alice.push(bA, 1, Bn(static_cast<uint8_t>('A' + i), 10), true);
+    aliceL.push(alice, bA,1, Bn(static_cast<uint8_t>('A' + i), 10), true);
   }
   alice.tick(now);
   wire.deliverAll(); // OPEN -> bob
@@ -481,10 +714,10 @@ BOOST_AUTO_TEST_CASE(TestRudpCumulativeAck) {
   alice.tick(now);
   wire.deliverAll(); // CHANNEL packet with 5 messages -> bob
   // Bob should now have received all 5 in order.
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 5u);
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 5u);
   for (int i = 0; i < 5; ++i) {
-    BOOST_TEST(wire.bobRecv[i].data.size() == 10u);
-    BOOST_TEST(static_cast<uint8_t>(wire.bobRecv[i].data[0]) ==
+    BOOST_TEST(bobL.received[i].data.size() == 10u);
+    BOOST_TEST(static_cast<uint8_t>(bobL.received[i].data[0]) ==
                static_cast<uint8_t>('A' + i));
   }
 
@@ -523,17 +756,19 @@ BOOST_AUTO_TEST_CASE(TestRudpOutOfOrderViaReorderBuffer) {
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xEEE;
   cfg.handshakeRetryInterval = std::chrono::milliseconds(50);
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xFFF;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9500), bA = makeAddr(9501);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
 
   // Establish channel first (no message loss).
-  alice.push(bA, 1, B("init"), true);
+  aliceL.push(alice, bA,1, B("init"), true);
   alice.tick(now);
   wire.deliverAll();
   wire.deliverAll();
@@ -544,22 +779,22 @@ BOOST_AUTO_TEST_CASE(TestRudpOutOfOrderViaReorderBuffer) {
   wire.deliverAll();
   alice.tick(now);
   wire.deliverAll();
-  wire.bobRecv.clear();
+  bobL.clearMessages();
 
   // Now push 4 messages and verify they all arrive even after we
   // drop alice's first attempt. Each push happens BEFORE the next
   // flush so they ride in the same packet.
-  alice.push(bA, 1, B("one"), true);
-  alice.push(bA, 1, B("two"), true);
-  alice.push(bA, 1, B("three"), true);
-  alice.push(bA, 1, B("four"), true);
+  aliceL.push(alice, bA,1, B("one"), true);
+  aliceL.push(alice, bA,1, B("two"), true);
+  aliceL.push(alice, bA,1, B("three"), true);
+  aliceL.push(alice, bA,1, B("four"), true);
 
   // Drop the first packet alice emits.
   wire.dropNextAtoB = 1;
   alice.tick(now);
   wire.deliverAll();
 
-  BOOST_TEST(wire.bobRecv.size() == 0u); // everything dropped
+  BOOST_TEST(bobL.received.size() == 0u); // everything dropped
 
   // Advance time and let alice retransmit. With our every-flush retransmit
   // model, even one more flush should re-send everything in sendBuf.
@@ -567,15 +802,15 @@ BOOST_AUTO_TEST_CASE(TestRudpOutOfOrderViaReorderBuffer) {
   alice.tick(now);
   wire.deliverAll();
   // bob now has all four, in order.
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 4u);
-  BOOST_TEST(std::string(wire.bobRecv[0].data.begin(),
-                         wire.bobRecv[0].data.end()) == "one");
-  BOOST_TEST(std::string(wire.bobRecv[1].data.begin(),
-                         wire.bobRecv[1].data.end()) == "two");
-  BOOST_TEST(std::string(wire.bobRecv[2].data.begin(),
-                         wire.bobRecv[2].data.end()) == "three");
-  BOOST_TEST(std::string(wire.bobRecv[3].data.begin(),
-                         wire.bobRecv[3].data.end()) == "four");
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 4u);
+  BOOST_TEST(std::string(bobL.received[0].data.begin(),
+                         bobL.received[0].data.end()) == "one");
+  BOOST_TEST(std::string(bobL.received[1].data.begin(),
+                         bobL.received[1].data.end()) == "two");
+  BOOST_TEST(std::string(bobL.received[2].data.begin(),
+                         bobL.received[2].data.end()) == "three");
+  BOOST_TEST(std::string(bobL.received[3].data.begin(),
+                         bobL.received[3].data.end()) == "four");
 }
 
 // ---------------------------------------------------------------------------
@@ -586,16 +821,18 @@ BOOST_AUTO_TEST_CASE(TestRudpUnreliableTail) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0x1A1;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x2B2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9600), bA = makeAddr(9601);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
   // Establish channel via a reliable push, drain everything.
-  alice.push(bA, 9, B("init"), true);
+  aliceL.push(alice, bA,9, B("init"), true);
   alice.tick(now);
   wire.deliverAll();
   wire.deliverAll();
@@ -605,17 +842,17 @@ BOOST_AUTO_TEST_CASE(TestRudpUnreliableTail) {
   wire.deliverAll();
   alice.tick(now);
   wire.deliverAll();
-  wire.bobRecv.clear();
+  bobL.clearMessages();
 
   // Push an unreliable blob. Should get delivered as the unreliable tail
   // of the next CHANNEL packet alice sends.
-  alice.push(bA, 9, B("game-state-snapshot"), false);
+  aliceL.push(alice, bA,9, B("game-state-snapshot"), false);
   alice.tick(now);
   wire.deliverAll();
 
   // Find the unreliable delivery in bob's recv list.
   bool foundUnreliable = false;
-  for (auto& r : wire.bobRecv) {
+  for (auto& r : bobL.received) {
     if (!r.reliable) {
       foundUnreliable = true;
       BOOST_TEST(r.channelId == 9u);
@@ -634,19 +871,21 @@ BOOST_AUTO_TEST_CASE(TestRudpChannelCap) {
   minx::RudpConfig cfg;
   cfg.maxChannelsPerPeer = 3;
   cfg.rngSeed = 0x999;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x888;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9700), bA = makeAddr(9701);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Allocate channels 1, 2, 3 — should all succeed.
-  BOOST_TEST(alice.push(bA, 1, B("a"), true));
-  BOOST_TEST(alice.push(bA, 2, B("b"), true));
-  BOOST_TEST(alice.push(bA, 3, B("c"), true));
+  BOOST_TEST(aliceL.push(alice, bA,1, B("a"), true));
+  BOOST_TEST(aliceL.push(alice, bA,2, B("b"), true));
+  BOOST_TEST(aliceL.push(alice, bA,3, B("c"), true));
   // Channel 4 should be rejected.
-  BOOST_TEST(!alice.push(bA, 4, B("d"), true));
+  BOOST_TEST(!aliceL.push(alice, bA,4, B("d"), true));
   BOOST_TEST(alice.channelCount(bA) == 3u);
 }
 
@@ -658,12 +897,13 @@ BOOST_AUTO_TEST_CASE(TestRudpOversizeRejected) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0x77;
-  Rudp r(cfg);
+  TestListener listener;
+  Rudp r(&listener, cfg);
   SockAddr peer = makeAddr(9800);
   Bytes huge = Bn(0xAB, Rudp::MAX_MESSAGE_SIZE + 1);
-  BOOST_TEST(!r.push(peer, 1, huge, true));
+  BOOST_TEST(!listener.push(r, peer, 1, huge, true));
   Bytes max_ok = Bn(0xAB, Rudp::MAX_MESSAGE_SIZE);
-  BOOST_TEST(r.push(peer, 1, max_ok, true));
+  BOOST_TEST(listener.push(r, peer, 1, max_ok, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -674,15 +914,17 @@ BOOST_AUTO_TEST_CASE(TestRudpChannelInactivityGC) {
   minx::RudpConfig cfg;
   cfg.channelInactivityTimeout = std::chrono::milliseconds(100);
   cfg.rngSeed = 0xDEC0;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xDED0;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9900), bA = makeAddr(9901);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
-  alice.push(bA, 1, B("hi"), true);
+  aliceL.push(alice, bA,1, B("hi"), true);
   alice.tick(now);
   wire.deliverAll();
   wire.deliverAll();
@@ -716,15 +958,17 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseDropsChannel) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xC105E;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xC106E;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9910), bA = makeAddr(9911);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 7, B("hello"), true);
+  aliceL.push(alice, bA,7, B("hello"), true);
   alice.tick(now);
   wire.deliverAll(now);
 
@@ -735,13 +979,13 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseDropsChannel) {
 
   // close() on a non-existent channel is a no-op — no packet emitted.
   BOOST_REQUIRE_EQUAL(wire.pending(), 0u);
-  alice.close(bA, 999);
+  alice.closeChannel(bA, 999);
   BOOST_TEST(alice.channelCount(bA) == 1u);
   BOOST_TEST(wire.pending() == 0u);
 
   // Close the real channel. State is gone from alice immediately,
   // AND the peer entry is pruned because it had no other channels.
-  alice.close(bA, 7);
+  alice.closeChannel(bA, 7);
   BOOST_TEST(alice.channelCount(bA) == 0u);
   BOOST_TEST(alice.peerCount() == 0u);
   BOOST_TEST(!alice.isEstablished(bA, 7));
@@ -759,7 +1003,7 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseDropsChannel) {
   BOOST_TEST(bob.peerCount() == 0u);
 
   // Repeated close is also a no-op — no packet emitted.
-  alice.close(bA, 7);
+  alice.closeChannel(bA, 7);
   BOOST_TEST(alice.peerCount() == 0u);
   BOOST_TEST(wire.pending() == 0u);
 }
@@ -775,28 +1019,34 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseEmitsHsCloseToPeer) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xC105A;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xC105B;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9930), bA = makeAddr(9931);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 3, B("hi"), true);
+  aliceL.push(alice, bA,3, B("hi"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 3));
   BOOST_REQUIRE(bob.isEstablished(aA, 3));
 
-  // Install destroyed callbacks on both sides to observe the teardown.
+  // Install destroyed hooks on both sides to observe the teardown.
   size_t aliceDestroyed = 0, bobDestroyed = 0;
-  alice.setChannelDestroyedCallback(bA, 3, [&]() { ++aliceDestroyed; });
-  bob.setChannelDestroyedCallback(aA, 3, [&]() { ++bobDestroyed; });
+  aliceL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == bA && c == 3) ++aliceDestroyed;
+  };
+  bobL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == aA && c == 3) ++bobDestroyed;
+  };
 
-  // alice.close() fires alice's destroyed synchronously and queues one
+  // alice.closeChannel() fires alice's destroyed synchronously and queues one
   // HS_CLOSE on the wire. bob hasn't been notified yet.
-  alice.close(bA, 3);
+  alice.closeChannel(bA, 3);
   BOOST_TEST(aliceDestroyed == 1u);
   BOOST_TEST(bobDestroyed == 0u);
   BOOST_TEST(wire.pending() == 1u);
@@ -812,7 +1062,7 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseEmitsHsCloseToPeer) {
 
   // A stray push from bob to the now-gone channel starts a fresh
   // handshake (channel_id 3 is reusable — nothing remembers it).
-  bob.push(aA, 3, B("still there?"), true);
+  bobL.push(bob, aA,3, B("still there?"), true);
   bob.tick(now);
   BOOST_TEST(wire.pending() >= 1u);
   wire.clearQueue();
@@ -828,22 +1078,24 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseOnNonEstablishedEmitsNothing) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xC106A;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xC106B;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9940), bA = makeAddr(9941);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Push creates a channel in IDLE and queues an OPEN on first tick.
-  alice.push(bA, 5, B("hi"), true);
+  aliceL.push(alice, bA,5, B("hi"), true);
   alice.tick(1000);
   BOOST_REQUIRE_EQUAL(wire.pending(), 1u); // the OPEN
   wire.clearQueue();
   BOOST_REQUIRE(!alice.isEstablished(bA, 5));
 
   // Close while in OPEN_SENT. No HS_CLOSE emitted.
-  alice.close(bA, 5);
+  alice.closeChannel(bA, 5);
   BOOST_TEST(wire.pending() == 0u);
   BOOST_TEST(alice.channelCount(bA) == 0u);
 }
@@ -859,15 +1111,17 @@ BOOST_AUTO_TEST_CASE(TestRudpHsCloseWrongTokenIsDropped) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xC107A;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xC107B;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9950), bA = makeAddr(9951);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 11, B("x"), true);
+  aliceL.push(alice, bA,11, B("x"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(bob.isEstablished(aA, 11));
@@ -887,7 +1141,9 @@ BOOST_AUTO_TEST_CASE(TestRudpHsCloseWrongTokenIsDropped) {
   appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, fake);
 
   size_t bobDestroyed = 0;
-  bob.setChannelDestroyedCallback(aA, 11, [&]() { ++bobDestroyed; });
+  bobL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == aA && c == 11) ++bobDestroyed;
+  };
 
   bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, fake, now);
 
@@ -896,7 +1152,7 @@ BOOST_AUTO_TEST_CASE(TestRudpHsCloseWrongTokenIsDropped) {
   BOOST_TEST(bobDestroyed == 0u);
 
   // The legitimate close still works.
-  alice.close(bA, 11);
+  alice.closeChannel(bA, 11);
   wire.deliverAll(now);
   BOOST_TEST(!bob.isEstablished(aA, 11));
   BOOST_TEST(bobDestroyed == 1u);
@@ -912,7 +1168,8 @@ BOOST_AUTO_TEST_CASE(TestRudpHsCloseForUnknownChannelDropped) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xC108A;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9960);
 
@@ -952,30 +1209,32 @@ BOOST_AUTO_TEST_CASE(TestRudpGcIdleThreshold) {
   cfg.channelInactivityTimeout = std::chrono::seconds(3600); // backstop off
   cfg.maxChannelsPerPeer = 3; // this test exercises multi-channel eviction
   cfg.rngSeed = 0x6C6C;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x6C6D;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9920), bA = makeAddr(9921);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Channel 1 — established at t = 1000.
   uint64_t now = 1000;
-  alice.push(bA, 1, B("one"), true);
+  aliceL.push(alice, bA,1, B("one"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 1));
 
   // Channel 2 — established at t = 3000.
   now = 3000;
-  alice.push(bA, 2, B("two"), true);
+  aliceL.push(alice, bA,2, B("two"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 2));
 
   // Channel 3 — established at t = 5000.
   now = 5000;
-  alice.push(bA, 3, B("three"), true);
+  aliceL.push(alice, bA,3, B("three"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 3));
@@ -1027,26 +1286,29 @@ BOOST_AUTO_TEST_CASE(TestRudpDrainFiresOnAckOnly) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xD1A1;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xD1A2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(9930), bA = makeAddr(9931);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   size_t aliceDrains = 0;
   size_t bobDrains = 0;
 
-  // Alice pushes first (creates channel 1 eagerly via push), then
-  // installs the drain callback. Doing it in this order means the
-  // callback is in place by the time bob's ack comes back.
-  uint64_t now = 1000;
-  BOOST_REQUIRE(alice.push(bA, 1, B("hello"), true));
-  alice.setSendBufDrainedCallback(bA, 1, [&]() { ++aliceDrains; });
+  // Drain hooks track per-(peer, cid) writable events. The TestListener
+  // is installed at construction, so there's no race here.
+  aliceL.writableHook = [&](const SockAddr& p, uint32_t c) {
+    if (p == bA && c == 1) ++aliceDrains;
+  };
+  bobL.writableHook = [&](const SockAddr& p, uint32_t c) {
+    if (p == aA && c == 1) ++bobDrains;
+  };
 
-  // Bob's callback is set up BEFORE any channel exists — setXxxCallback
-  // with a non-null fn creates the channel on bob's side proactively.
-  bob.setSendBufDrainedCallback(aA, 1, [&]() { ++bobDrains; });
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,1, B("hello"), true));
 
   alice.tick(now);
   wire.deliverAll(now);
@@ -1068,7 +1330,7 @@ BOOST_AUTO_TEST_CASE(TestRudpDrainFiresOnAckOnly) {
   // reorder entry) but it is NOT an ack-drain. Alice's drain must
   // stay at zero.
   now = 2000;
-  BOOST_REQUIRE(bob.push(aA, 1, B("world"), true));
+  BOOST_REQUIRE(bobL.push(bob, aA,1, B("world"), true));
   bob.tick(now);
   wire.deliverAll(now);
 
@@ -1092,33 +1354,61 @@ BOOST_AUTO_TEST_CASE(TestRudpDrainFiresOnAckOnly) {
 // ---------------------------------------------------------------------------
 
 BOOST_AUTO_TEST_CASE(TestRudpDestroyedFiresFromAllPaths) {
-  // (a) close()
+  // The new model fires onClosed only for channels that became visible
+  // to the listener — i.e. channels created by push() or admitted by
+  // onAccept(true). We seed each sub-test with push() so the channel
+  // is visible before the destruction path under test fires.
+
+  // (a) closeChannel()
   {
     minx::RudpConfig cfg;
     cfg.baseTickInterval = std::chrono::microseconds::zero();
     cfg.rngSeed = 0xDE51;
-    Rudp r(cfg);
-    size_t destroyed = 0;
-    r.setChannelDestroyedCallback(makeAddr(40000), 1, [&]() { ++destroyed; });
-    BOOST_TEST(destroyed == 0u);
-    r.close(makeAddr(40000), 1);
-    BOOST_TEST(destroyed == 1u);
+    TestListener listener;
+    Rudp r(&listener, cfg);
+    SockAddr p = makeAddr(40000);
+    auto h = listener.registerChannel(r, p, 1);
+    BOOST_REQUIRE(h);
+    BOOST_TEST(listener.closedCount() == 0u);
+    r.closeChannel(p, 1);
+    BOOST_TEST(listener.closedCount() == 1u);
+    BOOST_TEST(h->closed);
+    BOOST_TEST(static_cast<int>(h->closedReason.value()) ==
+               static_cast<int>(Rudp::CloseReason::APPLICATION));
     // Second close is a no-op.
-    r.close(makeAddr(40000), 1);
-    BOOST_TEST(destroyed == 1u);
+    r.closeChannel(p, 1);
+    BOOST_TEST(listener.closedCount() == 1u);
   }
 
   // (b) gc()
   {
     minx::RudpConfig cfg;
     cfg.baseTickInterval = std::chrono::microseconds::zero();
-    cfg.rngSeed = 0xDE52;
-    Rudp r(cfg);
-    size_t destroyed = 0;
-    r.setChannelDestroyedCallback(makeAddr(40001), 1, [&]() { ++destroyed; });
-    r.tick(100'000); // advance currentTimeUs_ past any reasonable threshold
-    BOOST_TEST(r.gc(std::chrono::microseconds(1)) == 1u);
-    BOOST_TEST(destroyed == 1u);
+    cfg.rngSeed = 0xDE52a;
+    TestListener aliceL;
+    Rudp alice(&aliceL, cfg);
+    cfg.rngSeed = 0xDE52b;
+    TestListener bobL;
+    Rudp bob(&bobL, cfg);
+
+    SockAddr aA = makeAddr(40001), bA = makeAddr(40010);
+    FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+    uint64_t now = 1000;
+    auto aliceH = aliceL.registerChannel(alice, bA, 1);
+    aliceL.push(alice, bA,1, B("seed"), true);
+    alice.tick(now);
+    wire.deliverAll(now);
+    BOOST_REQUIRE(alice.isEstablished(bA, 1));
+
+    // Established channel: lastActivity stops bumping after the
+    // ack settles. Advance time and call gc with a tight threshold.
+    now += 10'000;
+    alice.tick(now);
+    BOOST_TEST(alice.gc(std::chrono::microseconds(1)) == 1u);
+    BOOST_REQUIRE_EQUAL(aliceL.closedCount(), 1u);
+    BOOST_TEST(static_cast<int>(aliceH->closedReason.value()) ==
+               static_cast<int>(Rudp::CloseReason::IDLE));
   }
 
   // (c) doPulseWork idle-timeout sweep
@@ -1126,29 +1416,32 @@ BOOST_AUTO_TEST_CASE(TestRudpDestroyedFiresFromAllPaths) {
     minx::RudpConfig cfg;
     cfg.channelInactivityTimeout = std::chrono::milliseconds(10);
     cfg.rngSeed = 0xDE53;
-    Rudp alice(cfg);
+    TestListener aliceL;
+    Rudp alice(&aliceL, cfg);
     cfg.rngSeed = 0xDE54;
-    Rudp bob(cfg);
+    TestListener bobL;
+    Rudp bob(&bobL, cfg);
 
     SockAddr aA = makeAddr(40002), bA = makeAddr(40003);
-    FakeWire wire(alice, bob, aA, bA);
+    FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
-    size_t destroyed = 0;
     uint64_t now = 1000;
-    alice.push(bA, 1, B("hi"), true);
-    alice.setChannelDestroyedCallback(bA, 1, [&]() { ++destroyed; });
+    auto aliceH = aliceL.registerChannel(alice, bA, 1);
+    aliceL.push(alice, bA,1, B("hi"), true);
     alice.tick(now);
     wire.deliverAll(now);
     BOOST_REQUIRE(alice.isEstablished(bA, 1));
-    BOOST_TEST(destroyed == 0u);
+    BOOST_TEST(aliceL.closedCount() == 0u);
 
     // Jump time past the idle timeout AND past the next pulse
     // deadline so that tick() runs doPulseWork (which is what
-    // actually sweeps idle channels). The default baseTickInterval
-    // is 100 ms, so advance at least that far.
+    // actually sweeps idle channels). Default baseTickInterval is
+    // 100 ms, so advance at least that far.
     now += 150'000;
     alice.tick(now);
-    BOOST_TEST(destroyed == 1u);
+    BOOST_REQUIRE_EQUAL(aliceL.closedCount(), 1u);
+    BOOST_TEST(static_cast<int>(aliceH->closedReason.value()) ==
+               static_cast<int>(Rudp::CloseReason::IDLE));
   }
 }
 
@@ -1167,23 +1460,25 @@ BOOST_AUTO_TEST_CASE(TestRudpPreEstablishedQueueCap) {
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.maxReorderMessagesPerChannel = 3;
   cfg.rngSeed = 0xCA91;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xCA92;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(40100), bA = makeAddr(40101);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Push 3 reliable messages BEFORE ticking alice (so the handshake
   // hasn't started yet — first push moves us to OPEN_SENT but the
   // handshake doesn't complete until deliverAll runs). All three
   // land in the pre-established queue.
-  BOOST_TEST(alice.push(bA, 1, B("m0"), true) == true);
-  BOOST_TEST(alice.push(bA, 1, B("m1"), true) == true);
-  BOOST_TEST(alice.push(bA, 1, B("m2"), true) == true);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m0"), true) == true);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m1"), true) == true);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m2"), true) == true);
 
   // The 4th push must be rejected — queue is at cap.
-  BOOST_TEST(alice.push(bA, 1, B("m3"), true) == false);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m3"), true) == false);
 
   // Now complete the handshake and deliver. Only the 3 accepted
   // messages should reach bob; the rejected one is NOT silently
@@ -1192,11 +1487,11 @@ BOOST_AUTO_TEST_CASE(TestRudpPreEstablishedQueueCap) {
   alice.tick(now);
   wire.deliverAll(now);
 
-  BOOST_TEST(wire.bobRecv.size() == 3u);
-  if (wire.bobRecv.size() == 3u) {
-    BOOST_TEST(wire.bobRecv[0].data == B("m0"));
-    BOOST_TEST(wire.bobRecv[1].data == B("m1"));
-    BOOST_TEST(wire.bobRecv[2].data == B("m2"));
+  BOOST_TEST(bobL.received.size() == 3u);
+  if (bobL.received.size() == 3u) {
+    BOOST_TEST(bobL.received[0].data == B("m0"));
+    BOOST_TEST(bobL.received[1].data == B("m1"));
+    BOOST_TEST(bobL.received[2].data == B("m2"));
   }
 }
 
@@ -1208,37 +1503,34 @@ BOOST_AUTO_TEST_CASE(TestRudpOpenedFiresOnHappyPath) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0x0FED0A;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x0FED0B;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(40200), bA = makeAddr(40201);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
-  std::vector<std::pair<SockAddr, uint32_t>> aliceOpens, bobOpens;
-  alice.setChannelOpenedCallback(
-    [&](const SockAddr& p, uint32_t cid) { aliceOpens.emplace_back(p, cid); });
-  bob.setChannelOpenedCallback(
-    [&](const SockAddr& p, uint32_t cid) { bobOpens.emplace_back(p, cid); });
-
-  BOOST_TEST(aliceOpens.size() == 0u);
-  BOOST_TEST(bobOpens.size() == 0u);
+  // Listener captures opens automatically; no extra hook needed.
+  BOOST_TEST(aliceL.establishedCount() == 0u);
+  BOOST_TEST(bobL.establishedCount() == 0u);
 
   uint64_t now = 1000;
-  BOOST_REQUIRE(alice.push(bA, 5, B("hi"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,5, B("hi"), true));
   alice.tick(now);
   wire.deliverAll(now);
 
   BOOST_REQUIRE(alice.isEstablished(bA, 5));
   BOOST_REQUIRE(bob.isEstablished(aA, 5));
 
-  // Exactly one Opened fire per side, with the right parameters.
-  BOOST_REQUIRE_EQUAL(aliceOpens.size(), 1u);
-  BOOST_REQUIRE_EQUAL(bobOpens.size(), 1u);
-  BOOST_TEST(aliceOpens[0].first == bA);
-  BOOST_TEST(aliceOpens[0].second == 5u);
-  BOOST_TEST(bobOpens[0].first == aA);
-  BOOST_TEST(bobOpens[0].second == 5u);
+  // Exactly one handler per side has established for (bA,5) / (aA,5).
+  BOOST_REQUIRE_EQUAL(aliceL.establishedCount(), 1u);
+  BOOST_REQUIRE_EQUAL(bobL.establishedCount(), 1u);
+  BOOST_REQUIRE(aliceL.handler(bA, 5));
+  BOOST_TEST(aliceL.handler(bA, 5)->established);
+  BOOST_REQUIRE(bobL.handler(aA, 5));
+  BOOST_TEST(bobL.handler(aA, 5)->established);
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,42 +1548,31 @@ BOOST_AUTO_TEST_CASE(TestRudpAcceptRejectsSilently) {
   cfg.handshakeRetryInterval = std::chrono::microseconds(1);
   cfg.handshakeMaxRetries = 1;
   cfg.rngSeed = 0xADAD1;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xADAD2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(40210), bA = makeAddr(40211);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
-  size_t rejectCalls = 0;
-  bob.setChannelAcceptCallback([&](const SockAddr& /*peer*/, uint32_t /*cid*/) {
-    ++rejectCalls;
-    return false;
-  });
-
-  size_t bobOpens = 0;
-  bob.setChannelOpenedCallback([&](const SockAddr&, uint32_t) { ++bobOpens; });
-
-  // Pre-register a Destroyed callback on the (aA, 7) tuple. This
-  // eagerly creates the channel in IDLE state with the callback
-  // attached. When bob's accept predicate returns false on alice's
-  // incoming OPEN, eraseChannelSilent must NOT fire this — that's
-  // the whole invariant under test.
-  size_t bobDestroyed = 0;
-  bob.setChannelDestroyedCallback(aA, 7, [&]() { ++bobDestroyed; });
+  bobL.acceptPredicate = [](const SockAddr&, uint32_t) { return false; };
+  // Tests inspect bobL.acceptCalls.size() / opens.size() / closes.size().
 
   uint64_t now = 1000;
-  BOOST_REQUIRE(alice.push(bA, 7, B("reject me"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,7, B("reject me"), true));
   alice.tick(now);
   wire.deliverAll(now);
 
   // Bob saw the OPEN, ran the predicate (=>false), erased the channel.
-  BOOST_TEST(rejectCalls >= 1u); // could be >1 due to alice retries
-  BOOST_TEST(bobOpens == 0u);
+  BOOST_TEST(bobL.acceptCalls.size() >= 1u); // could be >1 due to alice retries
+  BOOST_TEST(bobL.establishedCount() == 0u);
   BOOST_TEST(bob.channelCount(aA) == 0u);
   BOOST_TEST(bob.peerCount() == 0u);
-  // The destroyed invariant: silent erase does NOT fire destroyed.
-  BOOST_TEST(bobDestroyed == 0u);
+  // Closed invariant: a channel rejected by onAccept never became
+  // visible to the listener and so produces NO onClosed event.
+  BOOST_TEST(bobL.closedCount() == 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,30 +1584,30 @@ BOOST_AUTO_TEST_CASE(TestRudpAcceptAllowsAndOpens) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xACC01;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xACC02;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(40220), bA = makeAddr(40221);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Order of events we want to verify:
   //   1. Bob's Accept predicate fires once with (aA, 9).
   //   2. Bob's Opened fires once with (aA, 9), AFTER accept.
   // We record each event with a sequence number and assert ordering.
   std::vector<std::string> events;
-  bob.setChannelAcceptCallback([&](const SockAddr& p, uint32_t cid) {
+  bobL.acceptPredicate = [&](const SockAddr&, uint32_t cid) {
     events.push_back("accept:" + std::to_string(cid));
-    (void)p;
     return true;
-  });
-  bob.setChannelOpenedCallback([&](const SockAddr& p, uint32_t cid) {
+  };
+  bobL.openedHook = [&](const SockAddr&, uint32_t cid) {
     events.push_back("opened:" + std::to_string(cid));
-    (void)p;
-  });
+  };
 
   uint64_t now = 1000;
-  BOOST_REQUIRE(alice.push(bA, 9, B("pls"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,9, B("pls"), true));
   alice.tick(now);
   wire.deliverAll(now);
 
@@ -1354,32 +1635,35 @@ BOOST_AUTO_TEST_CASE(TestRudpPeerRestartFiresFullTriad) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xBABE1;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xBABE2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(40230), bA = makeAddr(40231);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Establish a channel naturally first.
   uint64_t now = 1000;
-  BOOST_REQUIRE(alice.push(bA, 3, B("first"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,3, B("first"), true));
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(bob.isEstablished(aA, 3));
 
-  // Register bob's lifecycle callbacks AFTER the first handshake so
-  // we only see events from the restart onward.
+  // Register bob's hooks AFTER the first handshake so we only see
+  // events from the restart onward.
   std::vector<std::string> events;
-  bob.setChannelAcceptCallback([&](const SockAddr&, uint32_t cid) {
+  bobL.acceptPredicate = [&](const SockAddr&, uint32_t cid) {
     events.push_back("accept:" + std::to_string(cid));
     return true;
-  });
-  bob.setChannelOpenedCallback([&](const SockAddr&, uint32_t cid) {
+  };
+  bobL.openedHook = [&](const SockAddr&, uint32_t cid) {
     events.push_back("opened:" + std::to_string(cid));
-  });
-  bob.setChannelDestroyedCallback(aA, 3,
-                                  [&]() { events.push_back("destroyed"); });
+  };
+  bobL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == aA && c == 3) events.push_back("destroyed");
+  };
 
   // Forge an HS_OPEN packet from alice with a DIFFERENT nonce than
   // the one bob currently holds — simulates "alice process restarted
@@ -1440,31 +1724,33 @@ static minx::Bytes makeIndexedPayload(uint32_t i) {
 }
 
 static uint32_t extractPayloadIndex(const minx::Bytes& b) {
-  return (static_cast<uint32_t>(static_cast<uint8_t>(b[0])) << 24) |
-         (static_cast<uint32_t>(static_cast<uint8_t>(b[1])) << 16) |
-         (static_cast<uint32_t>(static_cast<uint8_t>(b[2])) << 8) |
-         (static_cast<uint32_t>(static_cast<uint8_t>(b[3])));
+  // ConstBuffer reads in BE the same way Buffer writes in BE.
+  minx::ConstBuffer rb(b);
+  return rb.get<uint32_t>();
 }
 
 // Forge a CHANNEL packet body (the bytes onPacket receives — i.e. AFTER
 // the 8-byte stdext routing key has been stripped). Wire layout matches
-// local/rudp.md exactly.
+// the wire-side emitChannel in src/rudp.cpp exactly. All BE work goes
+// through minx::Buffer.
 static minx::Bytes forgeChannelBody(
   uint32_t channel_id, uint64_t session_token, uint32_t solid_ack,
   uint32_t porosity,
   const std::vector<std::pair<uint32_t, minx::Bytes>>& reliable_msgs) {
   minx::Bytes out;
-  pushU32BE(out, channel_id);
-  pushU64BE(out, session_token);
-  pushU32BE(out, solid_ack);
-  pushU32BE(out, porosity);
-  pushU8(out, static_cast<uint8_t>(reliable_msgs.size()));
+  out.resize(out.max_size());
+  minx::Buffer buf(out);
+  buf.put<uint32_t>(channel_id);
+  buf.put<uint64_t>(session_token);
+  buf.put<uint32_t>(solid_ack);
+  buf.put<uint32_t>(porosity);
+  buf.put<uint8_t>(static_cast<uint8_t>(reliable_msgs.size()));
   for (auto& [id, body] : reliable_msgs) {
-    pushU32BE(out, id);
-    pushU16BE(out, static_cast<uint16_t>(body.size()));
-    for (auto c : body)
-      out.push_back(c);
+    buf.put<uint32_t>(id);
+    buf.put<uint16_t>(static_cast<uint16_t>(body.size()));
+    buf.put(std::span<const char>{body.data(), body.size()});
   }
+  out.resize(buf.getSize());
   appendCrcTrailer(minx::Rudp::KEY_V0_CHANNEL, out);
   return out;
 }
@@ -1495,12 +1781,14 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkReliableDelivery) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xBEEF;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xCAFE;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(11000), bA = makeAddr(11001);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   const size_t N = 1000;
 
@@ -1511,7 +1799,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkReliableDelivery) {
   // Push all N messages onto alice. Channel state is created on the
   // first push and the handshake is queued for the next flush.
   for (size_t i = 0; i < N; ++i) {
-    BOOST_REQUIRE(alice.push(bA, /*channel=*/42,
+    BOOST_REQUIRE(aliceL.push(alice, bA,/*channel=*/42,
                              makeIndexedPayload(static_cast<uint32_t>(i)),
                              /*reliable=*/true));
   }
@@ -1521,7 +1809,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkReliableDelivery) {
   uint64_t now = 0;
   const int MAX_STEPS = 1000; // generous upper bound; expected ~30
   int steps = 0;
-  while (steps < MAX_STEPS && wire.bobRecv.size() < N) {
+  while (steps < MAX_STEPS && bobL.received.size() < N) {
     alice.tick(now);
     bob.tick(now);
     wire.deliverAll();
@@ -1531,15 +1819,15 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkReliableDelivery) {
 
   // Convergence reached.
   BOOST_TEST_MESSAGE("bulk reliable converged in " << steps << " steps");
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), N);
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), N);
 
   // Verify strict in-order delivery: index in each received payload
   // must equal its position in the receive list.
   for (size_t i = 0; i < N; ++i) {
-    BOOST_REQUIRE_EQUAL(wire.bobRecv[i].channelId, 42u);
-    BOOST_REQUIRE(wire.bobRecv[i].reliable);
-    BOOST_REQUIRE_EQUAL(wire.bobRecv[i].data.size(), 16u);
-    const uint32_t got = extractPayloadIndex(wire.bobRecv[i].data);
+    BOOST_REQUIRE_EQUAL(bobL.received[i].channelId, 42u);
+    BOOST_REQUIRE(bobL.received[i].reliable);
+    BOOST_REQUIRE_EQUAL(bobL.received[i].data.size(), 16u);
+    const uint32_t got = extractPayloadIndex(bobL.received[i].data);
     BOOST_REQUIRE_EQUAL(got, static_cast<uint32_t>(i));
   }
 
@@ -1593,19 +1881,21 @@ BOOST_AUTO_TEST_CASE(TestRudpStressWideGapReorderBuffer) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xCAFE;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xBEEFEE;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(11100), bA = makeAddr(11101);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
   const uint32_t channel = 42;
 
   // Step 1: real handshake via a normal init message. After convergence,
   // bob's solidAck = 1 (init was msg 1) and we know the session_token.
-  BOOST_REQUIRE(alice.push(bA, channel, B("init"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,channel, B("init"), true));
   for (int i = 0; i < 10 && !alice.isEstablished(bA, channel); ++i) {
     alice.tick(now);
     bob.tick(now);
@@ -1622,8 +1912,8 @@ BOOST_AUTO_TEST_CASE(TestRudpStressWideGapReorderBuffer) {
     wire.deliverAll();
     now += 1000;
   }
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 1u);
-  wire.bobRecv.clear();
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 1u);
+  bobL.clearMessages();
 
   const uint64_t token = bob.sessionToken(aA, channel);
   BOOST_REQUIRE(token != 0);
@@ -1643,7 +1933,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressWideGapReorderBuffer) {
   // Nothing should have been delivered: bob's solidAck is still 1, and
   // msg 2 is the next one needed. All 51 forged msgs are sitting in
   // the reorder buffer waiting for the gap to close.
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 0u);
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 0u);
 
   // Step 3: forge msgs 2..49 (the missing low range) and inject. Bob's
   // handleChannelPacket buffers all 48 of them, then calls deliverInOrder
@@ -1659,13 +1949,13 @@ BOOST_AUTO_TEST_CASE(TestRudpStressWideGapReorderBuffer) {
   bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, lowPacket, now);
 
   // Verify all 99 messages (2..100) were delivered in strict order.
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 99u);
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 99u);
   for (size_t i = 0; i < 99; ++i) {
     const uint32_t expected = static_cast<uint32_t>(i + 2);
-    BOOST_REQUIRE_EQUAL(wire.bobRecv[i].channelId, channel);
-    BOOST_REQUIRE(wire.bobRecv[i].reliable);
-    BOOST_REQUIRE_EQUAL(wire.bobRecv[i].data.size(), 16u);
-    const uint32_t got = extractPayloadIndex(wire.bobRecv[i].data);
+    BOOST_REQUIRE_EQUAL(bobL.received[i].channelId, channel);
+    BOOST_REQUIRE(bobL.received[i].reliable);
+    BOOST_REQUIRE_EQUAL(bobL.received[i].data.size(), 16u);
+    const uint32_t got = extractPayloadIndex(bobL.received[i].data);
     BOOST_REQUIRE_EQUAL(got, expected);
   }
 
@@ -1693,18 +1983,20 @@ BOOST_AUTO_TEST_CASE(TestRudpStressReorderBufferMessageCap) {
   cfg.rngSeed = 0xDEAD;
   // Very small cap so we trip it with a forged packet of just 6 messages.
   cfg.maxReorderMessagesPerChannel = 5;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xBEEF1;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(11200), bA = makeAddr(11201);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
   const uint32_t channel = 99;
 
   // Establish the channel via a normal init message.
-  BOOST_REQUIRE(alice.push(bA, channel, B("init"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,channel, B("init"), true));
   for (int i = 0; i < 10 && !alice.isEstablished(bA, channel); ++i) {
     alice.tick(now);
     bob.tick(now);
@@ -1721,8 +2013,8 @@ BOOST_AUTO_TEST_CASE(TestRudpStressReorderBufferMessageCap) {
     wire.deliverAll();
     now += 1000;
   }
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), 1u);
-  wire.bobRecv.clear();
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 1u);
+  bobL.clearMessages();
 
   const uint64_t token = bob.sessionToken(aA, channel);
   BOOST_REQUIRE(token != 0);
@@ -1754,7 +2046,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressReorderBufferMessageCap) {
   // No messages should have been delivered: the cap tripped before
   // deliverInOrder ran, AND the gap from solidAck=1 → msg 100 means
   // nothing would have been deliverable anyway.
-  BOOST_TEST(wire.bobRecv.size() == 0u);
+  BOOST_TEST(bobL.received.size() == 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,18 +2064,20 @@ BOOST_AUTO_TEST_CASE(TestRudpDestroyedFiresOnReorderCapBreach) {
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.maxReorderMessagesPerChannel = 5;
   cfg.rngSeed = 0xDE56;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xDE57;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(11250), bA = makeAddr(11251);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
   const uint32_t channel = 77;
 
   // Establish the channel via a normal init message.
-  BOOST_REQUIRE(alice.push(bA, channel, B("init"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,channel, B("init"), true));
   for (int i = 0; i < 10 && !alice.isEstablished(bA, channel); ++i) {
     alice.tick(now);
     bob.tick(now);
@@ -1792,10 +2086,12 @@ BOOST_AUTO_TEST_CASE(TestRudpDestroyedFiresOnReorderCapBreach) {
   }
   BOOST_REQUIRE(bob.isEstablished(aA, channel));
 
-  // Register destroyed callback AFTER handshake so we only count the
+  // Register destroyed hook AFTER handshake so we only count the
   // breach event.
   size_t destroyed = 0;
-  bob.setChannelDestroyedCallback(aA, channel, [&]() { ++destroyed; });
+  bobL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == aA && c == channel) ++destroyed;
+  };
 
   // Forge a 6-msg packet that overruns the 5-entry cap.
   const uint64_t token = bob.sessionToken(aA, channel);
@@ -1830,18 +2126,20 @@ BOOST_AUTO_TEST_CASE(TestRudpStressReorderBufferByteCap) {
   cfg.maxReorderMessagesPerChannel = 1000;
   // Byte cap is 600 — two 500-byte messages will exceed it.
   cfg.maxReorderBytesPerChannel = 600;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xFADE2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(11300), bA = makeAddr(11301);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 0;
   const uint32_t channel = 7;
 
   // Establish via init.
-  BOOST_REQUIRE(alice.push(bA, channel, B("init"), true));
+  BOOST_REQUIRE(aliceL.push(alice, bA,channel, B("init"), true));
   for (int i = 0; i < 10 && !alice.isEstablished(bA, channel); ++i) {
     alice.tick(now);
     bob.tick(now);
@@ -1856,7 +2154,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressReorderBufferByteCap) {
     wire.deliverAll();
     now += 1000;
   }
-  wire.bobRecv.clear();
+  bobL.clearMessages();
 
   const uint64_t token = bob.sessionToken(aA, channel);
   BOOST_REQUIRE(token != 0);
@@ -1882,7 +2180,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressReorderBufferByteCap) {
 
   // Channel killed by the byte cap branch.
   BOOST_TEST(!bob.isEstablished(aA, channel));
-  BOOST_TEST(wire.bobRecv.size() == 0u);
+  BOOST_TEST(bobL.received.size() == 0u);
 
   // GC sweeps it on the next tick.
   bob.tick(now);
@@ -1923,12 +2221,14 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkWithLoss) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xC0DE;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xF00D;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(11400), bA = makeAddr(11401);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Drop every 3rd a→b packet (data direction). Acks (b→a) flow freely.
   // This isolates the test to the retransmit path on the data side.
@@ -1936,7 +2236,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkWithLoss) {
 
   const size_t N = 1000;
   for (size_t i = 0; i < N; ++i) {
-    BOOST_REQUIRE(alice.push(bA, /*channel=*/42,
+    BOOST_REQUIRE(aliceL.push(alice, bA,/*channel=*/42,
                              makeIndexedPayload(static_cast<uint32_t>(i)),
                              /*reliable=*/true));
   }
@@ -1944,7 +2244,7 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkWithLoss) {
   uint64_t now = 0;
   const int MAX_STEPS = 1000; // generous; expected on the order of 50-80
   int steps = 0;
-  while (steps < MAX_STEPS && wire.bobRecv.size() < N) {
+  while (steps < MAX_STEPS && bobL.received.size() < N) {
     alice.tick(now);
     bob.tick(now);
     wire.deliverAll();
@@ -1953,15 +2253,15 @@ BOOST_AUTO_TEST_CASE(TestRudpStressBulkWithLoss) {
   }
 
   BOOST_TEST_MESSAGE("bulk + 33% a→b loss converged in " << steps << " steps");
-  BOOST_REQUIRE_EQUAL(wire.bobRecv.size(), N);
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), N);
 
   // Strict in-order delivery: the index encoded in each payload must
   // equal the position in the receive list.
   for (size_t i = 0; i < N; ++i) {
-    BOOST_REQUIRE_EQUAL(wire.bobRecv[i].channelId, 42u);
-    BOOST_REQUIRE(wire.bobRecv[i].reliable);
-    BOOST_REQUIRE_EQUAL(wire.bobRecv[i].data.size(), 16u);
-    const uint32_t got = extractPayloadIndex(wire.bobRecv[i].data);
+    BOOST_REQUIRE_EQUAL(bobL.received[i].channelId, 42u);
+    BOOST_REQUIRE(bobL.received[i].reliable);
+    BOOST_REQUIRE_EQUAL(bobL.received[i].data.size(), 16u);
+    const uint32_t got = extractPayloadIndex(bobL.received[i].data);
     BOOST_REQUIRE_EQUAL(got, static_cast<uint32_t>(i));
   }
 
@@ -1992,23 +2292,25 @@ BOOST_AUTO_TEST_CASE(TestRudpBucketNegotiationSmallerWins) {
   aliceCfg.rngSeed = 0xB0C1;
   aliceCfg.perChannelBytesPerSecond = 1;      // effectively no refill
   aliceCfg.perChannelBurstBytes = 4000;       // the small side
-  Rudp alice(aliceCfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, aliceCfg);
 
   minx::RudpConfig bobCfg;
   bobCfg.baseTickInterval = std::chrono::microseconds::zero();
   bobCfg.rngSeed = 0xB0C2;
   bobCfg.perChannelBytesPerSecond = 1'000'000; // generous local config
   bobCfg.perChannelBurstBytes = 1'000'000;     // the large side
-  Rudp bob(bobCfg);
+  TestListener bobL;
+  Rudp bob(&bobL, bobCfg);
 
   SockAddr aA = makeAddr(10000), bA = makeAddr(10001);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Establish a channel. The handshake OPEN/ACCEPT carries each side's
   // advertised params; both sides freeze their effective bucket at
   // handshake completion.
   uint64_t now = 1000;
-  alice.push(bA, 1, B("warmup"), true);
+  aliceL.push(alice, bA,1, B("warmup"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 1));
@@ -2021,7 +2323,7 @@ BOOST_AUTO_TEST_CASE(TestRudpBucketNegotiationSmallerWins) {
   // worth of bytes before latching.
   Bytes big = Bn('x', Rudp::MAX_MESSAGE_SIZE);
   for (int i = 0; i < 50; ++i) {
-    bob.push(aA, 1, big, true);
+    bobL.push(bob, aA,1, big, true);
   }
   wire.clearQueue();
 
@@ -2054,15 +2356,17 @@ BOOST_AUTO_TEST_CASE(TestRudpBucketExhaustionAndRefill) {
   cfg.rngSeed = 0xB0C3;
   cfg.perChannelBytesPerSecond = 10'000; // 10 KB/sec refill
   cfg.perChannelBurstBytes = 2000;       // 2 KB initial burst
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xB0C4;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(10010), bA = makeAddr(10011);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 1, B("warmup"), true);
+  aliceL.push(alice, bA,1, B("warmup"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 1));
@@ -2070,7 +2374,7 @@ BOOST_AUTO_TEST_CASE(TestRudpBucketExhaustionAndRefill) {
   // Push a lot of data into alice's sendBuf.
   Bytes big = Bn('A', Rudp::MAX_MESSAGE_SIZE);
   for (int i = 0; i < 30; ++i) {
-    alice.push(bA, 1, big, true);
+    aliceL.push(alice, bA,1, big, true);
   }
 
   // Phase 1: fixed `now` so the bucket can't refill. Once the initial
@@ -2122,15 +2426,17 @@ BOOST_AUTO_TEST_CASE(TestRudpBucketBothUnlimitedPacingDisabled) {
   cfg.rngSeed = 0xB0C7;
   // defaults: perChannelBytesPerSecond == perChannelBurstBytes ==
   // PER_CHANNEL_UNLIMITED
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xB0C8;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(10030), bA = makeAddr(10031);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 1, B("warmup"), true);
+  aliceL.push(alice, bA,1, B("warmup"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 1));
@@ -2139,7 +2445,7 @@ BOOST_AUTO_TEST_CASE(TestRudpBucketBothUnlimitedPacingDisabled) {
   // so a finite rate couldn't have refilled.
   Bytes big = Bn('X', Rudp::MAX_MESSAGE_SIZE);
   for (int i = 0; i < 50; ++i) {
-    alice.push(bA, 1, big, true);
+    aliceL.push(alice, bA,1, big, true);
   }
   wire.clearQueue();
   size_t emitted = 0;
@@ -2171,17 +2477,19 @@ BOOST_AUTO_TEST_CASE(TestRudpSimultaneousOpenBothSidesPush) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0x51A1;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0x51A2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(10100), bA = makeAddr(10101);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Both sides push before the other's OPEN arrives. tick() on each
   // emits HS_OPEN; they race through the queue.
-  alice.push(bA, 77, B("from-alice"), true);
-  bob.push(aA, 77, B("from-bob"), true);
+  aliceL.push(alice, bA,77, B("from-alice"), true);
+  bobL.push(bob, aA,77, B("from-bob"), true);
   alice.tick(1000);
   bob.tick(1000);
   // Wire now has two queued HS_OPENs — one from each side.
@@ -2207,8 +2515,8 @@ BOOST_AUTO_TEST_CASE(TestRudpSimultaneousOpenBothSidesPush) {
     bob.tick(1000 + i);
     wire.deliverAll(1000 + i);
   }
-  BOOST_TEST(!wire.aliceRecv.empty());
-  BOOST_TEST(!wire.bobRecv.empty());
+  BOOST_TEST(!aliceL.received.empty());
+  BOOST_TEST(!bobL.received.empty());
 }
 
 // ===========================================================================
@@ -2223,11 +2531,8 @@ BOOST_AUTO_TEST_CASE(TestRudpPulseDeadlineAdvances) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::milliseconds(100); // 100_000 us
   cfg.rngSeed = 0xBEAD;
-  Rudp r(cfg);
-  // Install callbacks so sendFn/receiveFn are non-null (doPulseWork
-  // returns early if sendFn is unset).
-  r.setSendCallback([](const SockAddr&, const Bytes&) {});
-  r.setReceiveCallback([](const SockAddr&, uint32_t, const Bytes&, bool) {});
+  TestListener listener;
+  Rudp r(&listener, cfg);
 
   // Before any call, deadline is the init sentinel (0).
   BOOST_TEST(r.nextDeadlineUs() == 0u);
@@ -2258,19 +2563,21 @@ BOOST_AUTO_TEST_CASE(TestRudpPulseCatchupOnOverdue) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::milliseconds(10); // 10ms interval
   cfg.rngSeed = 0xBEA3;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xBEA4;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(10210), bA = makeAddr(10211);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Establish the channel and drain the warmup traffic by running a
   // few tick/deliver cycles with time advancing well past the 10ms
   // interval. After this loop alice.sendBuf and the wire are both
   // empty and both sides have up-to-date deadlines.
   uint64_t now = 1'000'000;
-  alice.push(bA, 1, B("warmup"), true);
+  aliceL.push(alice, bA,1, B("warmup"), true);
   for (int i = 0; i < 10; ++i) {
     alice.tick(now);
     bob.tick(now);
@@ -2284,7 +2591,7 @@ BOOST_AUTO_TEST_CASE(TestRudpPulseCatchupOnOverdue) {
   // only one fits per packet — so N packets emitted ≈ N pulses fired.
   Bytes big = Bn('C', Rudp::MAX_MESSAGE_SIZE);
   for (int i = 0; i < 10; ++i) {
-    alice.push(bA, 1, big, true);
+    aliceL.push(alice, bA,1, big, true);
   }
 
   // Jump time forward by 100ms = 10 intervals past alice's current
@@ -2311,28 +2618,34 @@ BOOST_AUTO_TEST_CASE(TestRudpSymmetricCloseIsIdempotent) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xEDC1;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xEDC2;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(10300), bA = makeAddr(10301);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 2, B("x"), true);
+  aliceL.push(alice, bA,2, B("x"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 2));
   BOOST_REQUIRE(bob.isEstablished(aA, 2));
 
   size_t aliceDestroyed = 0, bobDestroyed = 0;
-  alice.setChannelDestroyedCallback(bA, 2, [&]() { ++aliceDestroyed; });
-  bob.setChannelDestroyedCallback(aA, 2, [&]() { ++bobDestroyed; });
+  aliceL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == bA && c == 2) ++aliceDestroyed;
+  };
+  bobL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == aA && c == 2) ++bobDestroyed;
+  };
 
   // Both close BEFORE delivering either HS_CLOSE — each HS_CLOSE is
   // queued on the wire with the other side still live.
-  alice.close(bA, 2);
-  bob.close(aA, 2);
+  alice.closeChannel(bA, 2);
+  bob.closeChannel(aA, 2);
   BOOST_TEST(aliceDestroyed == 1u);
   BOOST_TEST(bobDestroyed == 1u);
   BOOST_TEST(wire.pending() == 2u);
@@ -2361,15 +2674,17 @@ BOOST_AUTO_TEST_CASE(TestRudpStaleHsCloseAfterPeerRestartIsDropped) {
   minx::RudpConfig cfg;
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.rngSeed = 0xEDC3;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xEDC4;
-  std::unique_ptr<Rudp> bob(new Rudp(cfg));
+  TestListener bobL;
+  std::unique_ptr<Rudp> bob(new Rudp(&bobL, cfg));
 
   SockAddr aA = makeAddr(10310), bA = makeAddr(10311);
-  FakeWire wire(alice, *bob, aA, bA);
+  FakeWire wire(alice, aliceL, *bob, bobL, aA, bA);
 
   uint64_t now = 1000;
-  alice.push(bA, 3, B("hi"), true);
+  aliceL.push(alice, bA,3, B("hi"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 3));
@@ -2380,11 +2695,12 @@ BOOST_AUTO_TEST_CASE(TestRudpStaleHsCloseAfterPeerRestartIsDropped) {
   // with different RNG (so new nonce, new token). Rewire.
   bob.reset();
   cfg.rngSeed = 0xEDC5;
-  bob.reset(new Rudp(cfg));
-  FakeWire wire2(alice, *bob, aA, bA);
+  TestListener bobL2;
+  bob.reset(new Rudp(&bobL2, cfg));
+  FakeWire wire2(alice, aliceL, *bob, bobL2, aA, bA);
 
   // Fresh bob pushes → emits a new HS_OPEN with a new nonce.
-  bob->push(aA, 3, B("reborn"), true);
+  bobL2.push(*bob, aA, 3, B("reborn"), true);
   bob->tick(now);
   wire2.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 3));
@@ -2404,7 +2720,9 @@ BOOST_AUTO_TEST_CASE(TestRudpStaleHsCloseAfterPeerRestartIsDropped) {
   appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, stale);
 
   size_t aliceDestroyed = 0;
-  alice.setChannelDestroyedCallback(bA, 3, [&]() { ++aliceDestroyed; });
+  aliceL.closedHook = [&](const SockAddr& p, uint32_t c, Rudp::CloseReason) {
+    if (p == bA && c == 3) ++aliceDestroyed;
+  };
 
   alice.onPacket(bA, Rudp::KEY_V0_HANDSHAKE, stale, now);
 
@@ -2423,16 +2741,18 @@ BOOST_AUTO_TEST_CASE(TestRudpPushFailsWhenSendBufFullOnEstablished) {
   cfg.baseTickInterval = std::chrono::microseconds::zero();
   cfg.maxReorderMessagesPerChannel = 3; // tiny cap to force the condition
   cfg.rngSeed = 0xEDC6;
-  Rudp alice(cfg);
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
   cfg.rngSeed = 0xEDC7;
-  Rudp bob(cfg);
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
 
   SockAddr aA = makeAddr(10320), bA = makeAddr(10321);
-  FakeWire wire(alice, bob, aA, bA);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
 
   // Establish the channel with a trivial warm-up that gets acked.
   uint64_t now = 1000;
-  alice.push(bA, 1, B("warmup"), true);
+  aliceL.push(alice, bA,1, B("warmup"), true);
   alice.tick(now);
   wire.deliverAll(now);
   BOOST_REQUIRE(alice.isEstablished(bA, 1));
@@ -2449,12 +2769,888 @@ BOOST_AUTO_TEST_CASE(TestRudpPushFailsWhenSendBufFullOnEstablished) {
   wire.dropEveryNthAtoB = 1; // drop every alice→bob packet
 
   // First 3 pushes fill sendBuf up to the cap of 3.
-  BOOST_TEST(alice.push(bA, 1, B("m0"), true) == true);
-  BOOST_TEST(alice.push(bA, 1, B("m1"), true) == true);
-  BOOST_TEST(alice.push(bA, 1, B("m2"), true) == true);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m0"), true) == true);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m1"), true) == true);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m2"), true) == true);
   // Fourth push is rejected — sendBuf is full on an ESTABLISHED
   // channel. Not a preEstablishedQueue path: the channel is live.
-  BOOST_TEST(alice.push(bA, 1, B("m3"), true) == false);
+  BOOST_TEST(aliceL.push(alice, bA,1, B("m3"), true) == false);
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel ChannelMetrics: bytesSent / bytesReceived / openedAtUs / null
+// ---------------------------------------------------------------------------
+//
+// metricsFor() returns null for unknown (peer, channel_id). After a
+// handshake, both peers' metrics show non-zero bytesSent and bytesReceived
+// for handshake bytes, and openedAtUs equals the now_us at promote time.
+// After a reliable round-trip, byte counters grow further.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpMetricsBytesAndOpenedAt) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE71;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE72;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40500), bA = makeAddr(40501);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // Unknown channel before any push: nullopt.
+  BOOST_TEST(!alice.metricsFor(bA, 4).has_value());
+  BOOST_TEST(!bob.metricsFor(aA, 4).has_value());
+
+  uint64_t now = 1234567;
+  BOOST_REQUIRE(aliceL.push(alice, bA,4, B("hello-bob"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 4));
+  BOOST_REQUIRE(bob.isEstablished(aA, 4));
+
+  auto am = alice.metricsFor(bA, 4);
+  auto bm = bob.metricsFor(aA, 4);
+  BOOST_REQUIRE(am.has_value());
+  BOOST_REQUIRE(bm.has_value());
+
+  // openedAtUs is exactly the now_us we drove the handshake under.
+  BOOST_TEST(am->openedAtUs == now);
+  BOOST_TEST(bm->openedAtUs == now);
+
+  // Both sides put bytes on the wire (alice: OPEN + first CHANNEL packet;
+  // bob: ACCEPT + first CHANNEL packet w/ ack).
+  BOOST_TEST(am->bytesSent > 0u);
+  BOOST_TEST(am->bytesReceived > 0u);
+  BOOST_TEST(bm->bytesSent > 0u);
+  BOOST_TEST(bm->bytesReceived > 0u);
+
+  // Symmetry: alice's "sent" equals what bob counted as "received" plus
+  // any in-flight packets — but in the steady state after deliverAll,
+  // every emitted packet has been delivered to the other side. So:
+  // alice.bytesSent == bob.bytesReceived (and vice versa).
+  BOOST_TEST(am->bytesSent == bm->bytesReceived);
+  BOOST_TEST(bm->bytesSent == am->bytesReceived);
+
+  // Now push a second message and verify counters grow monotonically.
+  const uint64_t sentBefore = am->bytesSent;
+  BOOST_REQUIRE(aliceL.push(alice, bA,4, B("again"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  auto am2 = alice.metricsFor(bA, 4);
+  BOOST_REQUIRE(am2.has_value());
+  BOOST_TEST(am2->bytesSent > sentBefore);
+}
+
+// ---------------------------------------------------------------------------
+// memoryByteSeconds grows when buffers are non-empty across pulses.
+// We construct a tightly controlled scenario:
+//   1. Establish a channel and drain to empty buffers.
+//   2. Stop wire delivery so any push() into sendBuf stays there.
+//   3. Push exactly one MSG_BYTES-byte message at t = T0 (sendBuf
+//      now holds MSG_BYTES bytes).
+//   4. Advance time to T0 + DURATION_S seconds via tick().
+//   5. Expected delta = MSG_BYTES * DURATION_S byte-seconds, exactly.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpMetricsMemoryIntegral) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE73;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE74;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40510), bA = makeAddr(40511);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1'000'000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,9, B("x"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 9));
+
+  // Drain to empty buffers, then advance the integral clock to
+  // currentTimeUs_ via a tick(). After this, alice's channel has
+  // empty sendBuf / reorder / preEstablished / pendingUnreliable.
+  alice.tick(now);
+  auto am0 = alice.metricsFor(bA, 9);
+  BOOST_REQUIRE(am0.has_value());
+  const uint64_t baseline = am0->memoryByteSeconds;
+
+  // Stop delivery: any push() from here goes into sendBuf and stays.
+  wire.dropEveryNthAtoB = 1;
+
+  // Push exactly MSG_BYTES bytes at time `now`, then advance time
+  // by exactly DURATION_S seconds. The integral over that window
+  // should equal MSG_BYTES * DURATION_S.
+  static constexpr size_t MSG_BYTES = 100;
+  static constexpr uint64_t DURATION_S = 5;
+
+  BOOST_REQUIRE(aliceL.push(alice, bA,9, Bn('Q', MSG_BYTES), true));
+  // Force an immediate pulse so sendBuf actually contains the
+  // message before our timing window starts.
+  alice.tick(now);
+  wire.clearQueue();
+  const uint64_t startTime = now;
+
+  now = startTime + DURATION_S * 1'000'000ULL;
+  alice.tick(now);
+  wire.clearQueue();
+
+  auto am1 = alice.metricsFor(bA, 9);
+  BOOST_REQUIRE(am1.has_value());
+  const uint64_t delta = am1->memoryByteSeconds - baseline;
+  // Exact match: 100 bytes * 5 s = 500 byte-seconds.
+  BOOST_TEST(delta == MSG_BYTES * DURATION_S);
+}
+
+// ---------------------------------------------------------------------------
+// ChannelLifecycleHook fires opened=true on ESTABLISHED and opened=false
+// on subsequent destroy. Pairing invariant: rejected accept produces
+// neither event.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpLifecycleHookOpenAndClose) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE75;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE76;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40520), bA = makeAddr(40521);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  auto aliceH = aliceL.registerChannel(alice, bA, 11);
+  BOOST_REQUIRE(aliceL.push(alice, bA,11, B("hi"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+
+  BOOST_REQUIRE_EQUAL(aliceL.establishedCount(), 1u);
+  BOOST_REQUIRE_EQUAL(bobL.establishedCount(), 1u);
+  BOOST_TEST(aliceH->established);
+  auto bobH = bobL.handler(aA, 11);
+  BOOST_REQUIRE(bobH);
+  BOOST_TEST(bobH->established);
+
+  // Close from alice. onClosed should fire on alice immediately
+  // (reason APPLICATION) and on bob once HS_CLOSE has been delivered
+  // (reason PEER_CLOSED).
+  alice.closeChannel(bA, 11);
+  BOOST_REQUIRE_EQUAL(aliceL.closedCount(), 1u);
+  BOOST_TEST(aliceH->closed);
+  BOOST_TEST(static_cast<int>(aliceH->closedReason.value()) ==
+             static_cast<int>(Rudp::CloseReason::APPLICATION));
+  wire.deliverAll(now);
+  BOOST_REQUIRE_EQUAL(bobL.closedCount(), 1u);
+  BOOST_TEST(static_cast<int>(bobH->closedReason.value()) ==
+             static_cast<int>(Rudp::CloseReason::PEER_CLOSED));
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpLifecycleHookRejectedAcceptFiresNothing) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.handshakeRetryInterval = std::chrono::microseconds(1);
+  cfg.handshakeMaxRetries = 1;
+  cfg.rngSeed = 0xBE77;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE78;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40530), bA = makeAddr(40531);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  bobL.acceptPredicate = [](const SockAddr&, uint32_t) { return false; };
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,13, B("nope"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+
+  // Bob's accept rejected — no opens / closes on bob's side.
+  BOOST_TEST(bobL.establishedCount() == 0u);
+  BOOST_TEST(bobL.closedCount() == 0u);
+  // Alice never got an ACCEPT, so her channel never reached
+  // ESTABLISHED. After handshake exhaustion her channel is GC'd. The
+  // listener invariant: a channel that was visible (push() created
+  // it) but never opened still fires onClosed once destroyed.
+  for (int i = 0; i < 5; ++i) {
+    now += 100;
+    alice.tick(now);
+    wire.clearQueue();
+  }
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_TEST(aliceL.establishedCount() == 0u);
+  BOOST_REQUIRE_EQUAL(aliceL.closedCount(), 1u);
+  auto aliceHFailed = aliceL.handler(bA, 13);
+  BOOST_REQUIRE(aliceHFailed);
+  BOOST_TEST(static_cast<int>(aliceHFailed->closedReason.value()) ==
+             static_cast<int>(Rudp::CloseReason::HANDSHAKE_FAILED));
+}
+
+// ---------------------------------------------------------------------------
+// closeChannel() on one side emits HS_CLOSE; the other side's
+// listener sees the close as PEER_CLOSED. The closing side's
+// listener sees the reason it passed in (APPLICATION here, since
+// RUDP only enumerates reasons it can itself produce — application-
+// level "why" stays in the application's own bookkeeping).
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseChannelSymmetricCloseReasons) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE79;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE7A;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40540), bA = makeAddr(40541);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,17, B("hi"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 17));
+
+  // Bob closes the channel. The wire carries an HS_CLOSE that tears
+  // down alice's side too.
+  auto bobH = bobL.handler(aA, 17);
+  BOOST_REQUIRE(bobH);
+  bob.closeChannel(aA, 17, minx::Rudp::CloseReason::APPLICATION);
+  BOOST_TEST(bob.channelCount(aA) == 0u);
+  BOOST_REQUIRE_EQUAL(bobL.closedCount(), 1u);
+  BOOST_TEST(static_cast<int>(bobH->closedReason.value()) ==
+             static_cast<int>(Rudp::CloseReason::APPLICATION));
+
+  wire.deliverAll(now);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_REQUIRE_EQUAL(aliceL.closedCount(), 1u);
+  auto aliceH = aliceL.handler(bA, 17);
+  BOOST_REQUIRE(aliceH);
+  // Alice's listener sees PEER_CLOSED — the HS_CLOSE packet is just
+  // a teardown hint; bob's reason stays in bob's bookkeeping.
+  BOOST_TEST(static_cast<int>(aliceH->closedReason.value()) ==
+             static_cast<int>(Rudp::CloseReason::PEER_CLOSED));
+}
+
+// ---------------------------------------------------------------------------
+// gc(threshold) fires the lifecycle hook with CloseReason::IDLE.
+// Establish a channel, advance wall-clock past the threshold, call
+// gc(threshold), and verify opened=false fired with the IDLE reason.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpLifecycleHookGcFiresIdle) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE7F;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE80;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40555), bA = makeAddr(40556);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,51, B("hi"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 51));
+  BOOST_REQUIRE_EQUAL(bobL.establishedCount(), 1u);
+
+  // Advance bob's notion of time well past any imaginable threshold,
+  // then call gc() with a tight threshold so the channel is evicted.
+  now += 10'000'000; // +10 s
+  bob.tick(now);
+  const size_t evicted = bob.gc(std::chrono::seconds(1));
+  BOOST_TEST(evicted == 1u);
+
+  BOOST_REQUIRE_EQUAL(bobL.closedCount(), 1u);
+  auto bobH = bobL.handler(aA, 51);
+  BOOST_REQUIRE(bobH);
+  BOOST_TEST(static_cast<int>(bobH->closedReason.value()) ==
+             static_cast<int>(Rudp::CloseReason::IDLE));
+}
+
+// ---------------------------------------------------------------------------
+// Peer restart fires lifecycle hook as (true → false → true): the old
+// session's destroy event, then the new session's open event.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpLifecycleHookPeerRestart) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE7B;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE7C;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40550), bA = makeAddr(40551);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,19, B("v1"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 19));
+  BOOST_REQUIRE_EQUAL(bobL.establishedCount(), 1u);
+
+  // Forge an HS_OPEN with a different nonce, simulating peer restart.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(19);
+  fb.put<uint8_t>(Rudp::HS_OPEN);
+  fb.put<uint64_t>(0xDEADBEEFDEADBEEFULL);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, now);
+
+  // Old session: closed with PEER_RESTART. New session: opened.
+  BOOST_REQUIRE_EQUAL(bobL.closedCount(), 1u);
+  BOOST_TEST(static_cast<int>(bobL.closes[0].reason) ==
+             static_cast<int>(Rudp::CloseReason::PEER_RESTART));
+  BOOST_REQUIRE_EQUAL(bobL.establishedCount(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// Peer-restart resets per-session metrics: the new session starts with
+// zeroed bytesSent/bytesReceived, a fresh openedAtUs, and a re-anchored
+// memoryByteSeconds clock.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpMetricsResetOnPeerRestart) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE7D;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE7E;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40560), bA = makeAddr(40561);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 5000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,21, B("first session"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 21));
+
+  // Bob sees non-zero counters for the first session.
+  auto m1 = bob.metricsFor(aA, 21);
+  BOOST_REQUIRE(m1.has_value());
+  BOOST_TEST(m1->bytesReceived > 0u);
+  BOOST_TEST(m1->bytesSent > 0u);
+  BOOST_TEST(m1->openedAtUs == 5000u);
+
+  // Forge a peer-restart OPEN at a later wall-clock.
+  now = 9000;
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(21);
+  fb.put<uint8_t>(Rudp::HS_OPEN);
+  fb.put<uint64_t>(0xCAFEBABECAFEBABEULL);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, now);
+
+  auto m2 = bob.metricsFor(aA, 21);
+  BOOST_REQUIRE(m2.has_value());
+  // New session: openedAtUs reflects the restart time, not the original.
+  BOOST_TEST(m2->openedAtUs == 9000u);
+  // bytesReceived starts fresh at the bytes for this single OPEN
+  // packet. We compute the expected wire size symbolically rather
+  // than hard-coding so wire-format tweaks don't silently break the
+  // test: HS_OPEN body = channel_id u32 + kind u8 + nonce u64 +
+  // advertised_rate u32 + advertised_burst u32 = 21 bytes; plus the
+  // 8-byte stdext routing key consumed by the dispatcher and the
+  // 4-byte CRC32C trailer.
+  static constexpr size_t HS_OPEN_BODY_SIZE = 4 + 1 + 8 + 4 + 4;
+  static constexpr size_t HS_OPEN_WIRE_SIZE =
+    HS_OPEN_BODY_SIZE + MinxStdExtensions::KEY_SIZE + Rudp::CRC_SIZE;
+  BOOST_TEST(m2->bytesReceived == HS_OPEN_WIRE_SIZE);
+  // bytesSent was reset and then bumped by the ACCEPT bob just emitted.
+  BOOST_TEST(m2->bytesSent > 0u);
+  BOOST_TEST(m2->bytesSent < m1->bytesSent);
+}
+
+// ---------------------------------------------------------------------------
+// CRC-corrupted packets still bill the addressed channel. Closes the
+// attack vector where an adversary deliberately corrupts inbound
+// packets to consume bandwidth + parsing CPU without being charged.
+//
+// We forge a CHANNEL packet against an existing established channel
+// with a valid channel_id at body[0..3] but a deliberately broken
+// CRC trailer. Bob's view of the channel must still see bytesReceived
+// grow by the wire size — even though the packet is dropped at CRC
+// verification before any further parsing.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpMetricsCorruptPacketStillBilled) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xC0DEC0;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC0DEC1;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40570), bA = makeAddr(40571);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,23, B("setup"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 23));
+
+  auto m0 = bob.metricsFor(aA, 23);
+  BOOST_REQUIRE(m0.has_value());
+  const uint64_t baselineRcv = m0->bytesReceived;
+
+  // Forge a CHANNEL-shaped body whose channel_id resolves to bob's
+  // existing channel 23, but whose CRC trailer is deliberately
+  // garbage. The session_token slot is left at zero — that's also
+  // wrong, but the CRC check fires first and short-circuits the
+  // session_token comparison.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(23);                  // channel_id (valid)
+  fb.put<uint64_t>(0xDEADDEADDEADDEADULL); // session_token (wrong)
+  fb.put<uint32_t>(0);                   // solid_ack
+  fb.put<uint32_t>(0);                   // porosity
+  fb.put<uint8_t>(0);                    // reliable_count
+  fb.put<uint32_t>(0xBADBAD00u);         // bogus "CRC" trailer
+  body.resize(fb.getSize());
+
+  bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, now);
+
+  auto m1 = bob.metricsFor(aA, 23);
+  BOOST_REQUIRE(m1.has_value());
+  // The corrupt packet was dropped at CRC verify, but bytesReceived
+  // grew by the full wire size (body + 8-byte routing key).
+  const uint64_t expected = body.size() + MinxStdExtensions::KEY_SIZE;
+  BOOST_TEST(m1->bytesReceived == baselineRcv + expected);
+}
+
+// ---------------------------------------------------------------------------
+// Wrong-session-token packets to an existing channel are billed even
+// though they are dropped before any further processing. Same attack
+// vector concern as the corrupt-CRC case, but with a valid CRC and a
+// forged session_token.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpMetricsWrongTokenStillBilled) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xC0DEC2;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC0DEC3;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40580), bA = makeAddr(40581);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,25, B("setup"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 25));
+
+  auto m0 = bob.metricsFor(aA, 25);
+  BOOST_REQUIRE(m0.has_value());
+  const uint64_t baselineRcv = m0->bytesReceived;
+
+  // Forge a CHANNEL packet with valid CRC but wrong session_token.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(25);
+  fb.put<uint64_t>(0x1234567812345678ULL); // wrong session_token
+  fb.put<uint32_t>(0);
+  fb.put<uint32_t>(0);
+  fb.put<uint8_t>(0);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_CHANNEL, body);
+
+  bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, now);
+
+  auto m1 = bob.metricsFor(aA, 25);
+  BOOST_REQUIRE(m1.has_value());
+  const uint64_t expected = body.size() + MinxStdExtensions::KEY_SIZE;
+  BOOST_TEST(m1->bytesReceived == baselineRcv + expected);
+}
+
+// ---------------------------------------------------------------------------
+// Abuse signals — observability path with null Minx.
+//
+// Each of the three strong signals fires the AbuseSignalCallback when
+// detected. We pass a null Minx (the default), so no real banAddress
+// happens; the callback is the only side-effect we observe. This is
+// the intended test pattern: tests don't mock Minx, they just leave
+// it null and verify the signal via the callback.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalForgedSessionTokenChannel) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB001;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xAB002;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40600), bA = makeAddr(40601);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // bobL.abuses is automatically populated by TestListener.
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,31, B("setup"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 31));
+  BOOST_TEST(bobL.abuses.size() == 0u);
+
+  // Forge a CHANNEL packet with valid CRC but wrong session_token —
+  // looks like off-path injection on a known channel.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(31);
+  fb.put<uint64_t>(0x1111111111111111ULL); // wrong session_token
+  fb.put<uint32_t>(0);
+  fb.put<uint32_t>(0);
+  fb.put<uint8_t>(0);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_CHANNEL, body);
+  bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, now);
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(bobL.abuses[0].peer == aA);
+  BOOST_TEST(bobL.abuses[0].cid == 31u);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::FORGED_SESSION_TOKEN_CHANNEL));
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalForgedHsClose) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB003;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xAB004;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40610), bA = makeAddr(40611);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // bobL.abuses is automatically populated by TestListener.
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,33, B("setup"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 33));
+  BOOST_TEST(bobL.abuses.size() == 0u);
+
+  // Forge an HS_CLOSE with valid CRC but wrong session_token.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(33);                        // channel_id
+  fb.put<uint8_t>(Rudp::HS_CLOSE);             // kind
+  fb.put<uint64_t>(0x2222222222222222ULL);     // wrong session_token
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, now);
+
+  // Channel must still be alive — forged close was rejected.
+  BOOST_TEST(bob.isEstablished(aA, 33));
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(bobL.abuses[0].peer == aA);
+  BOOST_TEST(bobL.abuses[0].cid == 33u);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::FORGED_SESSION_TOKEN_HS_CLOSE));
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalReorderCapBreach) {
+  // Tighten the reorder cap to a small number so the test can trip it
+  // with a handful of forged messages instead of thousands.
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.maxReorderMessagesPerChannel = 4;
+  cfg.rngSeed = 0xAB005;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xAB006;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40620), bA = makeAddr(40621);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // bobL.abuses is automatically populated by TestListener.
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,35, B("setup"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 35));
+  const uint64_t aliceToBobToken = bob.sessionToken(aA, 35);
+
+  // Forge CHANNEL packets carrying wide-gap reliable msg_ids so the
+  // reorder buffer can never deliver in-order — they all sit in the
+  // reorder map. msg_id 1 is needed first to release them; we send
+  // ids 100..104 instead. After 5 such packets we exceed cap=4.
+  for (uint32_t mid = 100; mid <= 105; ++mid) {
+    minx::Bytes body;
+    body.resize(body.max_size());
+    minx::Buffer fb(body);
+    fb.put<uint32_t>(35);                    // channel_id
+    fb.put<uint64_t>(aliceToBobToken);       // valid token
+    fb.put<uint32_t>(0);                     // solid_ack
+    fb.put<uint32_t>(0);                     // porosity
+    fb.put<uint8_t>(1);                      // reliable_count
+    fb.put<uint32_t>(mid);                   // msg_id
+    fb.put<uint16_t>(2);                     // len
+    fb.put<uint8_t>('x');
+    fb.put<uint8_t>('y');
+    body.resize(fb.getSize());
+    appendCrcTrailer(Rudp::KEY_V0_CHANNEL, body);
+    bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, now);
+    if (!bobL.abuses.empty()) break;
+  }
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(bobL.abuses[0].peer == aA);
+  BOOST_TEST(bobL.abuses[0].cid == 35u);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::REORDER_CAP_BREACH));
+}
+
+// ---------------------------------------------------------------------------
+// Smoke test: a clean handshake + reliable round-trip produces no
+// abuse signals. Guards against false positives on the happy path.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Soft abuse signals (CRC failure, stray, truncated). One-off
+// occurrences are noise; sustained ones become abuse via MINX's
+// spam filter. We test only that the signal fires — the filter's
+// own threshold logic is tested in MINX's spam_filter tests.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalCrcFailure) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB101;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40700);
+  // bobL.abuses is automatically populated by TestListener.
+
+  // CHANNEL-shaped body with a deliberately wrong CRC trailer.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(99);                  // channel_id
+  fb.put<uint64_t>(0);                   // session_token
+  fb.put<uint32_t>(0);
+  fb.put<uint32_t>(0);
+  fb.put<uint8_t>(0);
+  fb.put<uint32_t>(0xBADBAD00u);         // bogus "CRC" trailer
+  body.resize(fb.getSize());
+
+  bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, /*now_us=*/1000);
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(bobL.abuses[0].peer == aA);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::CRC_FAILURE));
+  // Severity classifier: this is a soft signal.
+  BOOST_TEST(Rudp::isStrongAbuseSignal(bobL.abuses[0].signal) == false);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalStrayHsClose) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB102;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40710);
+  // bobL.abuses is automatically populated by TestListener.
+
+  // HS_CLOSE for a channel that doesn't exist on bob's side.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(77);
+  fb.put<uint8_t>(Rudp::HS_CLOSE);
+  fb.put<uint64_t>(0xDEAD);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, /*now_us=*/1000);
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::STRAY_HS_CLOSE));
+  BOOST_TEST(Rudp::isStrongAbuseSignal(bobL.abuses[0].signal) == false);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalStrayChannelPacket) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB103;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40720);
+  // bobL.abuses is automatically populated by TestListener.
+
+  // CHANNEL packet for a channel that doesn't exist on bob's side.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(88);                  // unknown channel_id
+  fb.put<uint64_t>(0);
+  fb.put<uint32_t>(0);
+  fb.put<uint32_t>(0);
+  fb.put<uint8_t>(0);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_CHANNEL, body);
+  bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, /*now_us=*/1000);
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::STRAY_CHANNEL_PACKET));
+  BOOST_TEST(Rudp::isStrongAbuseSignal(bobL.abuses[0].signal) == false);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalTruncatedPacket) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB104;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40730);
+  // bobL.abuses is automatically populated by TestListener.
+
+  // CHANNEL-shaped body that is shorter than CHANNEL_FIXED_HEADER (21
+  // bytes) — but still long enough to pass the CRC32C trailer check.
+  // Body of 8 bytes (4 garbage + 4 CRC) is the shortest packet that
+  // gets a valid CRC.
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(0xABCD0123u); // 4 bytes of "channel_id"-ish padding
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_CHANNEL, body);
+
+  bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, /*now_us=*/1000);
+
+  BOOST_REQUIRE_EQUAL(bobL.abuses.size(), 1u);
+  BOOST_TEST(static_cast<int>(bobL.abuses[0].signal) ==
+             static_cast<int>(Rudp::AbuseSignal::TRUNCATED_PACKET));
+  BOOST_TEST(Rudp::isStrongAbuseSignal(bobL.abuses[0].signal) == false);
+}
+
+// Sustained CRC failures from one peer fire the soft signal each
+// time. The point of this test is to verify the firing rate, not the
+// spam-filter threshold logic itself (which lives in MINX). With
+// minx_ null, the only effect is repeated callback invocations.
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalCrcFailureSustained) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB105;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40740);
+
+  for (int i = 0; i < 50; ++i) {
+    minx::Bytes body;
+    body.resize(body.max_size());
+    minx::Buffer fb(body);
+    fb.put<uint32_t>(static_cast<uint32_t>(i));
+    fb.put<uint64_t>(0);
+    fb.put<uint32_t>(0);
+    fb.put<uint32_t>(0);
+    fb.put<uint8_t>(0);
+    fb.put<uint32_t>(0xDEADBEEFu); // wrong CRC every time
+    body.resize(fb.getSize());
+    bob.onPacket(aA, Rudp::KEY_V0_CHANNEL, body, /*now_us=*/1000);
+  }
+
+  size_t crcFails = 0;
+  for (auto& a : bobL.abuses) {
+    if (a.signal == Rudp::AbuseSignal::CRC_FAILURE) ++crcFails;
+  }
+  BOOST_TEST(crcFails == 50u);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalNoFalsePositives) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xAB007;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xAB008;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(40630), bA = makeAddr(40631);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA,41, B("hello"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 41));
+  BOOST_REQUIRE(alice.isEstablished(bA, 41));
+
+  BOOST_REQUIRE(bobL.push(bob, aA,41, B("world"), true));
+  bob.tick(now);
+  wire.deliverAll(now);
+
+  alice.closeChannel(bA, 41);
+  wire.deliverAll(now);
+
+  BOOST_TEST(aliceL.abuses.size() == 0u);
+  BOOST_TEST(bobL.abuses.size() == 0u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

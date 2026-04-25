@@ -4,11 +4,11 @@ LOG_MODULE_DISABLED("rudp")
 #include <minx/rudp/rudp.h>
 
 #include <minx/buffer.h>
+#include <minx/minx.h> // for Minx::banAddress on the abuse-feedback path
 
 #include <crc32c/crc32c.h>
 
 #include <algorithm>
-#include <cstring>
 #include <span>
 
 namespace minx {
@@ -35,26 +35,19 @@ namespace minx {
 // the google/crc32c library). Sub-microsecond per packet; free
 // compared to a UDP send.
 
-// Serialize a u64 key to 8 BE bytes using minx's Buffer (identical
-// endianness to the put<uint64_t>() calls in the emit functions).
-static void serializeKeyBE(uint64_t key,
-                           std::array<uint8_t, 8>& out) {
-  // Wrap a scratch Bytes around the output span. Bytes is a
-  // static_vector<char, MAX_DATA_SIZE>; we just need 8 bytes of
-  // addressable storage for the Buffer to write into.
-  Bytes scratch;
-  scratch.resize(8);
-  Buffer b(scratch);
-  b.put<uint64_t>(key);
-  std::memcpy(out.data(),
-              reinterpret_cast<const uint8_t*>(scratch.data()), 8);
-}
-
+// CRC32C over [key BE | body]. Key encoding goes through minx::Buffer
+// to guarantee identical BE serialization to the put<uint64_t>() calls
+// in the emit functions; receivers must verify with the same routing
+// key the sender used.
 static uint32_t computeCrc32cOverKeyAndBody(
     uint64_t key, const uint8_t* body, size_t bodyLen) {
-  std::array<uint8_t, 8> kb{};
-  serializeKeyBE(key, kb);
-  uint32_t acc = ::crc32c_value(kb.data(), 8);
+  Bytes keyBytes;
+  keyBytes.resize(MinxStdExtensions::KEY_SIZE);
+  Buffer kb(keyBytes);
+  kb.put<uint64_t>(key);
+  uint32_t acc = ::crc32c_value(
+    reinterpret_cast<const uint8_t*>(keyBytes.data()),
+    MinxStdExtensions::KEY_SIZE);
   if (bodyLen > 0)
     acc = ::crc32c_extend(acc, body, bodyLen);
   return acc;
@@ -100,15 +93,10 @@ static bool verifyAndStripCrc32cTrailer(
 // File-static helpers
 // ===========================================================================
 //
-// Reading a variable-length slice of bytes out of the middle of a
-// ConstBuffer is the one byte-shuffling primitive the AutoBuffer API
-// does not expose directly: get<T>() is for fixed-size typed reads,
-// getRemainingBytesSpan() / getRemainingBytes<R>() drain to end. This
-// helper fills the gap, and in the process works around an AutoBuffer
-// quirk: setReadPos refuses positions == backing-span end (it uses
-// `r >= buf_.size()` where `>` would be correct), so when the slice
-// ends exactly at the buffer's end we advance the cursor via
-// getRemainingBytesSpan() — the one API that permits r_ to land on s_.
+// Read a variable-length slice of bytes from the middle of a
+// ConstBuffer. The AutoBuffer API exposes fixed-size typed reads
+// (get<T>) and drain-to-end reads (getRemainingBytesSpan), but no
+// "consume N bytes as a Bytes" primitive — that's what this is.
 //
 // The caller must have verified `buf.getRemainingBytesCount() >= len`
 // before calling. No bounds check in here.
@@ -117,13 +105,7 @@ static Bytes readSliceBytes(ConstBuffer& buf, size_t len) {
   const auto backing = buf.getBackingSpan();
   const char* first = reinterpret_cast<const char*>(backing.data() + start);
   Bytes result(first, first + len);
-  const size_t newPos = start + len;
-  if (newPos < backing.size()) {
-    buf.setReadPos(newPos);
-  } else {
-    // At exact end-of-buffer. setReadPos would throw; drain instead.
-    (void)buf.getRemainingBytesSpan();
-  }
+  buf.setReadPos(start + len);
   return result;
 }
 
@@ -210,10 +192,16 @@ static Bytes readSliceBytes(ConstBuffer& buf, size_t len) {
 //     required and none is present.
 // ===========================================================================
 
+// Microseconds per second. Used in two unrelated places: the byte-
+// bucket scale (1 byte == USEC_PER_SEC scaled units) and the metric
+// integral's seconds/microseconds split. The literal would otherwise
+// repeat ~5x with no name.
+static constexpr uint64_t USEC_PER_SEC = 1'000'000ULL;
+
 // Scale factor: 1 byte == TOKEN_SCALE units in bucketTokensScaled. We
 // work in scaled integer units so that (R bytes/sec) × (Δt µs) divides
 // cleanly: R × Δt_us is exactly the number of micro-bytes to add.
-static constexpr uint64_t TOKEN_SCALE = 1'000'000ULL;
+static constexpr uint64_t TOKEN_SCALE = USEC_PER_SEC;
 
 void Rudp::initChannelBucket(ChannelState& cs, uint32_t peerRate,
                              uint32_t peerBurst) {
@@ -297,9 +285,15 @@ void Rudp::chargeChannelBucket(ChannelState& cs, size_t bytes) {
 // Construction / destruction
 // ===========================================================================
 
-Rudp::Rudp(RudpConfig config)
+Rudp::Rudp(Listener* listener, RudpConfig config, Minx* minx)
     : config_(config),
+      listener_(listener),
+      minx_(minx),
       rng_(config.rngSeed != 0 ? Csprng(config.rngSeed, 0) : Csprng()) {
+  // Listener is mandatory. The whole API funnels through it; running
+  // without one is never useful — even the simplest test wires a
+  // SendListener to capture outbound bytes.
+  assert(listener_ != nullptr && "Rudp: listener must not be null");
   // Cache config-derived constants so we don't keep re-converting
   // chrono::microseconds → uint64 on every call. baseTickInterval == 0
   // is a special "no pacing" mode where every external call fires
@@ -315,9 +309,6 @@ Rudp::Rudp(RudpConfig config)
 }
 
 Rudp::~Rudp() { LOGTRACE << "~Rudp"; }
-
-void Rudp::setSendCallback(SendFn fn) { sendFn_ = std::move(fn); }
-void Rudp::setReceiveCallback(ReceiveFn fn) { receiveFn_ = std::move(fn); }
 
 // ===========================================================================
 // Inspection helpers
@@ -342,46 +333,6 @@ uint64_t Rudp::sessionToken(const SockAddr& peer, uint32_t channel_id) const {
 // Write-path back-pressure callbacks — setters + fire helpers
 // ===========================================================================
 
-void Rudp::setSendBufDrainedCallback(const SockAddr& peer, uint32_t channel_id,
-                                     SendBufDrainedFn fn) {
-  // Create the channel if a real callback is being installed; if it's
-  // a clear (empty function), only touch an existing channel.
-  ChannelState* cs =
-    fn ? getOrCreateChannel(peer, channel_id) : findChannel(peer, channel_id);
-  if (!cs)
-    return;
-  cs->onSendBufDrained = std::move(fn);
-}
-
-void Rudp::setChannelDestroyedCallback(const SockAddr& peer,
-                                       uint32_t channel_id,
-                                       ChannelDestroyedFn fn) {
-  ChannelState* cs =
-    fn ? getOrCreateChannel(peer, channel_id) : findChannel(peer, channel_id);
-  if (!cs)
-    return;
-  cs->onChannelDestroyed = std::move(fn);
-}
-
-void Rudp::fireSendBufDrained(ChannelState& cs) {
-  if (cs.onSendBufDrained) {
-    // Re-entry safe: the callback may call back into push() which
-    // touches sendBuf, but we're not iterating sendBuf here.
-    cs.onSendBufDrained();
-  }
-}
-
-void Rudp::fireChannelDestroyed(ChannelState& cs) {
-  if (cs.onChannelDestroyed) {
-    // Move out the callback before invoking so that even if the
-    // handler somehow routes back into this channel's destruction
-    // again (it shouldn't), it can't re-fire.
-    auto fn = std::move(cs.onChannelDestroyed);
-    cs.onChannelDestroyed = nullptr;
-    fn();
-  }
-}
-
 void Rudp::eraseChannelSilent(const SockAddr& peer, uint32_t channel_id) {
   auto pit = peers_.find(peer);
   if (pit == peers_.end())
@@ -392,19 +343,212 @@ void Rudp::eraseChannelSilent(const SockAddr& peer, uint32_t channel_id) {
   }
 }
 
-void Rudp::setChannelAcceptCallback(ChannelAcceptFn fn) {
-  channelAcceptFn_ = std::move(fn);
+void Rudp::wireHandler(const SockAddr& peer, uint32_t channel_id,
+                       ChannelState& cs,
+                       std::shared_ptr<ChannelHandler> handler) {
+  // Inject the back-references the handler will use to push /
+  // closeChannel / etc. from inside its event methods. Then store
+  // the shared_ptr on the channel and fire onOpened — earliest
+  // event in the lifecycle.
+  handler->rudp_ = this;
+  handler->peer_ = peer;
+  handler->cid_ = channel_id;
+  cs.handler = std::move(handler);
+  cs.handlerEstablished = false;
+  cs.handler->onOpened();
 }
 
-void Rudp::setChannelOpenedCallback(ChannelOpenedFn fn) {
-  channelOpenedFn_ = std::move(fn);
+bool Rudp::registerChannel(const SockAddr& peer, uint32_t channel_id,
+                        std::shared_ptr<ChannelHandler> handler) {
+  // Programmer-error guard: re-registering an existing channel is
+  // not supported (use channelHandler() to inspect the existing
+  // handler if you need to).
+  if (findChannel(peer, channel_id) != nullptr) {
+    LOGDEBUG << "registerChannel: already registered" << SVAR(peer)
+             << VAR(channel_id);
+    return false;
+  }
+  ChannelState* cs = getOrCreateChannel(peer, channel_id);
+  if (!cs) {
+    return false; // per-peer channel cap
+  }
+  wireHandler(peer, channel_id, *cs, std::move(handler));
+  // Kick off the handshake: outbound registration is the application's
+  // declaration "I want this channel," and the wire-level cost of
+  // owning a channel is the OPEN. State IDLE → OPEN_SENT here so
+  // the next pulse emits the OPEN packet (no need for the app to
+  // call push() with dummy data just to start the handshake).
+  cs->weInitiated = true;
+  cs->nonceLocal = rng_.next();
+  cs->handshakeState = HandshakeState::OPEN_SENT;
+  cs->handshakeRetries = 0;
+  cs->lastHandshakeAttemptUs = currentTimeUs_;
+  return true;
+}
+
+std::shared_ptr<Rudp::ChannelHandler>
+Rudp::channelHandler(const SockAddr& peer, uint32_t channel_id) const {
+  const auto* cs = findChannel(peer, channel_id);
+  return cs ? cs->handler : nullptr;
+}
+
+void Rudp::reportAbuse(const SockAddr& peer, uint32_t channel_id,
+                       AbuseSignal signal) {
+  LOGDEBUG << "abuse signal" << SVAR(peer) << VAR(channel_id) << VAR(signal);
+  if (minx_) {
+    if (isStrongAbuseSignal(signal)) {
+      // Strong signal: immediate ban. MINX's ipFilter drops subsequent
+      // UDP packets from this peer's prefix. Minx::banAddress already
+      // short-circuits for loopback under trustLoopback.
+      minx_->banAddress(peer.address());
+    } else {
+      // Soft signal: feed MINX's count-min-sketch spam filter and let
+      // its threshold decide. One-off is noise; recurring is abuse.
+      // We ignore the boolean return: by the time it would say "over
+      // threshold" the filter is already dropping that peer's packets
+      // at MINX dispatch, which is the action we'd take anyway.
+      (void)minx_->checkSpam(peer.address(), /*alsoUpdate=*/true);
+    }
+  }
+  // Observability: every signal goes to the listener regardless of
+  // whether minx_ was provided. Tests pass null Minx and observe via
+  // the listener alone.
+  listener_->onAbuse(peer, channel_id, signal);
+}
+
+// ===========================================================================
+// Per-channel metrics — buffer integral + lookup + centralized teardown
+// ===========================================================================
+
+size_t Rudp::channelBufferBytes(const ChannelState& cs) const {
+  // Sum the application-visible memory the channel is currently
+  // holding. The numbers in cs.* are already maintained by the
+  // existing code paths; this helper just totals them on demand.
+  size_t total = cs.reorderBytes;
+  total += cs.pendingUnreliable.size();
+  for (const auto& kv : cs.sendBuf) {
+    total += kv.second.size();
+  }
+  for (const auto& m : cs.preEstablishedQueue) {
+    total += m.size();
+  }
+  return total;
+}
+
+void Rudp::updateMemoryIntegral(ChannelState& cs) {
+  // Lazy advance of memoryByteSeconds to currentTimeUs_. Called from
+  // doPulseWork (per pulse) and destroyChannel (final). Cheap:
+  // O(sendBuf size) for the buffer sum, with sendBuf bounded by
+  // maxReorderMessagesPerChannel (1024 by default).
+  //
+  // We accumulate in byte-microseconds (buf × dt_us) and carry the
+  // sub-second remainder across calls. Splitting dt into seconds and
+  // microseconds before multiplying avoids overflow at long idle
+  // intervals (a never-touched channel could see dt of weeks).
+  if (currentTimeUs_ <= cs.metricsLastUpdateUs) {
+    cs.metricsLastUpdateUs = currentTimeUs_;
+    return;
+  }
+  const uint64_t dt = currentTimeUs_ - cs.metricsLastUpdateUs;
+  const uint64_t buf = static_cast<uint64_t>(channelBufferBytes(cs));
+  cs.metricsLastUpdateUs = currentTimeUs_;
+  if (buf == 0) {
+    // No buffers held in this interval — integral doesn't move,
+    // remainder stays where it was.
+    return;
+  }
+  // Whole seconds of dt go straight into byte-seconds.
+  //
+  // Overflow analysis. buf is bounded by the per-channel reorder cap
+  // (~1 MB ≈ 2^20). dt_us_rem < USEC_PER_SEC ≈ 2^20, so buf * dt_us_rem
+  // ≤ 2^40 — comfortably below 2^64. dt_s is dt / USEC_PER_SEC, so
+  // buf * dt_s could theoretically overflow only if the channel
+  // survives ~3 million years of wall-clock with a full-megabyte
+  // buffer the entire time. Not a realistic scenario; uint64
+  // wraparound here is left as a documented (impossible-to-hit) edge.
+  const uint64_t dt_s = dt / USEC_PER_SEC;
+  const uint64_t dt_us_rem = dt % USEC_PER_SEC;
+  cs.metrics.memoryByteSeconds += buf * dt_s;
+  // Sub-second portion accumulates in the remainder; overflow into
+  // byte-seconds whenever the remainder crosses USEC_PER_SEC. The
+  // remainder is bounded above by buf * USEC_PER_SEC + USEC_PER_SEC
+  // < 2^41, so adding can't itself wrap; we only need one carry into
+  // byte-seconds.
+  cs.metricsMemRemainderUs += buf * dt_us_rem;
+  if (cs.metricsMemRemainderUs >= USEC_PER_SEC) {
+    cs.metrics.memoryByteSeconds += cs.metricsMemRemainderUs / USEC_PER_SEC;
+    cs.metricsMemRemainderUs %= USEC_PER_SEC;
+  }
+}
+
+std::optional<Rudp::ChannelMetrics>
+Rudp::metricsFor(const SockAddr& peer, uint32_t channel_id) const {
+  const auto* cs = findChannel(peer, channel_id);
+  if (!cs) return std::nullopt;
+  return cs->metrics;
+}
+
+void Rudp::destroyChannel(const SockAddr& peer, uint32_t channel_id,
+                          ChannelState& cs, CloseReason reason) {
+  // 1) Final metrics integral update so the listener's onClosed sees
+  //    a closed-out memoryByteSeconds when it calls metricsFor().
+  updateMemoryIntegral(cs);
+  // 2) handler->onClosed fires exactly once per registered channel.
+  //    Move the shared_ptr out before invoking so we can drop
+  //    Rudp's ref AFTER the call returns (the handler can rely on
+  //    being alive during onClosed) without the call site needing
+  //    to do its own ownership dance. (peer, cid) parameters are
+  //    unused here — the handler reads them via its protected
+  //    accessors, which were injected at registration.
+  if (auto handler = std::move(cs.handler)) {
+    cs.handler.reset();
+    cs.handlerEstablished = false;
+    handler->onClosed(reason);
+    // handler shared_ptr drops here when the local goes out of
+    // scope, releasing Rudp's ref. App-side refs (if any) survive.
+  }
+  (void)peer;
+  (void)channel_id;
+}
+
+std::ostream& operator<<(std::ostream& os, Rudp::CloseReason r) {
+  switch (r) {
+  case Rudp::CloseReason::APPLICATION:      return os << "APPLICATION";
+  case Rudp::CloseReason::IDLE:             return os << "IDLE";
+  case Rudp::CloseReason::HANDSHAKE_FAILED: return os << "HANDSHAKE_FAILED";
+  case Rudp::CloseReason::REORDER_BREACH:   return os << "REORDER_BREACH";
+  case Rudp::CloseReason::PEER_CLOSED:      return os << "PEER_CLOSED";
+  case Rudp::CloseReason::PEER_RESTART:     return os << "PEER_RESTART";
+  }
+  return os << "?(" << static_cast<int>(r) << ")";
+}
+
+std::ostream& operator<<(std::ostream& os, Rudp::AbuseSignal s) {
+  switch (s) {
+  case Rudp::AbuseSignal::FORGED_SESSION_TOKEN_CHANNEL:
+    return os << "FORGED_SESSION_TOKEN_CHANNEL";
+  case Rudp::AbuseSignal::FORGED_SESSION_TOKEN_HS_CLOSE:
+    return os << "FORGED_SESSION_TOKEN_HS_CLOSE";
+  case Rudp::AbuseSignal::REORDER_CAP_BREACH:
+    return os << "REORDER_CAP_BREACH";
+  case Rudp::AbuseSignal::CRC_FAILURE:
+    return os << "CRC_FAILURE";
+  case Rudp::AbuseSignal::STRAY_HS_CLOSE:
+    return os << "STRAY_HS_CLOSE";
+  case Rudp::AbuseSignal::STRAY_CHANNEL_PACKET:
+    return os << "STRAY_CHANNEL_PACKET";
+  case Rudp::AbuseSignal::TRUNCATED_PACKET:
+    return os << "TRUNCATED_PACKET";
+  }
+  return os << "?(" << static_cast<int>(s) << ")";
 }
 
 // ===========================================================================
 // Local state management — close / gc
 // ===========================================================================
 
-void Rudp::close(const SockAddr& peer, uint32_t channel_id) {
+void Rudp::closeChannel(const SockAddr& peer, uint32_t channel_id,
+                        CloseReason reason) {
   auto pit = peers_.find(peer);
   if (pit == peers_.end())
     return;
@@ -412,17 +556,18 @@ void Rudp::close(const SockAddr& peer, uint32_t channel_id) {
   auto cit = peerState.channels.find(channel_id);
   if (cit == peerState.channels.end())
     return;
-  LOGTRACE << "close" << SVAR(peer) << VAR(channel_id);
+  LOGTRACE << "closeChannel" << SVAR(peer) << VAR(channel_id) << VAR(reason);
   // Best-effort teardown hint to the peer. Only meaningful once both
   // sides agree on a session_token — emit for ESTABLISHED only. Other
   // states have no mutually-known token, so silently drop as before
   // (the peer's handshake retry / idle-GC will notice on its own).
   if (cit->second.handshakeState == HandshakeState::ESTABLISHED) {
-    emitHandshakeClose(peer, channel_id, cit->second.sessionToken);
+    emitHandshakeClose(peer, channel_id, cit->second); // charges bytesSent internally
   }
-  // Fire the destroyed callback BEFORE erase so the callback still
-  // has a live ChannelState reference if it needs to inspect anything.
-  fireChannelDestroyed(cit->second);
+  // Centralized teardown: final integral update + Listener::onClosed,
+  // done before erase so the listener can call metricsFor() to read
+  // final values. The reason is forwarded to the listener.
+  destroyChannel(peer, channel_id, cit->second, reason);
   peerState.channels.erase(cit);
   if (peerState.channels.empty()) {
     peers_.erase(pit);
@@ -445,7 +590,7 @@ size_t Rudp::gc(std::chrono::microseconds idleThreshold) {
       if (age >= thresholdUs) {
         LOGTRACE << "gc evict" << SVAR(pit->first) << VAR(cit->first)
                  << VAR(age);
-        fireChannelDestroyed(cs);
+        destroyChannel(pit->first, cit->first, cs, CloseReason::IDLE);
         cit = peerState.channels.erase(cit);
         ++evicted;
       } else {
@@ -502,6 +647,12 @@ Rudp::ChannelState* Rudp::getOrCreateChannel(const SockAddr& peer,
   }
   auto& cs = peerState.channels[channel_id];
   cs.lastActivityUs = currentTimeUs_;
+  // Anchor the memory-integral clock at creation so the first
+  // updateMemoryIntegral on this channel computes a sensible dt.
+  // promoteToEstablished re-anchors at the ESTABLISHED transition so
+  // the integral effectively measures post-handshake lifetime; the
+  // pre-handshake interval contributes zero to memoryByteSeconds.
+  cs.metricsLastUpdateUs = currentTimeUs_;
   return &cs;
 }
 
@@ -564,9 +715,15 @@ bool Rudp::push(const SockAddr& peer, uint32_t channel_id, const Bytes& msg,
              << VAR(MAX_MESSAGE_SIZE);
     return false;
   }
-  ChannelState* cs = getOrCreateChannel(peer, channel_id);
+  // push() does NOT create channels. The caller must have registered
+  // the channel first (registerChannel for outbound; onAccept-true on
+  // the inbound side). This guarantees every channel always has a
+  // handler — no events get dispatched into the void.
+  ChannelState* cs = findChannel(peer, channel_id);
   if (!cs) {
-    return false; // channel cap exhausted
+    LOGDEBUG << "push reject: channel not registered" << SVAR(peer)
+             << VAR(channel_id);
+    return false;
   }
 
   cs->lastActivityUs = currentTimeUs_;
@@ -629,8 +786,6 @@ void Rudp::flush() {
   // applications that want to push a message and immediately put it on
   // the wire without waiting for the next tick. Internally this is just
   // doPulseWork(currentTimeUs_, 1) — one packet per channel-with-data.
-  if (!sendFn_)
-    return;
   doPulseWork(currentTimeUs_, 1);
 }
 
@@ -693,8 +848,16 @@ void Rudp::runPulses(uint64_t now_us) {
 }
 
 void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
-  if (!sendFn_)
-    return;
+  // 0) Advance memory integrals for every live channel up to now_us.
+  //    Done before the destroy loop so channels that are about to be
+  //    GC'd see their last-window integral go in (destroyChannel
+  //    re-runs updateMemoryIntegral, which becomes a no-op when
+  //    metricsLastUpdateUs has already been snapped to now_us).
+  for (auto& peerEntry : peers_) {
+    for (auto& chEntry : peerEntry.second.channels) {
+      updateMemoryIntegral(chEntry.second);
+    }
+  }
 
   // 1) Handshake retries + GC of CLOSED / idle channels.
   for (auto pit = peers_.begin(); pit != peers_.end();) {
@@ -704,12 +867,19 @@ void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
          cit != peerState.channels.end();) {
       ChannelState& cs = cit->second;
       bool drop = false;
+      // dropReason starts at the channel's stamped closeReason —
+      // that's set at the moment we transition into CLOSED (e.g.
+      // reorder breach in handleChannelPacket). Idle GC and
+      // handshake exhaustion below override it with their own
+      // reason, since those paths discover the trigger here.
+      CloseReason dropReason = cs.closeReason;
 
       // Idle GC
       if (now_us > cs.lastActivityUs &&
           (now_us - cs.lastActivityUs) >= channelInactivityUs_) {
         LOGTRACE << "GC idle channel" << SVAR(pit->first) << VAR(cit->first);
         drop = true;
+        dropReason = CloseReason::IDLE;
       }
 
       // Handshake retry
@@ -722,7 +892,9 @@ void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
             LOGDEBUG << "handshake exhausted" << SVAR(pit->first)
                      << VAR(cit->first);
             cs.handshakeState = HandshakeState::CLOSED;
+            cs.closeReason = CloseReason::HANDSHAKE_FAILED;
             drop = true;
+            dropReason = CloseReason::HANDSHAKE_FAILED;
           } else {
             ++cs.handshakeRetries;
             cs.lastHandshakeAttemptUs = now_us;
@@ -730,13 +902,15 @@ void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
         }
       }
 
-      // Drop CLOSED channels eagerly
+      // Drop CLOSED channels eagerly. The stamped closeReason on the
+      // channel (from the reorder-breach path or from handshake
+      // exhaustion above) is already in dropReason.
       if (cs.handshakeState == HandshakeState::CLOSED) {
         drop = true;
       }
 
       if (drop) {
-        fireChannelDestroyed(cs);
+        destroyChannel(pit->first, cit->first, cs, dropReason);
         cit = peerState.channels.erase(cit);
       } else {
         ++cit;
@@ -822,11 +996,50 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
     return;
   }
 
-  // Verify the CRC32C trailer. Corrupted packets are dropped
-  // silently — RUDP's retransmit path recovers, and logging every
-  // miss would spam under any non-trivial loss profile.
+  // Attribute the inbound wire bytes to the addressed channel BEFORE
+  // CRC verification, before parsing the session_token, before
+  // anything that could reject the packet. The channel_id field sits
+  // at the same body offset (bytes 0..3) for both sub-protos
+  // (HANDSHAKE and CHANNEL), so we can read it from the still-
+  // untrusted bytes without parsing the rest. Charging here closes
+  // the attack vector where an adversary deliberately corrupts
+  // packets aimed at a known channel to consume bandwidth + parsing
+  // CPU without being billed for it.
+  //
+  // Bit-flips that happen to flip channel_id to ANOTHER existing
+  // channel_id mis-attribute the bytes, which is acceptable: SOME
+  // channel is still being billed. Packets whose channel_id matches
+  // no existing channel are not billed here — those fall through to
+  // MINX's IP-level spam filter (SpamFilter), which is the correct
+  // layer for charging garbage traffic that doesn't belong to any
+  // RUDP channel.
+  const size_t wireBytes = payload.size() + MinxStdExtensions::KEY_SIZE;
+  bool inboundCharged = false;
+  uint32_t probedChannelId = 0;
+  bool haveProbedChannelId = false;
+  if (payload.size() >= sizeof(uint32_t)) {
+    ConstBuffer probe(payload);
+    probedChannelId = probe.get<uint32_t>();
+    haveProbedChannelId = true;
+    if (ChannelState* preCs = findChannel(peer, probedChannelId)) {
+      preCs->metrics.bytesReceived += wireBytes;
+      inboundCharged = true;
+    }
+  }
+
+  // Verify the CRC32C trailer. Corrupted packets are dropped — but
+  // also fed to MINX's spam filter as a soft abuse signal: CRC32C is
+  // mathematically robust on a clean wire, so a peer producing
+  // recurring CRC failures is forging without bothering to compute
+  // the trailer. The bytesReceived pre-charge above already happened
+  // (so corrupt packets still bill the addressed channel for
+  // bandwidth), independent of this signal.
   Bytes body = payload; // copy so we can truncate the trailer
-  if (!verifyAndStripCrc32cTrailer(key, body)) return;
+  if (!verifyAndStripCrc32cTrailer(key, body)) {
+    reportAbuse(peer, haveProbedChannelId ? probedChannelId : 0,
+                AbuseSignal::CRC_FAILURE);
+    return;
+  }
 
   // Process the packet. Each handler returns a "novel" bool that used
   // to feed a scheduleHalvedFire() deadline tweak; that tweak only
@@ -836,7 +1049,7 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
   // is kept in the handler signatures for potential future use.
   switch (subproto) {
   case SUBPROTO_HANDSHAKE:
-    (void)handleHandshakePacket(peer, body);
+    (void)handleHandshakePacket(peer, body, wireBytes, inboundCharged);
     break;
   case SUBPROTO_CHANNEL:
     (void)handleChannelPacket(peer, body);
@@ -874,7 +1087,8 @@ void Rudp::onPacket(const SockAddr& peer, uint64_t key, const Bytes& payload,
 // channel slots or tearing down unrelated sessions.
 // ===========================================================================
 
-bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
+void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
+                                 size_t wireBytes, bool inboundCharged) {
   static constexpr size_t HANDSHAKE_HEADER_SIZE = 4 + 1;
   static constexpr size_t HANDSHAKE_OPEN_ACCEPT_BODY_SIZE =
     HANDSHAKE_HEADER_SIZE + 8 + 4 + 4; // 21
@@ -884,7 +1098,8 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
   if (payload.size() < HANDSHAKE_HEADER_SIZE) {
     LOGDEBUG << "drop: handshake packet too short for header"
              << VAR(payload.size());
-    return false;
+    reportAbuse(peer, /*channel_id=*/0, AbuseSignal::TRUNCATED_PACKET);
+    return;
   }
   ConstBuffer buf(payload);
   const uint32_t channel_id = buf.get<uint32_t>();
@@ -896,31 +1111,44 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
   if (kind == HS_CLOSE) {
     if (payload.size() < HANDSHAKE_CLOSE_BODY_SIZE) {
       LOGDEBUG << "drop: HS_CLOSE packet too short" << VAR(payload.size());
-      return false;
+      reportAbuse(peer, channel_id, AbuseSignal::TRUNCATED_PACKET);
+      return;
     }
     const uint64_t session_token = buf.get<uint64_t>();
     ChannelState* cs = findChannel(peer, channel_id);
     if (!cs) {
       LOGTRACE << "drop: HS_CLOSE for unknown channel" << VAR(channel_id);
-      return false;
+      reportAbuse(peer, channel_id, AbuseSignal::STRAY_HS_CLOSE);
+      return;
     }
     // Only ESTABLISHED channels have a mutually-known session_token.
     // Anything else (IDLE, OPEN_SENT, ACCEPT_SENT, CLOSED) is either
-    // a race against our own close() or a stale/spoofed packet; drop.
+    // a race against our own closeChannel() or a stale/spoofed
+    // packet.
     if (cs->handshakeState != HandshakeState::ESTABLISHED) {
       LOGTRACE << "drop: HS_CLOSE in non-ESTABLISHED state"
                << VAR(channel_id)
                << VAR(static_cast<int>(cs->handshakeState));
-      return false;
+      reportAbuse(peer, channel_id, AbuseSignal::STRAY_HS_CLOSE);
+      return;
     }
     if (cs->sessionToken != session_token) {
       LOGTRACE << "drop: HS_CLOSE with mismatched session_token"
                << VAR(channel_id);
-      return false;
+      // Forgery aimed at tearing down an existing session. Strong
+      // signal — same severity as the CHANNEL-packet mismatch.
+      reportAbuse(peer, channel_id,
+                  AbuseSignal::FORGED_SESSION_TOKEN_HS_CLOSE);
+      return;
     }
     LOGTRACE << "received HS_CLOSE, tearing down channel"
              << VAR(channel_id);
-    fireChannelDestroyed(*cs);
+    // bytesReceived was already charged in onPacket via the pre-CRC
+    // attribution path. The charge sits on the channel's metrics
+    // before destroyChannel fires Listener::onClosed, so an
+    // onClosed handler reading metricsFor() sees the close packet
+    // accounted for.
+    destroyChannel(peer, channel_id, *cs, CloseReason::PEER_CLOSED);
     auto pit = peers_.find(peer);
     if (pit != peers_.end()) {
       pit->second.channels.erase(channel_id);
@@ -928,12 +1156,13 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
         peers_.erase(pit);
       }
     }
-    return true; // novel: channel torn down by peer
+    return;
   }
 
   if (payload.size() < HANDSHAKE_OPEN_ACCEPT_BODY_SIZE) {
     LOGDEBUG << "drop: handshake packet too short" << VAR(payload.size());
-    return false;
+    reportAbuse(peer, channel_id, AbuseSignal::TRUNCATED_PACKET);
+    return;
   }
   const uint64_t nonce = buf.get<uint64_t>();
   const uint32_t peerRate = buf.get<uint32_t>();
@@ -941,7 +1170,7 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
 
   ChannelState* cs = getOrCreateChannel(peer, channel_id);
   if (!cs)
-    return false; // channel cap rejected
+    return; // channel cap rejected
   cs->lastActivityUs = currentTimeUs_;
 
   switch (kind) {
@@ -952,14 +1181,18 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
     switch (cs->handshakeState) {
     case HandshakeState::IDLE:
     case HandshakeState::CLOSED: {
-      // Apply the accept predicate BEFORE touching any state. If
-      // the app says no, erase the freshly-created channel and
-      // return without firing Destroyed — the channel was only
-      // ever a proposal, the app never owned it.
-      if (channelAcceptFn_ && !channelAcceptFn_(peer, channel_id)) {
+      // Listener::onAccept is predicate AND handler factory in one.
+      // Returning a non-null shared_ptr accepts and supplies the
+      // handler. Returning null rejects the inbound channel
+      // silently — no events fire, channel is erased.
+      auto handler = listener_->onAccept(peer, channel_id);
+      if (!handler) {
         LOGTRACE << "accept rejected" << VAR(channel_id);
         eraseChannelSilent(peer, channel_id);
-        return false; // not novel: silent drop
+        return;
+      }
+      if (!inboundCharged) {
+        cs->metrics.bytesReceived += wireBytes;
       }
       cs->weInitiated = false;
       cs->nonceRemote = nonce;
@@ -968,18 +1201,22 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
       cs->handshakeState = HandshakeState::ACCEPT_SENT;
       cs->lastHandshakeAttemptUs = currentTimeUs_;
       initChannelBucket(*cs, peerRate, peerBurst);
-      // Emit the ACCEPT immediately. After this, ESTABLISHED.
+      // Wire the handler now: rudp/peer/cid back-references are
+      // injected, handler->onOpened() fires. After this the handler
+      // can validly call rudp()->push() etc. from any subsequent
+      // event method.
+      wireHandler(peer, channel_id, *cs, std::move(handler));
+      // Emit the ACCEPT, then ESTABLISHED.
       emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
       promoteToEstablished(peer, channel_id, *cs);
-      return true; // novel: state transition + ACCEPT sent
+      return;
     }
     case HandshakeState::OPEN_SENT: {
       // Simultaneous open: both sides sent OPEN at roughly the same
-      // time, racing. The first OPEN to arrive wins. We treat the
-      // peer's OPEN as authoritative and switch roles: discard our
-      // own pending OPEN, accept theirs. Accept predicate does NOT
-      // fire here — we already committed on our side by calling
-      // push(); the app decided at push time.
+      // time, racing. The peer's OPEN wins; we accept theirs and
+      // discard our own pending OPEN. Accept predicate does NOT
+      // fire here — the handler was already wired at registerChannel
+      // time on our side. wireBytes was already charged by onPacket.
       cs->weInitiated = false;
       cs->nonceRemote = nonce;
       // Reuse our previously-generated nonce as N_b (don't waste it).
@@ -989,16 +1226,16 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
       initChannelBucket(*cs, peerRate, peerBurst);
       emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
       promoteToEstablished(peer, channel_id, *cs);
-      return true; // novel: state transition + ACCEPT sent
+      return;
     }
     case HandshakeState::ACCEPT_SENT:
     case HandshakeState::ESTABLISHED: {
       // Already accepted/established. The peer may not have received
       // our ACCEPT — re-emit it idempotently. The session_token
-      // doesn't change.
+      // doesn't change. wireBytes already charged by onPacket.
       if (cs->nonceRemote == nonce) {
         emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
-        return false; // duplicate OPEN, no novelty
+        return;
       }
       // Different N_a means a fresh OPEN attempt — likely the peer
       // restarted. The old session is dead from any stream
@@ -1010,11 +1247,12 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
       // policy decision. If accepted, reset state and continue.
       // If rejected, erase the whole channel and return (the old
       // session already got its Destroyed fire).
-      fireChannelDestroyed(*cs);
-      if (channelAcceptFn_ && !channelAcceptFn_(peer, channel_id)) {
+      destroyChannel(peer, channel_id, *cs, CloseReason::PEER_RESTART);
+      auto newHandler = listener_->onAccept(peer, channel_id);
+      if (!newHandler) {
         LOGTRACE << "accept rejected on peer-restart" << VAR(channel_id);
         eraseChannelSilent(peer, channel_id);
-        return true; // novel: old session destroyed
+        return;
       }
       cs->weInitiated = false;
       cs->nonceRemote = nonce;
@@ -1030,39 +1268,65 @@ bool Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload) {
       cs->lastSentSolidAck = 0;
       cs->lastSentPorosity = 0;
       cs->hasSentAnything = false;
+      // Reset metrics for the new session: counters and integral
+      // start fresh; openedAtUs is re-stamped in promoteToEstablished.
+      // The OLD session's pre-charge from onPacket was already
+      // visible to the listener inside destroyChannel above; we wipe
+      // it now for the NEW session.
+      cs->metrics = ChannelMetrics{};
+      cs->metricsLastUpdateUs = currentTimeUs_;
+      cs->metricsMemRemainderUs = 0;
+      // Re-attribute the OPEN packet's wire bytes to the new session.
+      // onPacket pre-charged them to the old session before we knew
+      // this was a peer-restart; without this re-charge they'd vanish
+      // from accounting.
+      cs->metrics.bytesReceived += wireBytes;
       initChannelBucket(*cs, peerRate, peerBurst);
+      // Wire the new handler — fresh onOpened for the new session.
+      wireHandler(peer, channel_id, *cs, std::move(newHandler));
       emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
       promoteToEstablished(peer, channel_id, *cs);
-      return true; // novel: peer restarted, full reset
+      return;
     }
     }
     break;
   }
 
   case HS_ACCEPT: {
-    // Peer is accepting our OPEN. Their nonce is N_b.
+    // Peer is accepting our OPEN. Their nonce is N_b. wireBytes
+    // already charged by onPacket — the channel pre-existed in
+    // OPEN_SENT (we sent the OPEN, so getOrCreateChannel didn't
+    // create it).
     if (cs->handshakeState != HandshakeState::OPEN_SENT) {
       LOGDEBUG << "drop: ACCEPT in unexpected state"
                << VAR(static_cast<int>(cs->handshakeState));
-      return false;
+      return;
     }
     cs->nonceRemote = nonce;
     cs->sessionToken = deriveSessionToken(cs->nonceLocal, cs->nonceRemote);
     initChannelBucket(*cs, peerRate, peerBurst);
     promoteToEstablished(peer, channel_id, *cs);
-    return true; // novel: ESTABLISHED transition + sendBuf has data
+    return;
   }
 
   default:
     LOGDEBUG << "drop: unknown handshake kind" << VAR(kind);
     break;
   }
-  return false;
 }
 
 void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
                                 ChannelState& cs) {
   cs.handshakeState = HandshakeState::ESTABLISHED;
+  // Stamp the metrics open-time AND start the integral clock at the
+  // ESTABLISHED transition. The integral could have been ticking
+  // from channel creation, but per-channel billing only cares about
+  // the post-handshake lifetime — anything before is the cost of
+  // opening, not of holding open. Reset metricsLastUpdateUs to
+  // currentTimeUs_ so the first integral update advances from here.
+  cs.metrics.openedAtUs = currentTimeUs_;
+  cs.metricsLastUpdateUs = currentTimeUs_;
+
   // Drain any application messages pushed before the handshake
   // completed into the real send buffer. push() caps
   // preEstablishedQueue at maxReorderMessagesPerChannel, so starting
@@ -1077,22 +1341,28 @@ void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
   }
   cs.preEstablishedQueue.clear();
 
-  // Wake any stream that deferred a write during handshake. The
-  // drain callback is safe to fire even if nothing was pending; the
-  // stream handler is expected to be a cheap "do I have pending
-  // write? if so retry, else no-op."
-  if (hadPending) {
-    fireSendBufDrained(cs);
+  // Single chokepoint for handler->onEstablished: every path to
+  // ESTABLISHED (fresh peer accept, self-initiated-got-ACCEPT,
+  // simultaneous open, peer restart after reset) flows through here.
+  cs.handlerEstablished = true;
+  if (cs.handler) {
+    cs.handler->onEstablished();
   }
 
-  // Single chokepoint for the Opened event: every path to ESTABLISHED
-  // — fresh peer accept, self-initiated-got-ACCEPT, simultaneous open,
-  // peer restart after reset — comes through here. Fire the global
-  // lifecycle callback so the app can install per-channel hooks,
-  // construct a RudpStream, etc.
-  if (channelOpenedFn_) {
-    channelOpenedFn_(peer, channel_id);
+  // Wake any stream that deferred a write during handshake. The
+  // onWritable callback is safe to fire even if nothing was pending;
+  // the handler is expected to be a cheap "do I have pending write?
+  // if so retry, else no-op." Fired AFTER onEstablished so the
+  // handler's "I'm ready" hook runs first.
+  if (hadPending && cs.handler) {
+    cs.handler->onWritable();
   }
+
+  // Reset the channel's stamped closeReason so a later destruction
+  // doesn't accidentally inherit a stale value.
+  cs.closeReason = CloseReason::APPLICATION;
+  (void)peer;
+  (void)channel_id;
 }
 
 // ===========================================================================
@@ -1111,13 +1381,14 @@ void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
 //   ... opaque unreliable bytes to end of payload ...
 // ===========================================================================
 
-bool Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
+void Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
   // Pre-length-check on the fixed channel header, matching minx.cpp's
   // inbound pattern. 21 = 4 + 8 + 4 + 4 + 1.
   static constexpr size_t CHANNEL_FIXED_HEADER = 4 + 8 + 4 + 4 + 1;
   if (payload.size() < CHANNEL_FIXED_HEADER) {
     LOGDEBUG << "drop: channel packet too short" << VAR(payload.size());
-    return false;
+    reportAbuse(peer, /*channel_id=*/0, AbuseSignal::TRUNCATED_PACKET);
+    return;
   }
   ConstBuffer buf(payload);
   const uint32_t channel_id = buf.get<uint32_t>();
@@ -1128,55 +1399,42 @@ bool Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
 
   ChannelState* cs = findChannel(peer, channel_id);
   if (!cs) {
-    // Unknown channel. Drop — handshake must come first to establish
-    // the session_token. This also defends against state-DoS via
-    // forged channel_ids.
     LOGTRACE << "drop: channel packet for unknown channel" << VAR(channel_id);
-    return false;
+    reportAbuse(peer, channel_id, AbuseSignal::STRAY_CHANNEL_PACKET);
+    return;
   }
   if (cs->handshakeState != HandshakeState::ESTABLISHED) {
     LOGTRACE << "drop: channel packet on un-established channel"
              << VAR(static_cast<int>(cs->handshakeState));
-    return false;
+    reportAbuse(peer, channel_id, AbuseSignal::STRAY_CHANNEL_PACKET);
+    return;
   }
   if (cs->sessionToken != session_token) {
     LOGDEBUG << "drop: session_token mismatch" << VAR(channel_id);
-    return false;
+    reportAbuse(peer, channel_id,
+                AbuseSignal::FORGED_SESSION_TOKEN_CHANNEL);
+    return;
   }
 
   cs->lastActivityUs = currentTimeUs_;
+  // bytesReceived was already charged in onPacket via the pre-CRC
+  // attribution path.
 
-  // Track two independent kinds of novelty:
-  //
-  //   ackedSomething  — the peer's ack info erased at least one entry
-  //                     from our sendBuf. This is the "write-path
-  //                     back-pressure relieved" signal and drives
-  //                     onSendBufDrained.
-  //
-  //   receivedNew     — we buffered a message we hadn't seen before.
-  //                     This is the "receiver has something new to
-  //                     ack" signal; it is NOT back-pressure relief
-  //                     and must NOT wake a pending write.
-  //
-  // The bool return (OR of the two) is legacy: it used to drive a
-  // deadline-halving tweak in onPacket that's since been removed. It
-  // remains in the handler signature for potential future use.
   bool ackedSomething = false;
-  bool receivedNew = false;
 
   // ---- 1) Process the peer's ack info: drop confirmed entries ----
 
-  // Cumulative ack: drop everything in sendBuf with msg_id <= solid_ack.
+  // Cumulative ack.
   for (auto it = cs->sendBuf.begin(); it != cs->sendBuf.end();) {
     if (it->first <= solid_ack) {
       it = cs->sendBuf.erase(it);
       ackedSomething = true;
     } else {
-      break; // map is ordered; once we exceed solid_ack we're done
+      break;
     }
   }
 
-  // SACK porosity: drop entries whose corresponding bit is set.
+  // SACK porosity.
   for (uint32_t i = 0; i < 32; ++i) {
     if ((porosity & (uint32_t{1} << i)) == 0)
       continue;
@@ -1186,14 +1444,14 @@ bool Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
     }
   }
 
-  // Fire the drain callback BEFORE processing incoming messages and
-  // BEFORE returning on any short/truncated path — the moment sendBuf
-  // shrank, the stream's pending write may become unblocked, and we
-  // want it to run before any other logic on this call stack. The
-  // callback is allowed (and expected) to call push() to stuff more
-  // bytes back into sendBuf; that's the whole point.
-  if (ackedSomething) {
-    fireSendBufDrained(*cs);
+  // Fire onWritable BEFORE processing incoming messages and BEFORE any
+  // short-circuit return below — the moment sendBuf shrank, the
+  // stream's pending write may become unblocked, and we want the
+  // handler to see it before any other logic on this call stack.
+  // The handler is allowed (and expected) to push() more bytes back
+  // into sendBuf from this callback; that's the whole point.
+  if (ackedSomething && cs->handler) {
+    cs->handler->onWritable();
   }
 
   // ---- 2) Process incoming reliable messages ----
@@ -1201,62 +1459,52 @@ bool Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
   for (uint8_t m = 0; m < reliable_count; ++m) {
     if (buf.getRemainingBytesCount() < RELIABLE_MESSAGE_OVERHEAD) {
       LOGDEBUG << "drop: truncated reliable msg header";
-      return ackedSomething || receivedNew;
+      return;
     }
     const uint32_t msg_id = buf.get<uint32_t>();
     const uint16_t len = buf.get<uint16_t>();
     if (buf.getRemainingBytesCount() < len) {
       LOGDEBUG << "drop: truncated reliable msg body";
-      return ackedSomething || receivedNew;
+      return;
     }
     Bytes msgBytes = readSliceBytes(buf, len);
 
     if (msg_id <= cs->solidAck) {
-      // Already delivered; this is a retransmit from the peer. Drop.
-      // NOT novel — this msg is already covered by previously-sent acks.
-      continue;
+      continue; // retransmit; already delivered
     }
     if (cs->reorderBuf.find(msg_id) != cs->reorderBuf.end()) {
-      // Already buffered out-of-order. NOT novel — the porosity bit for
-      // this msg is already set in our outbound state, the peer just
-      // hasn't received our ack yet (or is retransmitting because they
-      // didn't see our ack).
-      continue;
+      continue; // already buffered
     }
-    // New message. Buffer it. The reorder buffer cap is enforced after
-    // insertion; if we breach the cap, the channel is reset (DoS defense).
     cs->reorderBytes += msgBytes.size();
     cs->reorderBuf.emplace(msg_id, std::move(msgBytes));
-    receivedNew = true; // we have something new to ack
 
     if (cs->reorderBuf.size() > config_.maxReorderMessagesPerChannel ||
         cs->reorderBytes > config_.maxReorderBytesPerChannel) {
       LOGDEBUG << "reorder cap breach — closing channel" << VAR(channel_id);
+      // Resource attack: peer sent enough out-of-order messages to
+      // overrun our reorder buffer. We're already closing the channel
+      // (state -> CLOSED, GC'd next pulse); also penalize the peer's
+      // IP so a follow-up handshake can't just redo it.
+      reportAbuse(peer, channel_id, AbuseSignal::REORDER_CAP_BREACH);
       cs->handshakeState = HandshakeState::CLOSED;
-      return ackedSomething || receivedNew;
+      cs->closeReason = CloseReason::REORDER_BREACH;
+      return;
     }
   }
 
   // ---- 3) Drain anything contiguous from the reorder buffer ----
+  // Each contiguous message fires handler->onReliableMessage in order.
 
   deliverInOrder(peer, channel_id, *cs);
 
   // ---- 4) Process the unreliable tail ----
-  //
-  // Whatever bytes remain in the payload after the reliable section
-  // are the unreliable blob. No length prefix; "the rest of the packet."
 
   if (buf.getRemainingBytesCount() > 0) {
     Bytes tail = buf.getRemainingBytes<Bytes>();
-    if (receiveFn_) {
-      receiveFn_(peer, channel_id, tail, /*reliable=*/false);
+    if (cs->handler) {
+      cs->handler->onUnreliableMessage(tail);
     }
-    // Receiving unreliable data isn't itself novel for outbound state —
-    // unreliable doesn't get acked, so there's nothing new for us to
-    // tell the peer. Don't flag novelty for unreliable arrivals.
   }
-
-  return ackedSomething || receivedNew;
 }
 
 void Rudp::deliverInOrder(const SockAddr& peer, uint32_t channel_id,
@@ -1270,13 +1518,15 @@ void Rudp::deliverInOrder(const SockAddr& peer, uint32_t channel_id,
     if (it->first != cs.solidAck + 1)
       break;
 
-    if (receiveFn_) {
-      receiveFn_(peer, channel_id, it->second, /*reliable=*/true);
+    if (cs.handler) {
+      cs.handler->onReliableMessage(it->second);
     }
     cs.reorderBytes -= it->second.size();
     cs.solidAck = it->first;
     cs.reorderBuf.erase(it);
   }
+  (void)peer;
+  (void)channel_id;
 }
 
 // ===========================================================================
@@ -1285,9 +1535,6 @@ void Rudp::deliverInOrder(const SockAddr& peer, uint32_t channel_id,
 
 void Rudp::emitHandshake(const SockAddr& peer, uint32_t channel_id,
                          ChannelState& cs, HandshakeKind kind) {
-  if (!sendFn_)
-    return;
-
   // Canonical MINX write pattern: pre-size the destination Bytes to
   // its max capacity (O(1) on static_vector), wrap in a Buffer, write
   // fields via put<>(), then trim to buf.getSize(). No hand-rolled
@@ -1312,7 +1559,8 @@ void Rudp::emitHandshake(const SockAddr& peer, uint32_t channel_id,
   appendCrc32cTrailer(pkt);
   LOGTRACE << "emit handshake" << VAR(channel_id) << VAR(static_cast<int>(kind))
            << VAR(pkt.size());
-  sendFn_(peer, pkt);
+  cs.metrics.bytesSent += pkt.size();
+  listener_->onSend(peer, pkt);
 }
 
 // HS_CLOSE wire layout (after the 8-byte stdext routing key consumed by
@@ -1328,25 +1576,24 @@ void Rudp::emitHandshake(const SockAddr& peer, uint32_t channel_id,
 // it, so an off-path attacker forging a close is blocked by the
 // session_token check on receipt.
 void Rudp::emitHandshakeClose(const SockAddr& peer, uint32_t channel_id,
-                              uint64_t session_token) {
-  if (!sendFn_)
-    return;
+                              ChannelState& cs) {
   Bytes pkt;
   pkt.resize(pkt.max_size());
   Buffer buf(pkt);
   buf.put<uint64_t>(KEY_V0_HANDSHAKE);
   buf.put<uint32_t>(channel_id);
   buf.put<uint8_t>(static_cast<uint8_t>(HS_CLOSE));
-  buf.put<uint64_t>(session_token);
+  buf.put<uint64_t>(cs.sessionToken);
   pkt.resize(buf.getSize());
   appendCrc32cTrailer(pkt);
   LOGTRACE << "emit HS_CLOSE" << VAR(channel_id) << VAR(pkt.size());
-  sendFn_(peer, pkt);
+  cs.metrics.bytesSent += pkt.size();
+  listener_->onSend(peer, pkt);
 }
 
 size_t Rudp::emitChannel(const SockAddr& peer, uint32_t channel_id,
                          ChannelState& cs, size_t maxPackets) {
-  if (!sendFn_ || maxPackets == 0)
+  if (maxPackets == 0)
     return 0;
 
   const uint32_t porosity = computePorosity(cs);
@@ -1434,7 +1681,8 @@ size_t Rudp::emitChannel(const SockAddr& peer, uint32_t channel_id,
 
     LOGTRACE << "emit channel" << VAR(channel_id) << VAR(reliableCount)
              << VAR(pkt.size()) << VAR(packetsEmitted);
-    sendFn_(peer, pkt);
+    cs.metrics.bytesSent += pkt.size();
+    listener_->onSend(peer, pkt);
     ++packetsEmitted;
 
     // Charge the bucket for this packet's bytes. If tokens hit zero,

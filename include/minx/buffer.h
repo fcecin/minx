@@ -149,7 +149,9 @@ public:
   size_t getWritePos() const { return w_; }
 
   void setWritePos(size_t w) {
-    if (w >= buf_.size()) {
+    // Allow w == size: the cursor sits one past the last valid byte
+    // ("buffer full"); subsequent put<> attempts will fail naturally.
+    if (w > buf_.size()) {
       throw std::out_of_range("cannot write past backing buffer size");
     }
     w_ = w;
@@ -158,7 +160,10 @@ public:
   size_t getReadPos() const { return r_; }
 
   void setReadPos(size_t r) {
-    if (r >= buf_.size()) {
+    // Allow r == size: the cursor sits one past the last byte
+    // ("buffer drained"); getRemainingBytesCount() correctly reports
+    // 0 from there.
+    if (r > buf_.size()) {
       throw std::out_of_range("cannot read past backing buffer size");
     }
     r_ = r;

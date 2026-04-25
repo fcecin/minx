@@ -7,50 +7,44 @@ LOG_MODULE_DISABLED("rudp_stream")
 
 namespace minx {
 
-RudpStream::RudpStream(Rudp& rudp, SockAddr peer, uint32_t channel_id,
-                       executor_type ex)
-    : rudp_(rudp), peer_(std::move(peer)), channel_id_(channel_id),
-      ex_(std::move(ex)) {
-  LOGTRACE << "RudpStream" << VAR(channel_id_);
-
-  // Register the write-path back-pressure callbacks on the underlying
-  // Rudp channel. Capturing `this` is safe as long as the destructor
-  // unregisters before the stream's lifetime ends, which close()
-  // (called unconditionally from ~RudpStream) handles.
-  rudp_.setSendBufDrainedCallback(peer_, channel_id_,
-                                  [this]() { onChannelDrained(); });
-  rudp_.setChannelDestroyedCallback(peer_, channel_id_,
-                                    [this]() { onChannelDestroyed(); });
+RudpStream::RudpStream(executor_type ex) : ex_(std::move(ex)) {
+  LOGTRACE << "RudpStream";
 }
 
 RudpStream::~RudpStream() {
-  LOGTRACE << "~RudpStream" << VAR(channel_id_);
-  // Best-effort cleanup: complete any pending reader with eof so its
-  // captured handler isn't leaked. close() is idempotent so this is
-  // safe even after explicit close().
-  close();
+  LOGTRACE << "~RudpStream";
+  // Best-effort: detach (NOT close — at destruction time we don't
+  // want to inadvertently send an HS_CLOSE if something unexpected
+  // is happening). Idempotent if already closed.
+  detach();
 }
 
 // ---------------------------------------------------------------------------
-// Application integration
+// Rudp::ChannelHandler overrides
 // ---------------------------------------------------------------------------
 
-void RudpStream::feed(const Bytes& bytes) {
+void RudpStream::onOpened() {
+  // The handler is now wired into Rudp; rudp() / peer() / channelId()
+  // are valid. Nothing to do at this layer; subclasses or the
+  // application can override and chain if they need a "channel
+  // exists" hook before ESTABLISHED.
+  LOGTRACE << "onOpened" << VAR(channelId());
+}
+
+void RudpStream::onReliableMessage(const Bytes& msg) {
   if (closed_) {
-    LOGTRACE << "feed dropped: closed" << VAR(bytes.size());
+    LOGTRACE << "onReliableMessage dropped: closed" << VAR(msg.size());
     return;
   }
-  if (bytes.empty())
+  if (msg.empty())
     return;
 
-  // Append to the inbound byte buffer. Bytes is a static_vector<char,...>;
-  // we treat them as uint8_t for the deque<uint8_t> destination.
-  for (auto b : bytes) {
+  for (auto b : msg) {
     inboundBuf_.push_back(static_cast<uint8_t>(b));
   }
-  LOGTRACE << "feed appended" << VAR(bytes.size()) << VAR(inboundBuf_.size());
+  LOGTRACE << "onReliableMessage appended" << VAR(msg.size())
+           << VAR(inboundBuf_.size());
 
-  // If a reader was waiting on bytes, fire it now.
   if (pendingReader_) {
     auto reader = std::move(pendingReader_);
     pendingReader_ = nullptr;
@@ -58,23 +52,80 @@ void RudpStream::feed(const Bytes& bytes) {
   }
 }
 
+void RudpStream::onUnreliableMessage(const Bytes& msg) {
+  // Unreliable bytes never enter the byte stream's read path.
+  // Application decides policy via the optional UnreliableSink.
+  if (closed_)
+    return;
+  if (unreliableSink_) {
+    unreliableSink_(msg);
+  }
+}
+
+void RudpStream::onWritable() {
+  if (closed_)
+    return;
+  drainPendingWrite();
+}
+
+void RudpStream::onClosed(Rudp::CloseReason reason) {
+  if (closed_)
+    return;
+  LOGTRACE << "onClosed" << VAR(channelId()) << VAR(reason);
+  closed_ = true;
+  closeReason_ = reason;
+
+  const auto ec = closeReasonToError(reason);
+
+  if (pendingReader_) {
+    auto r = std::move(pendingReader_);
+    pendingReader_ = nullptr;
+    r(ec);
+  }
+
+  if (pendingWriteHandler_) {
+    auto h = std::move(pendingWriteHandler_);
+    pendingWriteHandler_ = nullptr;
+    const std::size_t pushed = pendingWriteOffset_;
+    pendingWriteBuf_.clear();
+    pendingWriteOffset_ = 0;
+    boost::asio::post(ex_, [h = std::move(h), ec, pushed]() mutable {
+      h(ec, pushed);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Application controls
+// ---------------------------------------------------------------------------
+
+void RudpStream::setUnreliableSink(UnreliableSink sink) {
+  unreliableSink_ = std::move(sink);
+}
+
 void RudpStream::close() {
+  doClose(/*tearDownChannel=*/true);
+}
+
+void RudpStream::detach() {
+  doClose(/*tearDownChannel=*/false);
+}
+
+void RudpStream::doClose(bool tearDownChannel) {
   if (closed_)
     return;
   closed_ = true;
-  LOGTRACE << "close" << VAR(channel_id_);
+  // closeReason_ stays nullopt: app-driven teardown has no "reason"
+  // beyond the call itself. (Compare onClosed() which populates from
+  // the channel's actual end cause.)
+  LOGTRACE << "doClose" << VAR(channelId()) << VAR(tearDownChannel);
 
-  // Complete any pending reader with eof (explicit user close).
   if (pendingReader_) {
     auto reader = std::move(pendingReader_);
     pendingReader_ = nullptr;
     reader(boost::asio::error::eof);
   }
 
-  // Complete any pending deferred-write handler with eof, returning
-  // however many bytes already made it into RUDP's sendBuf before
-  // the stream was closed. From Beast's perspective this is the
-  // standard "stream went away mid-write" completion.
   if (pendingWriteHandler_) {
     auto h = std::move(pendingWriteHandler_);
     pendingWriteHandler_ = nullptr;
@@ -86,15 +137,13 @@ void RudpStream::close() {
     });
   }
 
-  // Unregister our callbacks from the Rudp channel so that any later
-  // drain or destroy event can't fire into a dead stream. Clearing
-  // on a non-existent channel is a no-op inside Rudp.
-  rudp_.setSendBufDrainedCallback(peer_, channel_id_, nullptr);
-  rudp_.setChannelDestroyedCallback(peer_, channel_id_, nullptr);
+  if (tearDownChannel && rudp()) {
+    rudp()->closeChannel(peer(), channelId(), Rudp::CloseReason::APPLICATION);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Byte-pump helpers used by the templated startRead / startWrite paths
+// Byte-pump helpers
 // ---------------------------------------------------------------------------
 
 std::size_t RudpStream::drainBytes(uint8_t* dst, std::size_t maxBytes) {
@@ -109,7 +158,7 @@ std::size_t RudpStream::drainBytes(uint8_t* dst, std::size_t maxBytes) {
 
 void RudpStream::drainPendingWrite() {
   if (!pendingWriteHandler_)
-    return; // nothing deferred
+    return;
 
   const std::size_t total = pendingWriteBuf_.size();
   const uint8_t* src = pendingWriteBuf_.data();
@@ -119,26 +168,18 @@ void RudpStream::drainPendingWrite() {
     const std::size_t take =
       std::min(static_cast<std::size_t>(Rudp::MAX_MESSAGE_SIZE), remaining);
 
-    // Build a Bytes for this chunk. Bytes is a static_vector<char,...>
-    // so we copy through the (signed) char interface.
     Bytes chunk;
     chunk.resize(take);
     std::memcpy(chunk.data(), src + pendingWriteOffset_, take);
 
-    if (!rudp_.push(peer_, channel_id_, chunk, /*reliable=*/true)) {
-      // RUDP is back-pressured (sendBuf cap or preEstablishedQueue
-      // cap). Leave the pending state in place; onChannelDrained()
-      // will resume this loop when an ack shrinks sendBuf or a
-      // handshake completes.
+    if (!rudp() ||
+        !rudp()->push(peer(), channelId(), chunk, /*reliable=*/true)) {
       LOGTRACE << "write deferred" << VAR(pendingWriteOffset_) << VAR(total);
       return;
     }
     pendingWriteOffset_ += take;
   }
 
-  // All bytes pushed. Snapshot, clear state, post completion so
-  // Beast's write_some loop can re-enter with the next chunk (or
-  // fire its outer completion).
   const std::size_t bytesWritten = total;
   auto h = std::move(pendingWriteHandler_);
   pendingWriteHandler_ = nullptr;
@@ -149,54 +190,38 @@ void RudpStream::drainPendingWrite() {
   });
 }
 
-void RudpStream::onChannelDrained() {
-  // Called synchronously from Rudp::handleChannelPacket (or
-  // promoteToEstablished) when sendBuf has room again. Try to push
-  // whatever is still pending. Cheap no-op if nothing is deferred.
-  drainPendingWrite();
+// ---------------------------------------------------------------------------
+// CloseReason → error_code mapping
+// ---------------------------------------------------------------------------
+
+boost::system::error_code
+RudpStream::closeReasonToError(Rudp::CloseReason reason) {
+  switch (reason) {
+  case Rudp::CloseReason::PEER_CLOSED:
+    // Clean remote disconnect; classic eof for the Beast/Asio user.
+    return boost::asio::error::eof;
+  case Rudp::CloseReason::APPLICATION:
+  case Rudp::CloseReason::IDLE:
+  case Rudp::CloseReason::HANDSHAKE_FAILED:
+  case Rudp::CloseReason::REORDER_BREACH:
+  case Rudp::CloseReason::PEER_RESTART:
+    // Transport pulled out from under the stream. operation_aborted
+    // matches Asio's "the operation was cancelled out from under
+    // you." Application can call getCloseReason() for the cause.
+    return boost::asio::error::operation_aborted;
+  }
+  return boost::asio::error::operation_aborted;
 }
 
-void RudpStream::onChannelDestroyed() {
-  // The underlying channel is about to be erased from Rudp's maps.
-  // Mark ourselves closed and abort any pending handlers with
-  // operation_aborted (as opposed to eof, which is the user-close
-  // semantic). After this point the stream is permanently dead;
-  // the application should construct a fresh RudpStream if it
-  // wants to continue on the same (peer, channel_id) tuple.
-  LOGTRACE << "onChannelDestroyed" << VAR(channel_id_);
-  closed_ = true;
+// ---------------------------------------------------------------------------
+// Completion-posting helpers
+// ---------------------------------------------------------------------------
 
-  if (pendingReader_) {
-    auto r = std::move(pendingReader_);
-    pendingReader_ = nullptr;
-    r(boost::asio::error::operation_aborted);
-  }
-
-  if (pendingWriteHandler_) {
-    auto h = std::move(pendingWriteHandler_);
-    pendingWriteHandler_ = nullptr;
-    const std::size_t pushed = pendingWriteOffset_;
-    pendingWriteBuf_.clear();
-    pendingWriteOffset_ = 0;
-    boost::asio::post(ex_, [h = std::move(h), pushed]() mutable {
-      h(boost::asio::error::operation_aborted, pushed);
-    });
-  }
-
-  // Do NOT call setXxxCallback(nullptr) here — Rudp has already
-  // moved-out our callback by the time fireChannelDestroyed invoked
-  // us, and is about to erase the ChannelState entirely.
-}
-
-void RudpStream::postError(
-  std::function<void(boost::system::error_code, std::size_t)> h,
-  boost::system::error_code ec) {
+void RudpStream::postError(ErasedHandler h, boost::system::error_code ec) {
   boost::asio::post(ex_, [h = std::move(h), ec]() mutable { h(ec, 0); });
 }
 
-void RudpStream::postRead(
-  std::function<void(boost::system::error_code, std::size_t)> h,
-  std::size_t copied) {
+void RudpStream::postRead(ErasedHandler h, std::size_t copied) {
   boost::asio::post(ex_, [h = std::move(h), copied]() mutable {
     h(boost::system::error_code{}, copied);
   });
