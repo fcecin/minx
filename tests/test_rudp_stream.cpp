@@ -1031,4 +1031,188 @@ BOOST_AUTO_TEST_CASE(TestRudpStreamGetCloseReasonOnIdleGc) {
              static_cast<int>(Rudp::CloseReason::IDLE));
 }
 
+// ---------------------------------------------------------------------------
+// shutdown() — graceful close with SO_LINGER-style timeout.
+//
+//   18. shutdown() on a quiet stream: no in-flight write → defers
+//       close to Rudp's drain check; channel survives until the next
+//       pulse drains sendBuf, then HS_CLOSE goes out.
+//   19. shutdown() while a write is in flight: the in-flight
+//       async_write_some completes successfully (all bytes pushed
+//       into sendBuf), THEN the deferred close fires.
+//   20. async_write_some after shutdown() returns eof.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpStreamShutdownDefersCloseUntilDrain) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xA1FCE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBFB;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11240), bA = makeAddr(11241);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+  wire.bindStreams(aliceStream, bobStream, 1);
+
+  uint64_t now = 1000;
+  establish(io, alice, bob, wire, now, aA, 1);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  BOOST_REQUIRE(bob.isEstablished(aA, 1));
+
+  // No write in flight: shutdown() registers the deferred close
+  // immediately. Channel still exists until the next pulse.
+  aliceStream->shutdown(std::chrono::seconds(1));
+  BOOST_TEST(alice.isEstablished(bA, 1));
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+
+  // Pulse: drain check fires (sendBuf empty), HS_CLOSE goes out.
+  alice.tick(now);
+  BOOST_TEST(!alice.isEstablished(bA, 1));
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+
+  // Bob sees the HS_CLOSE and tears down.
+  step(io, alice, bob, wire, now);
+  BOOST_TEST(!bob.isEstablished(aA, 1));
+  BOOST_TEST(!bobStream->is_open());
+  BOOST_REQUIRE(bobStream->getCloseReason().has_value());
+  BOOST_TEST(static_cast<int>(*bobStream->getCloseReason()) ==
+             static_cast<int>(Rudp::CloseReason::PEER_CLOSED));
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpStreamShutdownLetsInFlightWriteFinish) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.maxReorderMessagesPerChannel = 4;
+  cfg.rngSeed = 0xA20CE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC0B;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11250), bA = makeAddr(11251);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+  wire.bindStreams(aliceStream, bobStream, 1);
+
+  uint64_t now = 1000;
+  establish(io, alice, bob, wire, now, aA, 1);
+
+  // Park a multi-fragment write that will need more than one push()
+  // round to fully drain into sendBuf — bigger than the per-channel
+  // reorder cap (4 messages * MAX_MESSAGE_SIZE) ensures back-pressure.
+  const std::size_t N = 8 * Rudp::MAX_MESSAGE_SIZE;
+  std::vector<uint8_t> payload(N, 0xAB);
+  boost::system::error_code writeEc;
+  std::size_t writeN = 0;
+  bool writeDone = false;
+  aliceStream->async_write_some(
+    boost::asio::buffer(payload),
+    [&](boost::system::error_code ec, std::size_t n) {
+      writeEc = ec;
+      writeN = n;
+      writeDone = true;
+    });
+  drainAsio(io);
+  // The write should be still in flight (capped at 4 messages, needs
+  // more onWritable cycles to push the rest).
+  BOOST_REQUIRE(!writeDone);
+
+  // Shutdown WHILE the write is in flight. The drainPendingWrite tail
+  // is what schedules the deferred closeChannel — until pendingWriteHandler_
+  // fires, no closeChannel is registered. So this is the path we
+  // care about.
+  aliceStream->shutdown(std::chrono::seconds(5));
+
+  // Drive the protocol forward: bob reads (consuming inboundBuf),
+  // ACKs return to alice, drainPendingWrite resumes via onWritable,
+  // eventually pushes everything into sendBuf, fires the write
+  // completion, the deferred closeChannel registers, and the next
+  // pulse's drain check fires HS_CLOSE.
+  std::array<uint8_t, 64 * 1024> rbuf{};
+  std::function<void()> postRead = [&]() {
+    bobStream->async_read_some(
+      boost::asio::buffer(rbuf),
+      [&](boost::system::error_code ec, std::size_t) {
+        if (ec) return;
+        postRead();
+      });
+  };
+  postRead();
+
+  for (int i = 0; i < 100 && (alice.channelCount(bA) > 0); ++i) {
+    step(io, alice, bob, wire, now);
+    now += 1000;
+  }
+
+  // Write completion fired with success and the full payload — the
+  // in-flight write was NOT aborted by shutdown.
+  BOOST_REQUIRE(writeDone);
+  BOOST_TEST(!writeEc);
+  BOOST_TEST(writeN == N);
+
+  // Channel torn down on both sides via graceful close, not RST or
+  // idle GC. (The fact that it tore down at all confirms the deferred
+  // close fired after the write drained.)
+  BOOST_TEST(!alice.isEstablished(bA, 1));
+  BOOST_TEST(!bob.isEstablished(aA, 1));
+  BOOST_REQUIRE(bobStream->getCloseReason().has_value());
+  BOOST_TEST(static_cast<int>(*bobStream->getCloseReason()) ==
+             static_cast<int>(Rudp::CloseReason::PEER_CLOSED));
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpStreamWriteAfterShutdownReturnsEof) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xA21CE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC1B;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11260), bA = makeAddr(11261);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+  wire.bindStreams(aliceStream, bobStream, 1);
+
+  uint64_t now = 1000;
+  establish(io, alice, bob, wire, now, aA, 1);
+
+  aliceStream->shutdown(std::chrono::seconds(1));
+
+  // New writes after shutdown immediately fail with eof — the stream
+  // is still open per is_open() (it's not torn down yet), but writes
+  // are gated.
+  std::vector<uint8_t> payload(8, 0xCC);
+  boost::system::error_code writeEc;
+  std::size_t writeN = 1234;
+  bool writeDone = false;
+  aliceStream->async_write_some(
+    boost::asio::buffer(payload),
+    [&](boost::system::error_code ec, std::size_t n) {
+      writeEc = ec;
+      writeN = n;
+      writeDone = true;
+    });
+  drainAsio(io);
+
+  BOOST_REQUIRE(writeDone);
+  BOOST_TEST(writeEc == boost::asio::error::eof);
+  BOOST_TEST(writeN == 0u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

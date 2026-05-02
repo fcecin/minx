@@ -496,16 +496,32 @@ public:
   /// a steady_timer.
   uint64_t nextDeadlineUs() const noexcept { return nextDeadlineUs_; }
 
-  /// Drop a single channel immediately. Whatever state it was in,
-  /// after this call the (peer, channel_id) tuple is gone from the
-  /// internal maps and any future packets arriving for it are dropped
-  /// as "unknown channel." If the channel was ESTABLISHED, a single
-  /// HS_CLOSE packet is emitted to the peer (fire-and-forget) so the
-  /// peer's side tears down synchronously rather than waiting for its
-  /// own idle-GC. The reason is forwarded to Listener::onClosed.
-  /// No-op if the channel doesn't exist.
+  /// Drop a channel.
+  ///
+  /// `timeout == 0` (default): immediate teardown. The (peer,
+  /// channel_id) tuple is erased synchronously; if the channel was
+  /// ESTABLISHED, a single HS_CLOSE packet is emitted to the peer
+  /// (fire-and-forget) so the peer's side tears down synchronously
+  /// rather than waiting for its own idle-GC. Pending bytes in
+  /// `sendBuf` are dropped — RST-equivalent. The reason is forwarded
+  /// to Listener::onClosed. No-op if the channel doesn't exist.
+  ///
+  /// `timeout > 0`: graceful close. Marks the channel for "drain
+  /// then close": the channel keeps pulsing normally until
+  /// `sendBuf` empties (all reliable bytes ACK'd), at which point
+  /// HS_CLOSE is emitted and the channel is destroyed. If the
+  /// timeout elapses with bytes still pending, falls back to
+  /// immediate teardown. The application is expected to stop
+  /// calling push() on this channel after closeChannel returns —
+  /// gating new writes is the application's responsibility (see
+  /// RudpStream's `closed_` flag for the pattern). Same SO_LINGER
+  /// shape: timeout=0 is RST, timeout>0 is a deadlined graceful
+  /// close. Only meaningful for ESTABLISHED channels; for any
+  /// other state, falls through to the immediate path.
   void closeChannel(const SockAddr& peer, uint32_t channel_id,
-                    CloseReason reason = CloseReason::APPLICATION);
+                    CloseReason reason = CloseReason::APPLICATION,
+                    std::chrono::microseconds timeout =
+                      std::chrono::microseconds(0));
 
   /// Evict every channel whose last activity is older than
   /// `idleThreshold` relative to RUDP's current internal time.
@@ -605,6 +621,16 @@ private:
     // breach), so the doPulseWork drop loop can pass it to
     // destroyChannel without losing the cause.
     CloseReason closeReason = CloseReason::APPLICATION;
+
+    // Graceful "drain then close" state, set by closeChannel(...,
+    // timeout>0). Pulse loop watches sendBuf: when it empties (or
+    // when closeOnDrainDeadlineUs elapses, whichever comes first),
+    // emits a single HS_CLOSE and tears down. Until then the
+    // channel keeps pulsing normally — retransmits in flight,
+    // ACKs in, no new push() calls expected from the application.
+    bool closeOnDrain = false;
+    CloseReason closeOnDrainReason = CloseReason::APPLICATION;
+    uint64_t closeOnDrainDeadlineUs = 0;
   };
 
   struct PeerState {

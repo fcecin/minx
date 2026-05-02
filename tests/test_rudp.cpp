@@ -3653,4 +3653,239 @@ BOOST_AUTO_TEST_CASE(TestRudpAbuseSignalNoFalsePositives) {
   BOOST_TEST(bobL.abuses.size() == 0u);
 }
 
+// ---------------------------------------------------------------------------
+// closeChannel(timeout > 0) — graceful "drain then close".
+//
+// Five scenarios cover the full SO_LINGER-shaped surface:
+//
+//   A. fully-drained channel: close fires HS_CLOSE on next pulse.
+//   B. unACK'd bytes: close defers; pulse fires HS_CLOSE the moment
+//      the last entry leaves sendBuf (peer ACKs).
+//   C. timeout fallback: peer never ACKs; deadline elapses; HS_CLOSE
+//      goes out anyway and the channel is destroyed (RST behavior).
+//   D. non-ESTABLISHED channel: timeout > 0 has no meaning; falls
+//      through to immediate teardown.
+//   E. second close call escalates to RST: closeChannel(timeout=0)
+//      after closeChannel(timeout>0) wins, channel goes away now.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseChannelOnDrainImmediateWhenEmpty) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xD7A1A;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xD7B1B;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(9940), bA = makeAddr(9941);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // Establish + push a single message + drain everything (sendBuf
+  // empty by the time we close).
+  uint64_t now = 1000;
+  aliceL.push(alice, bA, 1, B("hi"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  // Drive a second round so bob's ACK comes back to alice.
+  alice.tick(now);
+  bob.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  BOOST_REQUIRE(bob.isEstablished(aA, 1));
+
+  // Drained graceful close: timeout > 0 on a drained channel.
+  alice.closeChannel(bA, 1, Rudp::CloseReason::APPLICATION,
+                     std::chrono::seconds(1));
+  // Channel is NOT destroyed synchronously: the pulse runs the drain
+  // check.
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+  BOOST_TEST(wire.pending() == 0u);
+
+  // Pulse: drain check sees empty sendBuf, fires HS_CLOSE, destroys.
+  alice.tick(now);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_TEST(!alice.isEstablished(bA, 1));
+  BOOST_TEST(wire.pending() == 1u);
+
+  // Deliver HS_CLOSE → bob's side tears down.
+  wire.deliverAll(now);
+  BOOST_TEST(!bob.isEstablished(aA, 1));
+  BOOST_TEST(bob.channelCount(aA) == 0u);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseChannelOnDrainWaitsForPendingBytes) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xD7A2A;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xD7B2B;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(9942), bA = makeAddr(9943);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // Establish channel without leaving anything in alice's sendBuf.
+  uint64_t now = 1000;
+  aliceL.push(alice, bA, 1, B("setup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  alice.tick(now);
+  bob.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  BOOST_REQUIRE(bob.isEstablished(aA, 1));
+
+  // Now push a fresh message but don't deliver it yet — sendBuf has
+  // an unACK'd entry on alice's side.
+  aliceL.push(alice, bA, 1, B("late"), true);
+  alice.tick(now);
+
+  // Graceful close while sendBuf is non-empty.
+  alice.closeChannel(bA, 1, Rudp::CloseReason::APPLICATION,
+                     std::chrono::seconds(1));
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+
+  // Pulse alice again: sendBuf still has bytes (the retransmit of
+  // "late" is fine — drain check waits for the entry to clear).
+  alice.tick(now);
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+
+  // Deliver to bob; bob ACKs back; alice processes ACK on the pulse
+  // fired inline by onPacket (baseTickInterval=0). The drain check
+  // sees the now-empty sendBuf and fires HS_CLOSE.
+  wire.deliverAll(now);
+  BOOST_REQUIRE(!bobL.received.empty());
+
+  // Drive one more round: alice receives ACK → drain check fires.
+  alice.tick(now);
+  bob.tick(now);
+  wire.deliverAll(now);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_TEST(!bob.isEstablished(aA, 1));
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseChannelOnDrainTimeoutFallback) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xD7A3A;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xD7B3B;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(9944), bA = makeAddr(9945);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // Establish.
+  uint64_t now = 1000;
+  aliceL.push(alice, bA, 1, B("setup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  alice.tick(now);
+  bob.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+
+  // Push something, then drop the wire on the floor (peer
+  // disappeared) → sendBuf stays full.
+  aliceL.push(alice, bA, 1, B("oblivion"), true);
+  alice.tick(now);
+  wire.clearQueue(); // simulate "bob is gone"
+
+  // Graceful close with a tight 1ms deadline.
+  alice.closeChannel(bA, 1, Rudp::CloseReason::APPLICATION,
+                     std::chrono::microseconds(1000));
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+
+  // Pulse before deadline: still alive (sendBuf non-empty).
+  now += 500;
+  alice.tick(now);
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+
+  // Pulse after deadline: drain check sees timeout, fires HS_CLOSE,
+  // destroys despite pending bytes.
+  now += 1500; // total +2000us, well past the 1ms deadline.
+  alice.tick(now);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_TEST(!alice.isEstablished(bA, 1));
+  // HS_CLOSE was emitted (RST-style cleanup signal still goes out).
+  BOOST_TEST(wire.pending() >= 1u);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseChannelOnDrainNonEstablishedFallsThrough) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xD7A4A;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xD7B4B;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(9946), bA = makeAddr(9947);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  // Register a channel but DON'T complete the handshake — kick off
+  // OPEN_SENT and keep it there.
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.registerChannel(alice, bA, 5));
+  aliceL.push(alice, bA, 5, B("knock"), true);
+  alice.tick(now);
+  // Don't deliver → bob never ACCEPTs → alice stays in OPEN_SENT.
+  BOOST_REQUIRE(!alice.isEstablished(bA, 5));
+  BOOST_REQUIRE_EQUAL(alice.channelCount(bA), 1u);
+
+  // Graceful close on non-ESTABLISHED → falls through to immediate.
+  alice.closeChannel(bA, 5, Rudp::CloseReason::APPLICATION,
+                     std::chrono::seconds(1));
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_TEST(!alice.isEstablished(bA, 5));
+  // No HS_CLOSE on the wire (we weren't ESTABLISHED, no session
+  // token to authenticate one), but channel state is gone.
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpCloseChannelOnDrainSecondCallEscalates) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xD7A5A;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xD7B5B;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(9948), bA = makeAddr(9949);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  aliceL.push(alice, bA, 1, B("setup"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  alice.tick(now);
+  bob.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+
+  // Stash some bytes so sendBuf is non-empty.
+  aliceL.push(alice, bA, 1, B("payload"), true);
+  alice.tick(now);
+  wire.clearQueue();
+
+  // First close: graceful.
+  alice.closeChannel(bA, 1, Rudp::CloseReason::APPLICATION,
+                     std::chrono::seconds(1));
+  BOOST_TEST(alice.channelCount(bA) == 1u);
+
+  // Second close with timeout=0 escalates to RST — channel gone NOW.
+  alice.closeChannel(bA, 1, Rudp::CloseReason::APPLICATION,
+                     std::chrono::microseconds(0));
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+  BOOST_TEST(!alice.isEstablished(bA, 1));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

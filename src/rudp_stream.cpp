@@ -107,6 +107,21 @@ void RudpStream::close() {
   doClose(/*tearDownChannel=*/true);
 }
 
+void RudpStream::shutdown(std::chrono::microseconds timeout) {
+  if (closed_ || shutdownPending_) return;
+  shutdownPending_ = true;
+  shutdownTimeout_ = timeout;
+  LOGTRACE << "shutdown" << VAR(channelId()) << VAR(timeout.count());
+  // If no write is in flight, schedule the deferred close right now.
+  // Otherwise drainPendingWrite's post-completion tail will schedule
+  // it once the in-flight bytes have all been pushed into sendBuf.
+  if (!pendingWriteHandler_ && rudp()) {
+    rudp()->closeChannel(peer(), channelId(),
+                          Rudp::CloseReason::APPLICATION,
+                          shutdownTimeout_);
+  }
+}
+
 void RudpStream::detach() {
   doClose(/*tearDownChannel=*/false);
 }
@@ -188,6 +203,16 @@ void RudpStream::drainPendingWrite() {
   boost::asio::post(ex_, [h = std::move(h), bytesWritten]() mutable {
     h(boost::system::error_code{}, bytesWritten);
   });
+
+  // If shutdown() was called while this write was in flight, all the
+  // application bytes are now in Rudp's sendBuf. Schedule the
+  // deferred close: Rudp will fire HS_CLOSE once sendBuf empties (or
+  // shutdownTimeout_ elapses, whichever comes first).
+  if (shutdownPending_ && !closed_ && rudp()) {
+    rudp()->closeChannel(peer(), channelId(),
+                          Rudp::CloseReason::APPLICATION,
+                          shutdownTimeout_);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -548,7 +548,8 @@ std::ostream& operator<<(std::ostream& os, Rudp::AbuseSignal s) {
 // ===========================================================================
 
 void Rudp::closeChannel(const SockAddr& peer, uint32_t channel_id,
-                        CloseReason reason) {
+                        CloseReason reason,
+                        std::chrono::microseconds timeout) {
   auto pit = peers_.find(peer);
   if (pit == peers_.end())
     return;
@@ -556,18 +557,40 @@ void Rudp::closeChannel(const SockAddr& peer, uint32_t channel_id,
   auto cit = peerState.channels.find(channel_id);
   if (cit == peerState.channels.end())
     return;
+  ChannelState& cs = cit->second;
+
+  // Graceful "drain then close" path: timeout > 0 and channel is
+  // ESTABLISHED. Mark the channel so the pulse loop fires HS_CLOSE
+  // when sendBuf empties (or the deadline elapses, whichever comes
+  // first). For non-ESTABLISHED channels, graceful is meaningless
+  // (no session token, no reliable byte stream to drain) — fall
+  // through to immediate teardown. A second closeChannel call on
+  // an already-marked channel escalates to immediate (RST).
+  if (timeout.count() > 0 &&
+      cs.handshakeState == HandshakeState::ESTABLISHED &&
+      !cs.closeOnDrain) {
+    cs.closeOnDrain = true;
+    cs.closeOnDrainReason = reason;
+    cs.closeOnDrainDeadlineUs = currentTimeUs_ +
+      static_cast<uint64_t>(timeout.count());
+    LOGTRACE << "closeChannel deferred (drain then close)"
+             << SVAR(peer) << VAR(channel_id) << VAR(reason)
+             << VAR(timeout.count());
+    return;
+  }
+
   LOGTRACE << "closeChannel" << SVAR(peer) << VAR(channel_id) << VAR(reason);
   // Best-effort teardown hint to the peer. Only meaningful once both
   // sides agree on a session_token — emit for ESTABLISHED only. Other
   // states have no mutually-known token, so silently drop as before
   // (the peer's handshake retry / idle-GC will notice on its own).
-  if (cit->second.handshakeState == HandshakeState::ESTABLISHED) {
-    emitHandshakeClose(peer, channel_id, cit->second); // charges bytesSent internally
+  if (cs.handshakeState == HandshakeState::ESTABLISHED) {
+    emitHandshakeClose(peer, channel_id, cs); // charges bytesSent internally
   }
   // Centralized teardown: final integral update + Listener::onClosed,
   // done before erase so the listener can call metricsFor() to read
   // final values. The reason is forwarded to the listener.
-  destroyChannel(peer, channel_id, cit->second, reason);
+  destroyChannel(peer, channel_id, cs, reason);
   peerState.channels.erase(cit);
   if (peerState.channels.empty()) {
     peers_.erase(pit);
@@ -907,6 +930,27 @@ void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
       // exhaustion above) is already in dropReason.
       if (cs.handshakeState == HandshakeState::CLOSED) {
         drop = true;
+      }
+
+      // closeChannel(timeout > 0) deferred close. Fire HS_CLOSE the
+      // moment sendBuf empties (graceful) OR when the deadline
+      // elapses (RST fallback). pendingUnreliable is also drained
+      // — unreliable bytes don't retransmit but we want them to
+      // have at least one shot on the wire before we tear down.
+      if (!drop && cs.closeOnDrain) {
+        const bool drained =
+          cs.sendBuf.empty() && cs.pendingUnreliable.empty();
+        const bool timedOut = (now_us >= cs.closeOnDrainDeadlineUs);
+        if (drained || timedOut) {
+          if (cs.handshakeState == HandshakeState::ESTABLISHED) {
+            emitHandshakeClose(pit->first, cit->first, cs);
+          }
+          drop = true;
+          dropReason = cs.closeOnDrainReason;
+          LOGTRACE << "closeOnDrain fired"
+                   << SVAR(pit->first) << VAR(cit->first)
+                   << VAR(drained) << VAR(timedOut);
+        }
       }
 
       if (drop) {

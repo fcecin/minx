@@ -40,6 +40,15 @@
  * completes pending handlers with eof, AND tears down the underlying
  * RUDP channel via rudp()->closeChannel(...). 99% default intent.
  *
+ * shutdown(timeout) — graceful close. Stops accepting new writes
+ * (subsequent async_write_some returns eof). Allows any in-flight
+ * write to drain into Rudp's sendBuf, then asks Rudp to fire
+ * HS_CLOSE only after sendBuf empties (or `timeout` elapses,
+ * whichever comes first). Use when the application wants the peer
+ * to see EOF after its final bytes — equivalent to TCP's default
+ * close-with-FIN, with `timeout` playing the SO_LINGER role.
+ * Pending reads remain valid until onClosed actually fires.
+ *
  * detach() — close the stream but leave the underlying RUDP channel
  * alive. Same handler-completion semantics. Rare.
  *
@@ -116,6 +125,17 @@ public:
   /// rudp()->closeChannel(peer(), channelId(), APPLICATION). Pending
   /// handlers complete with eof. Idempotent.
   void close();
+
+  /// Graceful close: stop accepting new writes, let any in-flight
+  /// async_write_some drain into Rudp's sendBuf, and ask Rudp to
+  /// fire HS_CLOSE only after sendBuf empties — or after `timeout`
+  /// elapses, whichever comes first (then it falls back to RST).
+  /// New async_write_some calls after shutdown() return
+  /// boost::asio::error::eof. Pending reads stay live until Rudp
+  /// fires onClosed. Idempotent. Use when "the peer should see
+  /// EOF *after* my final bytes" matters; for fire-and-forget
+  /// teardown, use close() instead.
+  void shutdown(std::chrono::microseconds timeout);
 
   /// Close the stream WITHOUT tearing down the underlying RUDP
   /// channel. Same handler-completion semantics as close(). Rare;
@@ -227,7 +247,7 @@ private:
   void startWrite(const ConstBufferSequence& buffers, Handler&& handler) {
     auto erased = eraseHandler(std::forward<Handler>(handler));
 
-    if (closed_) {
+    if (closed_ || shutdownPending_) {
       postError(std::move(erased),
                 closeReason_ ? closeReasonToError(*closeReason_)
                              : boost::asio::error::eof);
@@ -264,6 +284,16 @@ private:
   UnreliableSink unreliableSink_;
   std::optional<Rudp::CloseReason> closeReason_;
   bool closed_ = false;
+
+  // shutdown() state. shutdownPending_ is set the moment shutdown()
+  // is called; new async_write_some calls then return eof. If
+  // pendingWriteHandler_ is non-null at that time, drainPendingWrite
+  // is allowed to finish pushing into Rudp's sendBuf and *then*
+  // schedules the deferred close via rudp()->closeChannel(...,
+  // shutdownTimeout_). If no write is in flight, the deferred close
+  // is scheduled immediately by shutdown() itself.
+  bool shutdownPending_ = false;
+  std::chrono::microseconds shutdownTimeout_{0};
 };
 
 } // namespace minx
