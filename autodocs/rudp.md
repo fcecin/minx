@@ -1,7 +1,6 @@
 # RUDP manual
 
-Audience: AI agents working on or with the MINX RUDP layer. Direct
-prose, no marketing.
+Audience: AI agents working on or with the MINX RUDP layer.
 
 ---
 
@@ -17,8 +16,7 @@ substrate and adds:
 - A reliable in-order message stream per channel (cumulative ack +
   32-bit SACK porosity bitmap).
 - An optional unreliable datagram tail riding alongside each channel
-  packet — the application's "skipping ack" lane, semantically a
-  per-channel datagram socket.
+  packet, out-of-band to the reliable bytes.
 - Per-channel token-bucket pacing (frozen at handshake completion).
 - A passive state machine: no threads, no timers, no `io_context`.
   Time and packet input come in from the application.
@@ -32,10 +30,10 @@ substrate and adds:
   distinct channel. The application picks `channel_id`s out-of-band.
 - Not adaptive. The token bucket uses static, peer-advertised rates.
   No AIMD, no congestion control loop.
-- Not encrypted. Off-path injection is gated by session token only
-  (16 bytes of secret-shared randomness). MINX's wire integrity
-  (CRC32C) catches corruption; nothing catches a deliberate on-path
-  attacker who can read traffic.
+- Not encrypted. Off-path injection is gated by a 64-bit session
+  token derived from a pair of 8-byte nonces exchanged in the
+  handshake. RUDP's CRC32C wire trailer catches corruption; nothing
+  catches a deliberate on-path attacker who can read traffic.
 
 ---
 
@@ -51,8 +49,10 @@ src/
   rudp_stream.cpp  RudpStream implementation
 
 tests/
-  test_rudp.cpp        RudpSuite — unit + integration tests, FakeWire-based
-  test_rudp_stream.cpp RudpStreamSuite — DISABLED, awaiting full rewrite
+  test_rudp.cpp        RudpSuite — FakeWire-based unit + integration tests
+  test_rudp_stream.cpp RudpStreamSuite — end-to-end RudpStream tests, two
+                       Rudp instances wired via a StreamWire glue, driven
+                       by a real io_context
 ```
 
 External dependencies (RUDP layer only):
@@ -68,95 +68,83 @@ External dependencies (RUDP layer only):
 
 ---
 
-## Core abstractions
+## Glossary
 
-- **Channel** — a `(peer_addr, channel_id)` tuple. Created lazily
-  (via `registerChannel` outbound, or `Listener::onAccept` inbound),
-  destroyed via any of: caller `closeChannel`, idle GC, peer
-  `HS_CLOSE`, peer-restart, handshake exhaustion, reorder cap breach.
-- **Channel handler** (`Rudp::ChannelHandler`) — application-owned
-  object that receives all per-channel events. Application
-  inherits, overrides what it cares about, hands `shared_ptr` to
-  Rudp. Carries `rudp() / peer() / channelId()` back-references that
-  Rudp injects at registration time.
-- **Listener** (`Rudp::Listener`) — single global object, bound at
-  construction. Carries the four non-channel events: `onSend`,
-  `onAccept`, `onAbuse`. `onAccept` doubles as the per-channel
-  factory for INBOUND channels.
-- **Pulse** — Rudp's heartbeat. Each pulse: advance memory integrals,
-  GC stale channels, fire handshake retries, emit packets for
-  channels with data. Pulses fire from `tick(now_us)` and
-  `onPacket(...)` based on a deadline cadence.
-- **Session token** — 64-bit integer derived from both sides' nonces
+- **Channel** — a `(peer_addr, channel_id)` tuple with its own
+  handshake, session token, send / reorder buffers, and metrics.
+- **Channel handler** — per-channel app object (subclass of
+  `Rudp::ChannelHandler`) that receives `onOpened` /
+  `onEstablished` / `onReliableMessage` / etc.
+- **Listener** — singleton bound at construction, carries the
+  non-channel events: `onSend`, `onAccept` (predicate + factory for
+  inbound channels), `onAbuse`.
+- **Pulse** — Rudp's heartbeat. Advances memory integrals, runs idle
+  GC, fires handshake retries, emits packets. Triggered from
+  `tick()` and `onPacket()` based on a deadline cadence.
+- **Session token** — 64-bit value derived from both sides' nonces
   at handshake completion. Authenticates every CHANNEL packet and
   HS_CLOSE.
-- **Wire trailer** — every datagram carries a CRC32C trailer over
-  `[routing_key | body]`. Corrupted datagrams are dropped before
-  any parsing. CRC failures emit a soft abuse signal.
+- **Wire trailer** — CRC32C over `[routing_key | body]` on every
+  RUDP datagram. Corrupted datagrams are dropped pre-parse.
 
 ---
 
-## Design decisions (bullet form)
+## Design decisions
+
+Load-bearing choices that explain why the API looks the way it does.
+Pure API surface details live in the API reference below.
 
 - **Listener is global, ChannelHandler is per-channel.** Listener
-  carries the irreducible global ports (`onSend`, `onAccept`,
-  `onAbuse`). Per-channel events live on per-channel objects so the
-  application doesn't maintain a parallel `(peer, cid) → state` map.
-- **Lifecycle is `Opened → [Established] → Closed`** (WebSocket
-  shape). `onOpened` fires when the handler is wired into Rudp's
-  tracking — earliest possible event. `onClosed` fires exactly once
-  per registered channel, regardless of whether the handshake ever
-  completed. `onEstablished` is the intermediate ESTABLISHED event;
-  may not fire if the channel dies before the handshake completes.
-- **Pairing invariant**: every registered channel gets exactly one
-  `onOpened` and exactly one `onClosed`. Channels rejected by
-  `onAccept` (returning `nullptr`) produce zero events.
-- **`registerChannel` for outbound, `onAccept`-returns-handler for
-  inbound.** Both paths funnel into the same chokepoint: Rudp injects
-  back-references, fires `handler->onOpened()`, then proceeds.
-- **`push()` does NOT auto-create channels.** Caller must register
+  carries the events with no natural per-channel home (`onSend`,
+  `onAccept`, `onAbuse`). Everything channel-scoped lives on the
+  per-channel handler so the application doesn't maintain a
+  parallel `(peer, cid) → state` map.
+- **Pairing invariant on the channel handler.** Every channel that
+  successfully registers (via `registerChannel` outbound or
+  `onAccept`-returns-non-null inbound) gets exactly one `onOpened`
+  and exactly one `onClosed`. Channels rejected by `onAccept`
+  produce zero events. `onEstablished` is intermediate and may not
+  fire if the channel dies before the handshake completes.
+- **shared_ptr ownership of the handler.** Rudp holds one ref while
+  the channel exists and drops it AFTER `onClosed` returns (so the
+  handler can rely on being alive throughout its own `onClosed`).
+  The app may hold its own ref independently; the handler can
+  outlive Rudp's ref.
+- **`push()` does NOT auto-create channels.** Caller registers
   first. This guarantees every channel always has a handler — no
-  events get dispatched into the void.
-- **shared_ptr ownership.** Rudp holds one ref while the channel
-  exists, drops AFTER `onClosed` returns. App can hold its own ref
-  independently. The handler can survive Rudp dropping its ref.
-- **`closeChannel` takes a `CloseReason`.** RUDP enumerates only
-  reasons it can itself produce (`APPLICATION` for caller-driven,
-  plus internal: `IDLE` / `HANDSHAKE_FAILED` / `REORDER_BREACH` /
-  `PEER_CLOSED` / `PEER_RESTART`). Application-level "why am I
-  closing" (billing, abuse policy) stays in the application's
-  bookkeeping — RUDP doesn't enumerate domain reasons.
+  events ever get dispatched into the void.
+- **`closeChannel` carries a `CloseReason` and an optional
+  SO_LINGER-style `timeout`.** RUDP only enumerates reasons it can
+  itself produce. Application-level "why am I closing" (billing,
+  policy, abuse decision) stays in the application's bookkeeping.
+  The `timeout` distinguishes immediate (RST) from graceful-drain
+  (FIN equivalent).
 - **CloseReason crosses the listener boundary, not the wire.** The
-  reason the closing side passes to `closeChannel` is visible only
-  to that side's handler. The peer sees `PEER_CLOSED`. The HS_CLOSE
-  packet doesn't carry a reason; it carries only the session token
-  to authenticate the close.
-- **Per-channel `ChannelMetrics`** for upper-layer billing /
-  accounting: `bytesSent`, `bytesReceived`, `memoryByteSeconds`
-  (cumulative integral of buffer bytes × elapsed seconds),
-  `openedAtUs`. Billing is the upper layer's policy; RUDP is pure
-  measurement. `bytesReceived` is charged BEFORE CRC verification
-  (closes the attack vector where deliberate corruption would
-  otherwise consume bandwidth + CPU for free).
-- **Abuse signals** fed back to MINX. Strong (forged session token,
-  reorder cap breach) → `Minx::banAddress`. Soft (CRC failure, stray
-  packets, truncated headers) → `Minx::checkSpam`. The same signals
-  also fire `Listener::onAbuse` for application-level metrics
-  regardless of whether MINX was provided at construction.
-- **Unreliable on a stream channel is suspicious.** `RudpStream`
-  never mixes unreliable bytes into the byte-stream's read path.
-  An unreliable arrival routes to an optional application-installed
-  sink; default is silent drop. Receiving unreliable on a stream
-  channel is plausibly an attack vector (or just garbage); the
-  application decides policy.
+  reason the closing side passes is visible only to that side's
+  handler. The peer always sees `PEER_CLOSED`. The HS_CLOSE packet
+  carries only the session token to authenticate the close.
+- **Per-channel metering is pure measurement, not policy.** Rudp
+  tracks `bytesSent` / `bytesReceived` / `memoryByteSeconds` /
+  `openedAtUs` and exposes them via `metricsFor`; deciding what to
+  bill for is the application's job. `bytesReceived` is charged
+  BEFORE CRC verification, closing the attack vector where
+  deliberate corruption would otherwise consume bandwidth + CPU for
+  free.
+- **Abuse feedback is two-track.** Strong signals (forged tokens,
+  reorder cap breach) → `Minx::banAddress`. Soft (CRC failure,
+  stray packets, truncated headers) → `Minx::checkSpam`. The
+  `Listener::onAbuse` hook fires for both regardless of whether a
+  `Minx*` was provided at construction.
+- **Unreliable bytes don't enter `RudpStream`'s read path.** The
+  reliable byte stream is the contract; unreliable arrivals are
+  out-of-band to it. By default they're dropped; the application
+  can opt in via `setUnreliableSink`.
 
 ---
 
 ## API reference — RUDP layer
 
 ### `class Rudp`
-
-Construction:
 
 ```cpp
 Rudp(Listener* listener, RudpConfig config = {}, Minx* minx = nullptr);
@@ -167,7 +155,6 @@ Rudp(Listener* listener, RudpConfig config = {}, Minx* minx = nullptr);
 - `minx` is optional. When non-null, RUDP feeds abuse signals to its
   filters automatically. When null, only the `Listener::onAbuse`
   hook fires; no IP-level action is taken (used by tests).
-- `config` is `RudpConfig` (see below).
 
 Non-copyable, non-movable.
 
@@ -207,30 +194,30 @@ protected:
 };
 ```
 
-Subclass this for per-channel state. Override only the events you
-care about. The protected accessors are populated by Rudp at
-registration time and are valid from the start of `onOpened()` through
-the end of `onClosed()` (after which the handler may still be alive
-in app memory but `rudp()` may dangle if the Rudp is destroyed).
+Subclass for per-channel state. Override only the events you care
+about. The protected accessors are populated by Rudp at registration
+time and are valid from the start of `onOpened()` onward.
+
+| Callback | When it fires |
+|---|---|
+| `onOpened` | Right after Rudp wires this handler into its tracking. Earliest event. |
+| `onEstablished` | Handshake complete; end-to-end I/O is reliable. May not fire if the channel dies first. |
+| `onReliableMessage` | Reliable message delivered in order. |
+| `onUnreliableMessage` | Optional datagram tail of an inbound CHANNEL packet (fires once per inbound CHANNEL packet that carries a non-empty unreliable section). |
+| `onWritable` | `sendBuf` shrank; back-pressure has cleared. |
+| `onClosed(reason)` | Final event. Fires exactly once after `onOpened`, regardless of how the channel ended. |
 
 **Idiomatic shape:**
 
 ```cpp
 class MyChannel : public Rudp::ChannelHandler {
 public:
-  void onOpened() override {
-    // (peer, cid, rudp) are valid here. Set up any per-channel state
-    // that needs them.
-  }
   void onEstablished() override {
-    // Now I can rely on end-to-end I/O. Send a hello, etc.
     rudp()->push(peer(), channelId(), greeting_, /*reliable=*/true);
   }
   void onReliableMessage(const Bytes& msg) override { /* ... */ }
   void onWritable() override { /* resume any deferred send */ }
-  void onClosed(Rudp::CloseReason r) override {
-    // Final event. Rudp drops its shared_ptr ref after this returns.
-  }
+  void onClosed(Rudp::CloseReason r) override { /* ... */ }
 };
 ```
 
@@ -247,21 +234,30 @@ struct Listener {
 };
 ```
 
-- `onSend` is mandatory. RUDP has bytes to put on the wire. The
-  bytes already start with the 8-byte stdext routing key; no
-  further wrapping. Glue typically forwards to
+- **`onSend`** is mandatory. Rudp has bytes to put on the wire. The
+  bytes already start with the 8-byte stdext routing key — no
+  further wrapping needed; glue typically forwards to
   `minx->sendExtension(peer, bytes)`.
-- `onAccept` is BOTH the inbound predicate AND the handler factory.
-  Returning `nullptr` rejects the inbound channel silently. Returning
-  a non-null `shared_ptr<ChannelHandler>` accepts and binds it as the
-  channel's handler — Rudp will fire `onOpened()` on it, route per-
-  channel events to it, and call `onClosed()` at the end. Default
-  implementation returns `nullptr` (reject all). Fires only on FRESH
-  inbound `HS_OPEN` (not on duplicate retransmits, not on
-  simultaneous-open where the app already committed via push).
-- `onAbuse` reports wire-level peer behavior (forged tokens, CRC
-  failures, etc). `channel_id` may be 0 when the signal can't be
-  attributed to a specific channel. See "AbuseSignal" below.
+- **`onAccept`** is both the inbound predicate and the handler
+  factory. Returning `nullptr` rejects the inbound channel silently.
+  Returning a non-null `shared_ptr<ChannelHandler>` accepts and
+  binds it. Default implementation returns `nullptr` (reject all).
+  Fires on:
+  - a FRESH inbound `HS_OPEN` (no existing channel state for the
+    tuple), and
+  - a peer-restart: an HS_OPEN on an existing channel carrying a
+    NEW nonce. The old session is torn down first (firing the old
+    handler's `onClosed(PEER_RESTART)`); then `onAccept` is re-run
+    to decide whether to accept the fresh logical session.
+
+  Does NOT fire on duplicate / retransmitted HS_OPEN (ACCEPT is
+  just re-emitted idempotently), or on simultaneous-open where the
+  app already committed via `registerChannel` (the handler is
+  already wired).
+- **`onAbuse`** reports wire-level peer behavior. `channel_id` may
+  be 0 when the signal can't be attributed to a specific channel.
+  Fires regardless of whether a `Minx*` was provided. See
+  `AbuseSignal` below.
 
 ### `enum class Rudp::CloseReason`
 
@@ -272,20 +268,14 @@ struct Listener {
 | `HANDSHAKE_FAILED` | Sent OPEN, never got ACCEPT (`handshakeMaxRetries` exhausted) |
 | `REORDER_BREACH` | Peer overran our reorder buffer (resource attack) |
 | `PEER_CLOSED` | Peer sent a valid HS_CLOSE |
-| `PEER_RESTART` | Peer sent HS_OPEN with a different nonce on an established channel (likely process restart) |
+| `PEER_RESTART` | Peer sent HS_OPEN with a different nonce on an established channel |
 
-Stream operator: `operator<<(std::ostream&, CloseReason)` prints the
-enum name (e.g. `"PEER_CLOSED"`).
-
-RUDP only enumerates reasons it can itself produce. Application-
-level "why am I closing" (billing, policy, abuse decision) is the
-application's own bookkeeping — call `closeChannel(p, c)` (default
-APPLICATION) and remember the why locally. The peer always sees
-`PEER_CLOSED`.
+Stream operator: `operator<<(std::ostream&, CloseReason)` prints
+the enum name (e.g. `"PEER_CLOSED"`).
 
 ### `enum class Rudp::AbuseSignal`
 
-Strong (`isStrongAbuseSignal == true`):
+Strong (`isStrongAbuseSignal(s) == true`):
 
 | Value | Meaning |
 |---|---|
@@ -293,7 +283,7 @@ Strong (`isStrongAbuseSignal == true`):
 | `FORGED_SESSION_TOKEN_HS_CLOSE` | HS_CLOSE on existing ESTABLISHED channel with wrong token |
 | `REORDER_CAP_BREACH` | Peer overran reorder buffer |
 
-Soft (`isStrongAbuseSignal == false`):
+Soft (`isStrongAbuseSignal(s) == false`):
 
 | Value | Meaning |
 |---|---|
@@ -302,19 +292,13 @@ Soft (`isStrongAbuseSignal == false`):
 | `STRAY_CHANNEL_PACKET` | CHANNEL packet for unknown / non-ESTABLISHED channel |
 | `TRUNCATED_PACKET` | Packet too short to contain its sub-protocol's fixed header |
 
-When a non-null `Minx*` was passed at construction:
+When a non-null `Minx*` was passed at construction, strong signals
+invoke `minx->banAddress(peer.address())` and soft signals invoke
+`minx->checkSpam(peer.address(), /*alsoUpdate=*/true)`.
+`isStrongAbuseSignal(s)` is a `static constexpr bool` for consumers
+that want to apply the same severity split for their own metrics.
 
-- Strong → `minx->banAddress(peer.address())` (drops subsequent UDP
-  packets from that prefix at MINX's IP filter).
-- Soft → `minx->checkSpam(peer.address(), /*alsoUpdate=*/true)`
-  (count-min sketch with threshold logic).
-
-`Listener::onAbuse` fires regardless of whether `Minx*` was
-provided. Use it for application-level metrics, logging, tests.
-
-`isStrongAbuseSignal(s)` is a public `static constexpr bool` for
-consumers that want to apply the same severity split for their own
-metrics.
+`operator<<(std::ostream&, AbuseSignal)` prints the enum name.
 
 ### `struct Rudp::ChannelMetrics`
 
@@ -327,37 +311,41 @@ struct ChannelMetrics {
 };
 ```
 
-- `bytesSent` / `bytesReceived` are the full datagram sizes
-  (including the 8-byte routing key and 4-byte CRC trailer),
-  cumulative monotone. `bytesReceived` is charged BEFORE CRC verify
-  / token check / sub-protocol parsing; corrupted, wrong-token, and
+- `bytesSent` / `bytesReceived` are full datagram sizes (including
+  the 8-byte routing key and 4-byte CRC trailer), cumulative
+  monotone. `bytesReceived` is charged BEFORE CRC verify / token
+  check / sub-protocol parsing; corrupted, wrong-token, and
   truncated-but-channel-id-readable packets all bill the addressed
   channel.
 - `memoryByteSeconds` is the cumulative integral of "current buffer
-  bytes × elapsed seconds." Updated lazily on each pulse and once
-  at destruction. Buffers counted: reorder buffer, send buffer,
-  preEstablished queue, pending unreliable. Reads in between can
-  lag by up to one pulse interval.
-- `openedAtUs` is the `currentTimeUs_` at ESTABLISHED transition.
-  Zero for channels that never reached ESTABLISHED.
+  bytes × elapsed seconds." Buffers counted: reorder buffer, send
+  buffer, preEstablished queue, pending unreliable. Updated lazily
+  on each pulse and once at destruction; reads in between can lag
+  by up to one pulse interval.
+- `openedAtUs` is the application-wall-clock value at the
+  ESTABLISHED transition. Zero for channels that never reached
+  ESTABLISHED.
 
 ### Application input verbs
 
 ```cpp
 bool registerChannel(const SockAddr& peer, uint32_t channel_id,
-                  std::shared_ptr<ChannelHandler> handler);
+                     std::shared_ptr<ChannelHandler> handler);
 ```
 
-Adopt a per-channel handler. Outbound's "Opened" trigger.
+Outbound's "Opened" trigger. Adopts a per-channel handler.
 
-- Creates the channel state in IDLE if absent.
-- Injects `rudp/peer/cid` back-references into `*handler`.
-- Stores the `shared_ptr` on the channel.
-- Fires `handler->onOpened()` before returning.
+- Creates the channel state if absent.
+- Injects `rudp` / `peer` / `cid` back-references into `*handler`.
+- Stores the `shared_ptr` on the channel and fires
+  `handler->onOpened()`.
+- Picks a local nonce, transitions the channel to `OPEN_SENT`,
+  resets the handshake retry counter. The OPEN packet itself goes
+  out on the next pulse (from `tick()` / `onPacket()` / `flush()`).
 
 Returns `false` if:
-- The per-peer channel cap is exhausted, OR
-- The (peer, cid) is already registered (programmer error — use
+- the per-peer channel cap is exhausted, or
+- the (peer, cid) is already registered (programmer error — use
   `channelHandler()` to inspect the existing one).
 
 ```cpp
@@ -378,7 +366,7 @@ have been registered (push does NOT auto-create).
 
 Returns `false` if:
 - `msg.size() > MAX_MESSAGE_SIZE`,
-- The channel doesn't exist (not registered),
+- the channel doesn't exist (not registered),
 - `reliable=true` and the per-channel send buffer is full
   (back-pressure — caller should defer; `onWritable()` will fire
   on the handler when capacity returns).
@@ -426,16 +414,35 @@ meantime. Use to set the next fire of a `boost::asio::steady_timer`.
 
 ```cpp
 void closeChannel(const SockAddr& peer, uint32_t channel_id,
-                  CloseReason reason = CloseReason::APPLICATION);
+                  CloseReason reason = CloseReason::APPLICATION,
+                  std::chrono::microseconds timeout =
+                    std::chrono::microseconds(0));
 ```
 
-Drop a single channel immediately.
+Drop a single channel. SO_LINGER-shaped.
+
+**`timeout == 0` (default) — immediate (RST):**
 
 - If ESTABLISHED, emits a single HS_CLOSE to the peer (fire-and-
-  forget, no retry) so the peer's side tears down synchronously.
-- Fires `handler->onClosed(reason)`.
-- Drops Rudp's `shared_ptr` ref on the handler.
-- Erases the channel from internal maps.
+  forget, no retry).
+- Pending bytes in `sendBuf` are dropped.
+- Fires `handler->onClosed(reason)`, drops Rudp's `shared_ptr` ref,
+  erases the channel.
+
+**`timeout > 0` — graceful (drain then close):**
+
+- Marks the channel and returns immediately.
+- The channel keeps pulsing normally: in-flight reliable bytes keep
+  retransmitting, ACKs keep being processed.
+- When `sendBuf` and `pendingUnreliable` empty, OR `timeout`
+  elapses (whichever first), HS_CLOSE fires and the channel tears
+  down via the normal path.
+- Only meaningful for ESTABLISHED channels; other states fall
+  through to the immediate path.
+- A second `closeChannel` call on an already-marked channel
+  escalates to immediate teardown (RST).
+- The application is expected to stop calling `push()` on this
+  channel — RUDP does not gate new writes itself.
 
 No-op if the channel doesn't exist.
 
@@ -454,12 +461,9 @@ std::optional<ChannelMetrics> metricsFor(
   const SockAddr& peer, uint32_t channel_id) const;
 ```
 
-Snapshot of a channel's metrics. `std::nullopt` if not tracked.
-Returned by value; safe to hold across mutating Rudp calls.
-
-The `memoryByteSeconds` field is updated on each pulse and at
-destruction. Reads in between can lag by up to one pulse interval.
-Call `tick()` first if a tight snapshot is needed.
+Snapshot by value; safe to hold across mutating Rudp calls.
+`memoryByteSeconds` lags by up to one pulse interval; call `tick()`
+first if a tight snapshot is needed.
 
 ### Debug / test inspection
 
@@ -470,7 +474,7 @@ bool isEstablished(const SockAddr& peer, uint32_t channel_id) const;
 uint64_t sessionToken(const SockAddr& peer, uint32_t channel_id) const;
 ```
 
-For tests and observability. Not part of the production API contract.
+Not part of the production API contract.
 
 ### Wire identity constants
 
@@ -497,9 +501,9 @@ RUDP itself is single-threaded by contract. All callbacks
 whichever thread drove the triggering call (`tick`, `onPacket`,
 `closeChannel`, `push`, `registerChannel`).
 
-Re-entrancy: callbacks may call back into Rudp on the same channel
-(push, closeChannel, etc) — except from inside `onClosed`, which is
-the final notification before Rudp drops its `shared_ptr` ref.
+Callbacks may call back into Rudp on the same channel (push,
+closeChannel, etc.) — except from inside `onClosed`, which is the
+final notification before Rudp drops its `shared_ptr` ref.
 
 ---
 
@@ -508,8 +512,8 @@ the final notification before Rudp drops its `shared_ptr` ref.
 `RudpStream` is a `Rudp::ChannelHandler` subclass that adapts one
 RUDP channel into a `boost::asio::AsyncStream`. Any Asio-based
 byte-stream library (Boost.Beast HTTP / WebSocket, in-memory pipes,
-ad-hoc serializers) can read/write through it without knowing
-anything about RUDP's wire format.
+ad-hoc serializers) can read / write through it without knowing
+RUDP's wire format.
 
 ### Construction
 
@@ -517,37 +521,26 @@ anything about RUDP's wire format.
 explicit RudpStream(boost::asio::any_io_executor ex);
 ```
 
-The stream is constructed unbound. Bind it to a channel by either:
+Constructed unbound. Bind by either:
 
 1. **Outbound**: pass the `shared_ptr<RudpStream>` to
    `rudp.registerChannel(peer, cid, stream)`.
 2. **Inbound**: return the `shared_ptr<RudpStream>` from the
    application's `Rudp::Listener::onAccept`.
 
-In both cases Rudp injects `rudp() / peer() / channelId()` and
+In both cases Rudp injects `rudp()` / `peer()` / `channelId()` and
 fires `onOpened()`.
 
 Non-copyable, non-movable.
 
-### `ChannelHandler` overrides
+### `ChannelHandler` overrides (wired by Rudp; the app doesn't call them)
 
-```cpp
-void onOpened() override;
-void onReliableMessage(const Bytes& msg) override;
-void onUnreliableMessage(const Bytes& msg) override;
-void onWritable() override;
-void onClosed(Rudp::CloseReason reason) override;
-```
-
-These are wired by Rudp; the application doesn't call them. Their
-behaviors:
-
-- `onOpened` — placeholder hook. Subclasses can override + chain.
+- `onOpened` — placeholder hook; subclasses may override + chain.
 - `onReliableMessage` — appends bytes to the internal read buffer
   and completes any pending `async_read_some`.
 - `onUnreliableMessage` — does NOT enter the byte stream's read
-  path. Routes to the optional `UnreliableSink` (see below).
-  Default: silent drop.
+  path. Routes to the optional `UnreliableSink` (see below);
+  default is silent drop.
 - `onWritable` — resumes a deferred `async_write_some` if one is
   pending.
 - `onClosed` — marks the stream closed, stores the reason,
@@ -560,19 +553,37 @@ using UnreliableSink = std::function<void(const Bytes& msg)>;
 void setUnreliableSink(UnreliableSink sink);
 ```
 
-Install a sink for unreliable bytes. Default: silent drop. Receiving
-unreliable on a stream channel is unusual and arguably suspicious;
-the application can use this to log, abuse-report, force-close, or
-ignore.
+Install a sink for unreliable bytes. Default: silent drop.
 
 ```cpp
 void close();
 ```
 
-Application-side teardown. Marks the stream closed AND tears down
-the underlying RUDP channel via
-`rudp()->closeChannel(peer(), channelId(), APPLICATION)`. Pending
-handlers complete with `eof`. Idempotent.
+RST-equivalent. Marks the stream closed AND tears down the
+underlying RUDP channel via
+`rudp()->closeChannel(peer(), channelId(), APPLICATION)` (zero
+timeout). Pending handlers complete with `eof`. Idempotent.
+
+```cpp
+void shutdown(std::chrono::microseconds timeout);
+```
+
+FIN-equivalent. Stops accepting new writes: subsequent
+`async_write_some` calls complete with `eof`. Any already-in-flight
+`async_write_some` is allowed to drain into Rudp's `sendBuf` before
+the deferred close is scheduled. Asks Rudp to fire HS_CLOSE only
+after `sendBuf` empties — or after `timeout` elapses, whichever
+comes first (timeout falls back to RST). Pending reads stay live
+until Rudp fires `onClosed`. Idempotent.
+
+Use when "the peer should see EOF *after* my final bytes" matters
+(e.g. an HTTP server flushing its last response chunk before
+closing). For fire-and-forget teardown, use `close()` instead.
+
+Internally implemented as `rudp()->closeChannel(peer(),
+channelId(), APPLICATION, timeout)` — called immediately if no
+write is in flight at `shutdown()` time, otherwise deferred until
+the in-flight write's bytes are fully pushed into `sendBuf`.
 
 ```cpp
 void detach();
@@ -589,9 +600,8 @@ std::size_t available() const noexcept; // test/debug only
 ```
 
 `getCloseReason()` is populated when `onClosed` fired (i.e. the
-underlying channel ended on its own). `close()` and `detach()`
-leave it `nullopt` — application-driven teardown has no "reason"
-beyond the call.
+underlying channel ended on its own). `close()`, `shutdown()`, and
+`detach()` leave it `nullopt`.
 
 ### Asio AsyncStream concept
 
@@ -611,7 +621,7 @@ via a `shared_ptr` holder.
 
 ### CloseReason → error_code mapping
 
-When `onClosed` fires and there's a pending `async_read_some` /
+When `onClosed` fires with a pending `async_read_some` /
 `async_write_some` handler, it completes with:
 
 | `CloseReason` | `error_code` |
@@ -620,20 +630,19 @@ When `onClosed` fires and there's a pending `async_read_some` /
 | Everything else | `boost::asio::error::operation_aborted` |
 
 Rationale: `PEER_CLOSED` is the clean remote-disconnect (TCP-style
-eof). Every other reason indicates the underlying transport was
-pulled out from under the stream — Asio's `operation_aborted` is
-the canonical "cancelled" code. The application can call
+eof); everything else means the underlying transport was pulled
+out from under the stream. The application can call
 `getCloseReason()` to recover the specific cause.
 
 When `close()` (user-driven) is called with pending handlers, they
-complete with `eof` regardless of `CloseReason` — it's the
-classic "user shut down the stream cleanly" semantic.
+complete with `eof` regardless of `CloseReason` — classic "user
+shut down the stream cleanly" semantic.
 
 ### Threading
 
-NOT thread-safe. The `RudpStream`, the `Rudp` it's bound to, and the
-Asio handler completions all run on the same thread (typically a
-single `io_context`).
+NOT thread-safe. The `RudpStream`, the `Rudp` it's bound to, and
+the Asio handler completions all run on the same thread (typically
+a single `io_context`).
 
 ---
 
@@ -655,7 +664,7 @@ Rudp rudp(&listener, RudpConfig{}, &minx);
 
 auto handler = std::make_shared<MyHandler>(/* ... */);
 if (!rudp.registerChannel(peer, /*cid=*/1, handler)) {
-  // cap exhausted
+  // cap exhausted or already registered
 }
 rudp.push(peer, 1, payload, /*reliable=*/true);
 
@@ -690,27 +699,30 @@ parallel `(peer, cid) → handler` map.
 
 ## Common gotchas
 
-- **Forgetting to register before pushing.** `rudp.push(p, c, msg, r)`
-  on a non-registered channel returns `false`. Always `registerChannel`
-  first (or accept inbound via `onAccept`).
-- **Pushing oversize messages.** `MAX_MESSAGE_SIZE = 1241`. Larger
-  payloads must be chunked by the caller (or use `RudpStream`,
-  which chunks internally).
-- **`close()` vs `detach()` on RudpStream.** `close()` tears down
-  the underlying channel (sends HS_CLOSE). `detach()` just closes
-  the stream view. Default to `close()` for normal teardown.
-- **Calling handler methods after `onClosed`.** After `onClosed`
-  returns, Rudp drops its `shared_ptr` ref. If the application
-  still holds one, the handler is alive but `rudp()` may dangle
-  if the Rudp itself is destroyed. Don't push from a stale
-  handler post-close.
-- **Trusting `CloseReason` on the peer side.** The peer always
-  sees `PEER_CLOSED`. Domain-specific reasons (billing, policy)
-  don't traverse the wire.
-- **Mixing reliable and unreliable on a stream channel.** RudpStream
-  drops unreliable bytes by default. If the application is sending
-  unreliable to a stream, install an `UnreliableSink` and decide
-  policy explicitly.
+Things easy to get wrong but not obvious from the API alone.
+
+- **`close()` vs `shutdown(timeout)` vs `detach()` on RudpStream.**
+  `close()` is RST: pending `sendBuf` bytes drop on the floor.
+  `shutdown(timeout)` is FIN: in-flight writes finish pushing into
+  `sendBuf`, then HS_CLOSE fires after the buffer drains (or
+  `timeout` elapses). `detach()` closes only the stream view; the
+  underlying channel keeps running.
+- **`push()` is not gated after `closeChannel(timeout > 0)`.** The
+  application must stop its own writes (e.g. `RudpStream::shutdown`
+  does this by flipping a private `shutdownPending_` flag that
+  makes subsequent `async_write_some` calls return `eof`). Pushing
+  past a deferred close just adds bytes that may or may not make it
+  out before the deadline.
+- **Handler accessors after `onClosed`.** After `onClosed` returns,
+  Rudp drops its `shared_ptr` ref. If the application still holds
+  one, the handler is alive but `rudp()` may dangle if the `Rudp`
+  itself is destroyed first. Don't push from a stale handler
+  post-close.
+- **`CloseReason` doesn't traverse the wire.** Whatever you pass to
+  `closeChannel(..., reason)` is visible only to your own handler's
+  `onClosed`. The peer always sees `PEER_CLOSED`.
 - **Per-peer channel cap defaults to 1.** Bump
   `RudpConfig::maxChannelsPerPeer` if multiple concurrent channels
   per peer are needed.
+- **`MAX_MESSAGE_SIZE = 1241`.** Larger payloads must be chunked by
+  the caller (or use `RudpStream`, which chunks internally).

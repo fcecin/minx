@@ -2,25 +2,23 @@
 
 __NOTE: This is experimental software.__
 
-MINX is a simple cooperative-economy boostrapping protocol for P2P applications that provides resistance against basic attacks, such as IP spoofing, traffic snooping and hijacking (MitM attacks), verification spam and RAM-exhaustion attacks.
-
-This protocol is part of [Hyle](https://hyle-project.org), a [Public Computing](https://medium.com/@fcecin/public-computing-ebfb04489cb0) project.
+MINX is a simple cooperative-economy bootstrapping protocol for P2P applications that provides resistance against basic attacks, such as IP spoofing, traffic snooping and hijacking (MitM attacks), verification spam and RAM-exhaustion attacks.
 
 ## Quickstart
 
-MINX is written in C++20. Most dependencies are downloaded by the build scripts. The exception is the [Boost](https://www.boost.org/) suite which must be already installed in your system (via e.g. `sudo apt install libboost-all-dev` in Ubuntu).
+MINX is written in C++20. Most dependencies are downloaded by the build scripts. The exception is the [Boost](https://www.boost.org/) suite, which must already be installed on your system (via e.g. `sudo apt install libboost-all-dev` on Ubuntu).
 
 The provided build system is written in CMake and produces a static library in both debug and release configurations via `build.sh`.
 
 ## Rationale
 
-Public Computing (PubCom, for short) allows nodes in Peer-to-Peer (P2P) networks (also referred to as "decentralized networks") to provide resources to each other, enabling a diverse set of applications. In a PubCom network, a node A may provide resources for a node B so that node B can run application X, and in turn, node B may provide resources for node A so that node A can run application Y. Applications need not be aware of each other, and the network is open and general-purpose, providing for any number of users and applications. Public Computing stands in contrast to Cloud Computing, where computing resources are instead provided by businesses.
+MINX is a low-level protocol built to serve as a bootstrapping mechanism for computing resource sharing in a peer-to-peer network. It is primarily intended as a foundation for higher-level protocols and middleware, although a P2P application could be built directly on top of it.
 
-MINX is a low-level protocol built to serve as a bootstrapping mechanism for computing resource sharing in a PubCom network. Its implementation is primarily intended as a foundation for higher-level, reusable PubCom middleware, although a P2P network or application could be built directly on top of it.
+MINX allows peer nodes in a P2P network to send cheap Proof-of-Work (PoW) solutions to each other in a way that is already protected against several attacks. It was built to support a P2P network where a node A would send a PoW solution to a node B; node B would then record a proportional amount of computing credits for node A. That would allow node A to then ask node B for computing resources in a spam-protected, rate-limited way, since the networking, computing, memory or storage expenditure at node B from node A's requests could be billed against node A's bootstrapped credit balance at node B.
 
-MINX allows peer nodes in a P2P network to send cheap Proof-of-Work (PoW) solutions to each other in a way that is already protected against several attacks. When a node A sends a PoW solution to a node B, node B records a proportional amount of computing credits to node A. That allows node A to then ask node B for computing resources in a spam-protected, rate-limited way, since the networking, computing, memory or storage expenditure at node B from node A's requests can be billed against node A's bootstrapped credit balance at node B.
+On top of this primitive, a more complex trust and anti-spam system or resource economy can be built. Such higher-level middleware would serve user-facing decentralized applications and provide richer APIs. MINX provides middleware with a basic, generic trust mechanism that securely cold-starts resource exchanges between peer nodes in an application-agnostic way, irrespective of individual peer node capabilities or application intents.
 
-Leveraging MINX, a more complex trust and anti-spam system or resource economy can be built. Such higher-level middleware would serve user-facing decentralized applications and provide richer APIs. MINX provides middleware with a basic, generic trust mechanism that securely cold-starts resource exchanges between peer nodes in an application-agnostic way, irrespective of individual peer node capabilities or application intents.
+MINX was built as a step towards realizing the vision of [Public Computing](https://medium.com/@fcecin/public-computing-ebfb04489cb0).
 
 ## Protocol specification
 
@@ -49,7 +47,7 @@ The remainder of the datagram is the message, which depends on `CODE`.
 
 There is no point-to-point connection state tracking in MINX, no data streams and thus no stream sequence numbers. Sender IP address verification is accomplished by a continous exchange of randomized IP address validation passwords (or tickets). Generated tickets (`GPASSWORD`) are randomly-generated by the sender and locally saved, which can then be spent by the remote node (`SPASSWORD`) in a return packet later.
 
-Receiving a packet with an `SPASSWORD` value that is not an outstanding, previously-unspent `GPASSWORD` value that was locally generated and saved beforehand causes the incoming packet with the unknown, invalid `SPASSWORD` value to be dropped. Whether passwords are associated with IP addresses or not, and for how long exacty they are retained after generation are up to the implementation. Passwords with a value of zero are invalid (absent).
+Receiving a packet with an `SPASSWORD` value that is not an outstanding, previously-unspent `GPASSWORD` value that was locally generated and saved beforehand causes the incoming packet with the unknown, invalid `SPASSWORD` value to be dropped. Whether passwords are associated with IP addresses or not, and for how long exactly they are retained after generation, are up to the implementation. Passwords with a value of zero are invalid (absent).
 
 Below is the specification for all messages.
 
@@ -86,7 +84,7 @@ Applications can drop some or all `GET_INFO` messages. The sender IP address can
 
 ### INFO (`0xFD`)
 
-Optional answer to a `GET_INFO` message. Receiver assumes that its `VERSION` informed by the previous `GET_INFO` message is supported by the sender.
+Optional answer to a `GET_INFO` message. The receiver assumes that the `VERSION` it advertised in its previous `GET_INFO` message is supported by the sender.
 
 - `uint8_t VERSION`: Implementation identifier.
 - `uint64_t GPASSWORD`: Generated ticket value, or zero.
@@ -99,7 +97,7 @@ The `ENGINE_INFO` data packet's format depends on the value of `ENGINE_ID`.
 If `ENGINE_ID` is `0x0` (the default engine), `ENGINE_INFO` has the following format:
 
 - `uint8_t[32] SKEY`: A 256-bit secure hash over some cryptographic public key controlled by the sender (or the public key itself, if it happens to be 256 bits long).
-- `uint8_t DIFFICULTY`: Minimum solution difficulty accepted by the sender, where the average number of hash lookups is in the order of `2^DIFFICULTY`.
+- `uint8_t DIFFICULTY`: Minimum solution difficulty accepted by the sender, where the average number of hash lookups is on the order of `2^DIFFICULTY`.
 
 If the application finds the message to be spam, the sender address can be penalized.
 
@@ -123,7 +121,7 @@ If `ENGINE_ID` is `0x0` (the default engine), `POW_DATA` has the following forma
 - `uint64_t NONCE`: PoW puzzle nonce.
 - `uint8_t[32] SOLUTION`: RandomX hash over the concatenation of `CKEY`, `HDATA`, `TIME`, `NONCE`.
 
-The protocol does not specify an acknowledgement or return message for `PROVE_WORK`. Such a facility can be provided by the application or a protocol extension. For example, the application can choose to check for some kind of credit balance at the remote node and just keep resubmitting proofs until it increases. Or the application can just blindly resubmit `PROVE_WORK` datagrams a certain number of times, or resort to recent proof resubmission if other operations are denied due to a lack of credit. In any case, the receiver should generally not penalise the sender for a double-spend attempt, since looking up `SOLUTION` against a record of previously spent solutions should be a fast operation.
+The protocol does not specify an acknowledgement or return message for `PROVE_WORK`. Such a facility can be provided by the application or a protocol extension. For example, the application can choose to check for some kind of credit balance at the remote node and just keep resubmitting proofs until it increases. Or the application can just blindly resubmit `PROVE_WORK` datagrams a certain number of times, or resort to recent proof resubmission if other operations are denied due to a lack of credit. In any case, the receiver should generally not penalize the sender for a double-spend attempt, since looking up `SOLUTION` in a record of previously spent solutions should be a fast operation.
 
 The receiver is responsible for detecting solutions that are correct but that need to be rejected because the puzzle difficulty is not high enough to justify tracking its solution.
 
@@ -152,11 +150,11 @@ MINX assumes that applications will use a public-key signature scheme, but it do
 
 The protocol can be extended to support any Proof-of-Work algorithm. The reference implementation uses [RandomX](https://github.com/tevador/RandomX) and assumes a 256-bit secure hash function for the specified default engine (`ENGINE_ID = 0x0`).
 
-RandomX is a good equalizer for CPU, GPU, FPGA and ASIC miners, and it currently allows MINX to just assume that PoW solutions translate roughly to the same resource expenditure. The main trade-offs in RandomX are memory use (between 256 MB and 2 GB) and verification speed.
+RandomX is a good equalizer for CPU, GPU, FPGA and ASIC miners, and it currently allows MINX to just assume that PoW solutions translate to roughly the same resource expenditure. The main trade-offs in RandomX are memory use (between 256 MB and 2 GB) and verification speed.
 
 RandomX memory use at the verifier is optimized by using a single verifier for all incoming puzzles. PoW solution spam is mitigated by banning IP address ranges for verification failures.
 
-Application protocols that need up to 251 datagram codes (`[0x00..0xFB]`) can just directly extend the message set, reusing the single `CODE` byte in the header. This allows the application to avoid creating its own message frame and to just use the provided networking engine and API.
+Application protocols that need up to 250 datagram codes (`[0x00..0xF9]`) can just directly extend the message set, reusing the single `CODE` byte in the header. This allows the application to avoid creating its own message frame and to just use the provided networking engine and API.
 
 Implementors can also insert another protocol between the datagram network and MINX, or they can simply replace the header's `CODE` byte with their own header, effectively creating a derived protocol.
 
@@ -166,12 +164,12 @@ The reference implementation of the default engine also serves as its specificat
 
 One of the core design decisions in MINX is to have both the PoW puzzle (the base challenge or problem) and the PoW solution (the hash) be generated by the client, and having both be informed in a single `PROVE_WORK` message.
 
-The RandomX hasher at both the client and the server is initialized with `SKEY`, which is a secure hash computed over the server's public key (or is the server's public key itself, if it fits in 256 bits). That prevents same PoW solution generated by a client from being spent across multiple servers. The RandomX hasher is expensive to create, but since it depends only on `SKEY`, a server has to create only one verifier to handle any number of clients, while clients have to create one RandomX hasher for every server they want to send `PROVE_WORK` messages to.
+The RandomX hasher at both the client and the server is initialized with `SKEY`, which is a secure hash computed over the server's public key (or is the server's public key itself, if it fits in 256 bits). That prevents the same PoW solution generated by a client from being spent across multiple servers. The RandomX hasher is expensive to create, but since it depends only on `SKEY`, a server has to create only one verifier to handle any number of clients, while clients have to create one RandomX hasher for every server they want to send `PROVE_WORK` messages to.
 
 The PoW puzzle, that is, the data to be hashed by RandomX, is a concatenation of:
 
-- `CKEY`: A secure hash computer over a public key controlled by the client (or the client's public key itself, if it fits in 256 bits).
-- `HDATA`: A secure hash computer over some arbitrary application-defined data block inside the `PROVE_WORK` message.
+- `CKEY`: A secure hash computed over a public key controlled by the client (or the client's public key itself, if it fits in 256 bits).
+- `HDATA`: A secure hash computed over some arbitrary application-defined data block inside the `PROVE_WORK` message.
 - `TIME`: The current global UTC time at the client.
 - `NONCE`: An integer field incremented by the client during the RandomX hashing loop, where the client tries to meet the difficulty target.
 
@@ -183,4 +181,4 @@ Double-spending in the same server is solved by the server keeping track of all 
 
 The reference implementation imposes an internal absolute limit of 1,280 bytes to all `DATA` fields. In practice, all applications should use less than 1,280 bytes since that's the IPv6 MTU.
 
-To prevent UDP amplification attacks without imposing e.g. a large and fixed packet size for the first leg of every 3-way handshake, the reference implementation uses a spam filter built with a modified count-min sketch. The `spamThreshold` constructor argument for `Minx` should ideally receive a lower value for P2P node deployments, e.g. `250`, to prevent P2P networks being hijacked for distributed amplification attacks. Centralized services using Minx can just use what is currently the highest allowed value (`65535`).
+To prevent UDP amplification attacks without imposing e.g. a large and fixed packet size for the first leg of every 3-way handshake, the reference implementation uses a spam filter built with a modified count-min sketch. The `spamThreshold` constructor argument for `Minx` should ideally receive a lower value for P2P node deployments, e.g. `250`, to prevent P2P networks from being hijacked for distributed amplification attacks. Centralized services using MINX can just use what is currently the highest allowed value (`65535`).
