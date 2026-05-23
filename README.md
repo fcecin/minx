@@ -18,7 +18,7 @@ MINX allows peer nodes in a P2P network to send cheap Proof-of-Work (PoW) soluti
 
 On top of this primitive, a more complex trust and anti-spam system or resource economy can be built. Such higher-level middleware would serve user-facing decentralized applications and provide richer APIs. MINX provides middleware with a basic, generic trust mechanism that securely cold-starts resource exchanges between peer nodes in an application-agnostic way, irrespective of individual peer node capabilities or application intents.
 
-MINX was built as a step towards realizing the vision of [Public Computing](https://medium.com/@fcecin/public-computing-ebfb04489cb0).
+The [CES](https://github.com/fcecin/ces) system uses MINX.
 
 ## Protocol specification
 
