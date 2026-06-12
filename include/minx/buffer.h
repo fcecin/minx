@@ -72,6 +72,22 @@ public:
     }
   }
 
+  void putBytes(std::span<const uint8_t> bytes) {
+    static_assert(IsMutable, "putBytes(): buffer is not mutable");
+    size_t avail = buf_.size() - w_;
+    if (bytes.size() > avail) {
+      throw std::runtime_error(
+        std::format("AutoBuffer::putBytes(): exceeds backing buffer: {} > {}",
+                    bytes.size(), avail));
+    }
+    if (!bytes.empty()) {
+      std::memcpy(const_cast<uint8_t*>(buf_.data()) + w_, bytes.data(),
+                  bytes.size());
+    }
+    w_ += bytes.size();
+    s_ = std::max(s_, w_);
+  }
+
   boost::asio::mutable_buffer getAsioBufferToWrite() {
     static_assert(IsMutable,
                   "Cannot get mutable ASIO buffer from a ConstBuffer");
@@ -101,7 +117,7 @@ public:
   }
 
   /**
-   * Returns a view of the remaining bytes and advance the read cursor.
+   * Returns a view of the remaining bytes and advances the read cursor.
    * WARNING: The returned span points to internal memory. Use "immediately"
    * (for example, in the same scope); do NOT store the pointer long-term.
    */
@@ -125,7 +141,8 @@ public:
         "AutoBuffer::getRemainingBytes(): maximum size exceeded: {} > {}",
         count, maxSize));
     }
-    R result(count);
+    R result;
+    result.resize(count);
     if (count > 0) {
       std::memcpy(result.data(), &buf_[r_], count);
       r_ += count;
@@ -134,6 +151,38 @@ public:
   }
 
   size_t getRemainingBytesCount() const { return s_ > r_ ? s_ - r_ : 0; }
+
+  /**
+   * Returns a view of the next `n` bytes and advances the read cursor.
+   * Throws std::runtime_error if fewer than `n` bytes remain.
+   * WARNING: The returned span points to internal memory. Use "immediately"
+   * (for example, in the same scope); do NOT store the pointer long-term.
+   */
+  std::span<const uint8_t> getBytesSpan(size_t n) {
+    size_t count = getRemainingBytesCount();
+    if (n > count) {
+      throw std::runtime_error(std::format(
+        "AutoBuffer::getBytesSpan(): short read: {} > {}", n, count));
+    }
+    std::span<const uint8_t> result(buf_.data() + r_, n);
+    r_ += n;
+    return result;
+  }
+
+  template <typename R> R getBytes(size_t n) {
+    size_t count = getRemainingBytesCount();
+    if (n > count) {
+      throw std::runtime_error(
+        std::format("AutoBuffer::getBytes(): short read: {} > {}", n, count));
+    }
+    R result;
+    result.resize(n);
+    if (n > 0) {
+      std::memcpy(result.data(), &buf_[r_], n);
+      r_ += n;
+    }
+    return result;
+  }
 
   size_t getSize() const { return s_; }
 
