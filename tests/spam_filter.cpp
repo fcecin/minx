@@ -15,7 +15,7 @@ struct SpamFilterFixture {
   static constexpr size_t TEST_DEPTH = 3;
   static constexpr uint32_t TEST_THRESHOLD = 5;
   static constexpr int ROTATION_SEC = 60;
-  static constexpr int PASSING_CAPACITY = (TEST_THRESHOLD + 1) * TEST_DEPTH;
+  static constexpr int PASSING_CAPACITY = TEST_THRESHOLD * TEST_DEPTH;
 
   std::unique_ptr<SpamFilter> filter;
   std::chrono::steady_clock::time_point mockClock;
@@ -54,7 +54,7 @@ BOOST_AUTO_TEST_CASE(TestBelowThreshold) {
 BOOST_AUTO_TEST_CASE(TestAboveThreshold) {
   std::string ip = "192.168.1.1";
   spam(ip, PASSING_CAPACITY);
-  BOOST_TEST(check(ip) == true, "Packet 19 (Capacity+1) should drop");
+  BOOST_TEST(check(ip) == true, "Packet Capacity+1 should drop");
 }
 
 BOOST_AUTO_TEST_CASE(TestIPv4_IPv6_Independence) {
@@ -119,12 +119,12 @@ BOOST_AUTO_TEST_CASE(TestDifferentIPs) {
 BOOST_AUTO_TEST_CASE(TestExactThresholdBoundary) {
   std::string ip = "192.168.9.9";
   spam(ip, PASSING_CAPACITY);
-  BOOST_TEST(check(ip) == true, "Packet 19 should drop");
+  BOOST_TEST(check(ip) == true, "Packet Capacity+1 should drop");
   filter = std::make_unique<SpamFilter>(TEST_WIDTH, TEST_DEPTH, TEST_THRESHOLD,
                                         ROTATION_SEC);
   std::string ip2 = "192.168.10.10";
   spam(ip2, PASSING_CAPACITY - 1);
-  BOOST_TEST(check(ip2) == false, "Packet 18 should still pass");
+  BOOST_TEST(check(ip2) == false, "Packet Capacity should still pass");
 }
 
 BOOST_AUTO_TEST_CASE(TestSubnetMasking) {
@@ -144,6 +144,25 @@ BOOST_AUTO_TEST_CASE(TestSubnetMasking) {
   BOOST_TEST(check(v6_neighbor) == true,
              "v6 Neighbor in same /56 should be blocked");
   BOOST_TEST(check(v6_outsider) == false, "v6 IP in different /56 should pass");
+}
+
+BOOST_AUTO_TEST_CASE(TestDisabledThreshold) {
+  SpamFilter disabled(TEST_WIDTH, TEST_DEPTH, 0, ROTATION_SEC);
+  address addr = address::from_string("203.0.113.7");
+  for (int i = 0; i < PASSING_CAPACITY * 10; ++i) {
+    BOOST_TEST(disabled.updateAndCheck(addr, &mockClock) == false,
+               "disabled filter (threshold 0) must never reject");
+  }
+}
+
+BOOST_AUTO_TEST_CASE(TestNoWraparoundAtCellMax) {
+  PacketGuard guard(16, 1, std::numeric_limits<uint16_t>::max());
+  address addr = address::from_string("198.51.100.42");
+  for (int i = 0; i < 70000; ++i) {
+    guard.check(addr, true);
+  }
+  BOOST_TEST(guard.check(addr) == true,
+             "saturated cell must stay at 0xffff, not wrap to 0");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

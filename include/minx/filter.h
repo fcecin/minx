@@ -48,6 +48,9 @@ public:
   }
 
   bool check(const boost::asio::ip::address& addr, bool alsoUpdate = false) {
+    if (threshold_ == 0) {
+      return false;  // 0 disables the filter: never reject
+    }
     auto bucket = getAddressPrefix(addr);
     const uint8_t* data = nullptr;
     size_t len = 0;
@@ -74,7 +77,7 @@ public:
         min_idx = idx;
       }
     }
-    if (min_val > threshold_) {
+    if (min_val >= threshold_) {
       return true;
     }
     if (alsoUpdate && min_val < std::numeric_limits<uint16_t>::max()) {

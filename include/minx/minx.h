@@ -265,6 +265,12 @@ struct MinxConfig {
   static constexpr uint16_t DEFAULT_SPAM_THRESHOLD = 250;
 
   /**
+   * Maximum spam threshold value.
+   */
+  static constexpr uint16_t MAX_SPAM_THRESHOLD =
+      std::numeric_limits<uint16_t>::max();
+
+  /**
    * Instance string name for logging. Use "" to not log an instance name.
    */
   std::string instanceName = "";
