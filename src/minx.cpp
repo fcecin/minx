@@ -165,12 +165,26 @@ uint16_t Minx::openSocket(const SockAddr& sockAddr, IOContext& netIO,
       LOGTRACE << "openSocket ipv6 failed to set option v6_only == false";
     }
   }
+  auto resetPartialSocketState = [this]() {
+    if (socket_) {
+      boost::system::error_code ec;
+      socket_->close(ec);
+      socket_.reset();
+    }
+    netIORetryTimer_.reset();
+    netIOStrand_.reset();
+    netIOWorkGuard_.reset();
+    taskIOWorkGuard_.reset();
+    netIO_ = nullptr;
+    taskIO_ = nullptr;
+  };
   try {
     socket_->bind(sockAddr);
     boost::system::error_code ec;
     auto ep = socket_->local_endpoint(ec);
     if (ec) {
       LOGTRACE << "openSocket failed to get local endpoint";
+      resetPartialSocketState();
       return 0;
     }
     receive();
@@ -179,6 +193,7 @@ uint16_t Minx::openSocket(const SockAddr& sockAddr, IOContext& netIO,
     return serverBoundPort;
   } catch (const std::exception& e) {
     LOGTRACE << "openSocket bind failed: " << e.what();
+    resetPartialSocketState();
     return 0;
   }
 }
