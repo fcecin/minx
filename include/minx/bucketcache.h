@@ -42,6 +42,28 @@ public:
   }
 
   /**
+   * Try to save an entry in the cache; never cause a bucket clear and flip.
+   * @param key The key to store.
+   * @param value The value to store.
+   * @return `true` if could insert or update, `false` otherwise.
+   */
+  bool tryPut(const K& key, const V& value) {
+    std::scoped_lock lock(cacheMutex_);
+    checkFlip();
+    auto& bucket = cache_[activeBucket_];
+    auto it = bucket.find(key);
+    if (it != bucket.end()) {
+      it->second = value;
+      return true;
+    }
+    if (cacheSize_ > 0 && bucket.size() >= cacheSize_) {
+      return false;
+    }
+    bucket[key] = value;
+    return true;
+  }
+
+  /**
    * Get an entry from the cache.
    * @param key The key to look up.
    * @return The value associated with the key, or an empty std::optional if not
@@ -164,6 +186,25 @@ public:
     if (cacheSize_ > 0 && bucket.size() >= cacheSize_) {
       flip();
     }
+  }
+
+  /**
+   * Try to save an element in the cache; never cause a bucket clear and flip.
+   * @param element The element to store.
+   * @return `true` if could insert or update, `false` otherwise.
+   */
+  bool tryPut(const E& element) {
+    std::scoped_lock lock(cacheMutex_);
+    checkFlip();
+    auto& bucket = cache_[activeBucket_];
+    if (bucket.count(element)) {
+      return true;
+    }
+    if (cacheSize_ > 0 && bucket.size() >= cacheSize_) {
+      return false;
+    }
+    bucket.insert(element);
+    return true;
   }
 
   /**
