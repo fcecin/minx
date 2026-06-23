@@ -87,6 +87,22 @@ void MinxClientTransport::sendProveWork(const MinxProveWork& msg) {
   else if (tcp_) tcp_->sendProveWork(serverAddr_, msg);
 }
 
+bool MinxClientTransport::setRemoteEndpoint(
+  const boost::asio::ip::udp::endpoint& serverEndpoint) {
+  if (!udp_) return false;
+  serverAddr_ = SockAddr(serverEndpoint.address(), serverEndpoint.port());
+  return true;
+}
+
+bool MinxClientTransport::setRemoteEndpoint(
+  const boost::asio::ip::tcp::endpoint& proxyEndpoint) {
+  if (!tcp_) return false;
+  // disconnect() restarts the io_context for the reconnect.
+  tcp_->disconnect();
+  proxyEndpoint_ = proxyEndpoint;
+  return tcp_->connect(proxyEndpoint_);
+}
+
 uint64_t MinxClientTransport::generatePassword() {
   if (udp_) return udp_->generatePassword();
   if (tcp_) return tcp_->generatePassword();

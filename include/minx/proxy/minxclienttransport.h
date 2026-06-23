@@ -66,11 +66,24 @@ public:
   void stop();
 
   // -- Send methods --
-  // Destination is set at construction (server endpoint or proxy endpoint).
+  // Destination is the remote set at construction or by setRemoteEndpoint.
 
   void sendGetInfo(const MinxGetInfo& msg);
   void sendMessage(const MinxMessage& msg);
   void sendProveWork(const MinxProveWork& msg);
+
+  // Change the remote at runtime. The udp overload applies in UDP mode, the tcp
+  // overload in TCP mode; each returns false in the other mode. Not thread-safe
+  // against the send methods; serialize these and sends on one thread.
+
+  // Swaps the destination, keeping the socket and IO threads. The open socket
+  // can still deliver a previous server's reply; the caller filters inbound by
+  // sender address. Returns false in TCP mode.
+  bool setRemoteEndpoint(const boost::asio::ip::udp::endpoint& serverEndpoint);
+
+  // Disconnects and reconnects to the new proxy. Returns false in UDP mode or
+  // on reconnect failure.
+  bool setRemoteEndpoint(const boost::asio::ip::tcp::endpoint& proxyEndpoint);
 
   /** Generate a random password for ticket exchange. */
   uint64_t generatePassword();
