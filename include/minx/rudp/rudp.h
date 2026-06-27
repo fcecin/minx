@@ -529,6 +529,14 @@ public:
   /// fires for each with reason = IDLE. Does NOT emit HS_CLOSE.
   size_t gc(std::chrono::microseconds idleThreshold);
 
+  /// Exempt a channel from idle GC. A persistent channel is never closed
+  /// by the inactivity timeout (neither the tick() sweep nor gc()), so it
+  /// stays up with no traffic and needs no keepalive. Liveness for such a
+  /// channel is the application's concern. No-op if the channel doesn't
+  /// exist. Clearing (persistent=false) restores normal idle GC.
+  void setChannelPersistent(const SockAddr& peer, uint32_t channel_id,
+                            bool persistent = true);
+
   // -----------------------------------------------------------------------
   // Read-only inspection
   // -----------------------------------------------------------------------
@@ -598,6 +606,10 @@ private:
 
     // Bookkeeping
     uint64_t lastActivityUs = 0;
+    // Exempt from idle GC (setChannelPersistent). Long-lived channels
+    // (the CES server-to-server peer mesh) opt out of the inactivity
+    // timeout instead of faking activity with a keepalive.
+    bool persistent = false;
 
     // Metrics: cumulative counters + the integral's per-channel state.
     ChannelMetrics metrics;

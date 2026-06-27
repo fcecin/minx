@@ -126,6 +126,10 @@ void RudpStream::detach() {
   doClose(/*tearDownChannel=*/false);
 }
 
+void RudpStream::setPersistent(bool persistent) {
+  if (rudp()) rudp()->setChannelPersistent(peer(), channelId(), persistent);
+}
+
 void RudpStream::doClose(bool tearDownChannel) {
   if (closed_)
     return;

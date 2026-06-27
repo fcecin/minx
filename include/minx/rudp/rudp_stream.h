@@ -143,6 +143,12 @@ public:
   /// channel. Idempotent.
   void detach();
 
+  /// Exempt this channel from idle GC (Rudp::setChannelPersistent). The
+  /// channel stays up with no traffic and needs no keepalive; liveness is
+  /// the application's concern. Safe only after onOpened() has wired the
+  /// back-references; a no-op if not yet bound.
+  void setPersistent(bool persistent = true);
+
   /// True until the stream is closed by any path.
   bool is_open() const noexcept { return !closed_; }
 

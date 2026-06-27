@@ -944,6 +944,57 @@ BOOST_AUTO_TEST_CASE(TestRudpChannelInactivityGC) {
 }
 
 // ---------------------------------------------------------------------------
+// 12a2. setChannelPersistent exempts a channel from idle GC.
+//
+// alice marks her side persistent and leaves bob's side normal as a
+// control. After advancing well past channelInactivityTimeout, alice's
+// channel survives (no keepalive, no traffic) while bob's idle side is
+// GC'd as usual.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpPersistentChannelSurvivesIdleGC) {
+  minx::RudpConfig cfg;
+  cfg.channelInactivityTimeout = std::chrono::milliseconds(100);
+  cfg.rngSeed = 0xBEEF;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBEF0;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(9930), bA = makeAddr(9931);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 0;
+  aliceL.push(alice, bA, 1, B("hi"), true);
+  alice.tick(now);
+  wire.deliverAll();
+  wire.deliverAll();
+  alice.tick(now);
+  wire.deliverAll();
+
+  BOOST_REQUIRE(alice.isEstablished(bA, 1));
+  BOOST_REQUIRE(bob.isEstablished(aA, 1));
+
+  // Mark alice's side persistent; bob's side stays normal (the control).
+  alice.setChannelPersistent(bA, 1);
+
+  // Advance well past the inactivity timeout.
+  now += 200'000;
+  alice.tick(now);
+  bob.tick(now);
+
+  BOOST_TEST(alice.channelCount(bA) == 1u);  // persistent: survives
+  BOOST_TEST(bob.channelCount(aA) == 0u);    // normal: GC'd
+
+  // Clearing the flag restores normal idle GC on the next sweep.
+  alice.setChannelPersistent(bA, 1, false);
+  now += 200'000;
+  alice.tick(now);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+}
+
+// ---------------------------------------------------------------------------
 // 12b. close() — local teardown verb, drops channel state immediately.
 //
 // Verifies that close() is purely local: alice drops her channel, any

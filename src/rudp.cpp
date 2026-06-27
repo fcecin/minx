@@ -610,7 +610,7 @@ size_t Rudp::gc(std::chrono::microseconds idleThreshold) {
       const uint64_t age = (currentTimeUs_ > cs.lastActivityUs)
                              ? (currentTimeUs_ - cs.lastActivityUs)
                              : 0;
-      if (age >= thresholdUs) {
+      if (!cs.persistent && age >= thresholdUs) {
         LOGTRACE << "gc evict" << SVAR(pit->first) << VAR(cit->first)
                  << VAR(age);
         destroyChannel(pit->first, cit->first, cs, CloseReason::IDLE);
@@ -628,6 +628,13 @@ size_t Rudp::gc(std::chrono::microseconds idleThreshold) {
     }
   }
   return evicted;
+}
+
+void Rudp::setChannelPersistent(const SockAddr& peer, uint32_t channel_id,
+                                bool persistent) {
+  ChannelState* cs = findChannel(peer, channel_id);
+  if (!cs) return;
+  cs->persistent = persistent;
 }
 
 // ===========================================================================
@@ -897,8 +904,8 @@ void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
       // reason, since those paths discover the trigger here.
       CloseReason dropReason = cs.closeReason;
 
-      // Idle GC
-      if (now_us > cs.lastActivityUs &&
+      // Idle GC (persistent channels opt out)
+      if (!cs.persistent && now_us > cs.lastActivityUs &&
           (now_us - cs.lastActivityUs) >= channelInactivityUs_) {
         LOGTRACE << "GC idle channel" << SVAR(pit->first) << VAR(cit->first);
         drop = true;
