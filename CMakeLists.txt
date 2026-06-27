@@ -8,6 +8,12 @@ project(minx)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# Portable -march by default; --native for local. Subdir builds inherit parent's.
+set(MINX_MARCH "x86-64-v3" CACHE STRING "Target -march; 'native' = local-only")
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  add_compile_options(-march=${MINX_MARCH})
+endif()
+
 include(FetchContent)
 
 # If no network connection, just use cached FetchContent deps
@@ -33,9 +39,12 @@ FetchContent_Declare(
     GIT_TAG        master
 )
 
-# This tells RandomX to compile with optimizations for the current machine's CPU.
-# Comment the line below if you need portable binaries.
-set(ARCH "native" CACHE STRING "Set RandomX architecture optimizations" FORCE)
+# RandomX: native only on an explicit native build, else inherit -march above.
+if(MINX_MARCH STREQUAL "native")
+  set(ARCH "native" CACHE STRING "Set RandomX architecture optimizations" FORCE)
+else()
+  set(ARCH "default" CACHE STRING "Set RandomX architecture optimizations" FORCE)
+endif()
 
 FetchContent_MakeAvailable(randomx)
 

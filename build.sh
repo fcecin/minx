@@ -15,6 +15,9 @@ print_help() {
     echo "  minsizerel      Builds the smallest possible release."
     echo ""
     echo "Options:"
+    echo "  --native        Build for the build host's exact CPU (-march=native)."
+    echo "                  Faster but NOT portable -- local dev/bench only."
+    echo "                  Default is -march=x86-64-v3 (portable, shippable)."
     echo "  --asan          Enables AddressSanitizer."
     echo "  --test [FILTER] Runs the unit tests after building. Optional Boost.Test filter."
     echo "                  Examples:"
@@ -98,9 +101,14 @@ build_one_config() {
         LINKER_FLAGS=""
     fi
 
+    # Portable -march by default; --native pins to the build host.
+    local MARCH="x86-64-v3"
+    [ "$ENABLE_NATIVE" = true ] && MARCH="native"
+
     local CMAKE_CMD=(
         cmake -S . -B "${BUILD_DIR}"
         -D CMAKE_BUILD_TYPE="${BUILD_TYPE_CAMEL}"
+        -D MINX_MARCH="${MARCH}"
         "-DCMAKE_CXX_FLAGS=${SANITIZE_FLAGS}"
         "-DCMAKE_C_FLAGS=${SANITIZE_FLAGS}"
         "-DCMAKE_EXE_LINKER_FLAGS=${LINKER_FLAGS}"
@@ -183,6 +191,7 @@ RUN_TESTS=false
 TEST_FILTER=""
 DO_CLEAN=false
 ENABLE_ASAN=false
+ENABLE_NATIVE=false
 DO_DEEP_CLEAN=false
 
 # Parse arguments — --test may optionally consume the next arg as a filter.
@@ -215,6 +224,9 @@ while [ $i -lt ${#ARGS[@]} ]; do
             ;;
         --clean)
             DO_CLEAN=true
+            ;;
+        --native)
+            ENABLE_NATIVE=true
             ;;
         --asan)
             ENABLE_ASAN=true
