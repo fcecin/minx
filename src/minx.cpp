@@ -211,8 +211,7 @@ void Minx::closeSocket(bool shouldPoll) {
     return;
   }
   if (netIORetryTimer_) {
-    boost::system::error_code ec;
-    netIORetryTimer_->cancel(ec);
+    netIORetryTimer_->cancel();
   }
   std::atomic<bool> done_flag(false);
   boost::asio::post(*netIOStrand_, [this, &done_flag]() {

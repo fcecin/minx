@@ -25,7 +25,7 @@ public:
 
   void connect(uint16_t port) {
     sock_.connect(
-      tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), port));
+      tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
   }
 
   void sendMsg(const uint8_t* data, size_t len) {
@@ -108,7 +108,7 @@ static void pollUntil(asio::io_context& io, std::function<bool()> pred,
 }
 
 static auto anyEp() {
-  return tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), 0);
+  return tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0);
 }
 
 BOOST_AUTO_TEST_SUITE(TcpServerSuite)

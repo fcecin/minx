@@ -120,9 +120,9 @@ int main(int argc, char* argv[]) {
 
   minx::Hash srvKey = generateRandomHash();
   minx::Hash cliKey = generateRandomHash();
-  minx::SockAddr srvAddr(boost::asio::ip::address::from_string("127.0.0.1"),
+  minx::SockAddr srvAddr(boost::asio::ip::make_address("127.0.0.1"),
                          9000);
-  minx::SockAddr cliAddr(boost::asio::ip::address::from_string("127.0.0.1"),
+  minx::SockAddr cliAddr(boost::asio::ip::make_address("127.0.0.1"),
                          9001);
 
   TestServerListener srvListener(srvKey);

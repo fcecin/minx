@@ -27,7 +27,7 @@ namespace minx {
 inline boost::asio::ip::address
 getAddressPrefix(boost::asio::ip::address addr) {
   if (addr.is_v6() && addr.to_v6().is_v4_mapped()) {
-    addr = addr.to_v6().to_v4();
+    addr = boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, addr.to_v6());
   }
   if (addr.is_v4()) {
     auto bytes = addr.to_v4().to_bytes();

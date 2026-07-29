@@ -7,6 +7,7 @@
 namespace {
 
 using boost::asio::ip::address;
+using boost::asio::ip::make_address;
 
 using namespace minx;
 
@@ -29,14 +30,14 @@ struct SpamFilterFixture {
   void advanceTime(int seconds) { mockClock += std::chrono::seconds(seconds); }
 
   void spam(const std::string& ip_str, int count) {
-    address addr = address::from_string(ip_str);
+    address addr = make_address(ip_str);
     for (int i = 0; i < count; ++i) {
       filter->updateAndCheck(addr, &mockClock);
     }
   }
 
   bool check(const std::string& ip_str) {
-    return filter->updateAndCheck(address::from_string(ip_str), &mockClock);
+    return filter->updateAndCheck(make_address(ip_str), &mockClock);
   }
 };
 
@@ -148,7 +149,7 @@ BOOST_AUTO_TEST_CASE(TestSubnetMasking) {
 
 BOOST_AUTO_TEST_CASE(TestDisabledThreshold) {
   SpamFilter disabled(TEST_WIDTH, TEST_DEPTH, 0, ROTATION_SEC);
-  address addr = address::from_string("203.0.113.7");
+  address addr = make_address("203.0.113.7");
   for (int i = 0; i < PASSING_CAPACITY * 10; ++i) {
     BOOST_TEST(disabled.updateAndCheck(addr, &mockClock) == false,
                "disabled filter (threshold 0) must never reject");
@@ -157,7 +158,7 @@ BOOST_AUTO_TEST_CASE(TestDisabledThreshold) {
 
 BOOST_AUTO_TEST_CASE(TestNoWraparoundAtCellMax) {
   PacketGuard guard(16, 1, std::numeric_limits<uint16_t>::max());
-  address addr = address::from_string("198.51.100.42");
+  address addr = make_address("198.51.100.42");
   for (int i = 0; i < 70000; ++i) {
     guard.check(addr, true);
   }

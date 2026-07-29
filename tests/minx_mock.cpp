@@ -13,7 +13,7 @@ minx::Hash makeKey() {
 }
 
 TestNode::TestNode(std::string n, std::string ip, uint16_t port)
-    : name(n), addr(boost::asio::ip::address::from_string(ip), port),
+    : name(n), addr(boost::asio::ip::make_address(ip), port),
       key(makeKey()) {
   minx::MinxConfig cfg;
   cfg.trustLoopback = true;
@@ -26,7 +26,7 @@ TestNode::TestNode(std::string n, std::string ip, uint16_t port)
 
 TestNode::TestNode(std::string n, std::string ip, uint16_t port,
                    const minx::MinxConfig& config)
-    : name(n), addr(boost::asio::ip::address::from_string(ip), port),
+    : name(n), addr(boost::asio::ip::make_address(ip), port),
       key(makeKey()) {
   minx = std::make_unique<minx::Minx>(&listener, config);
   minx->setExtensionHandler(

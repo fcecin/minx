@@ -104,8 +104,8 @@ void MinxRunner::stop() {
       t.join();
   powThreads_.clear();
 
-  netIO_.reset();
-  taskIO_.reset();
+  netIO_.restart();
+  taskIO_.restart();
 
   LOGTRACE << "stop stopped";
 }
