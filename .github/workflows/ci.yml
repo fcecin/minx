@@ -31,10 +31,13 @@ jobs:
         run: brew install cmake ninja boost
       # Examples are Linux developer demos (GNU-ld -z noexecstack, a POSIX
       # poll()/fork harness); the library + tests are the portable contract.
+      # ICU on the linker path: static Boost.Log pulls in Boost.Regex, which
+      # links Homebrew's keg-only ICU.
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DMINX_BUILD_EXAMPLES=OFF
+          -DCMAKE_EXE_LINKER_FLAGS="-L$(brew --prefix icu4c)/lib"
       - name: Build
         run: cmake --build build
       - name: Test
