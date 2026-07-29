@@ -9,8 +9,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # Portable -march by default; --native for local. Subdir builds inherit parent's.
+# x86 only: other ISAs (e.g. Apple Silicon arm64) reject x86-64-v3.
 set(MINX_MARCH "x86-64-v3" CACHE STRING "Target -march; 'native' = local-only")
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   add_compile_options(-march=${MINX_MARCH})
 endif()
 

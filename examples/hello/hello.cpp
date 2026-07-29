@@ -1,5 +1,6 @@
 #include <minx/minx.h>
 
+#include <iomanip>
 #include <iostream>
 
 #include <minx/blog.h>
