@@ -234,6 +234,7 @@ RudpStream::closeReasonToError(Rudp::CloseReason reason) {
   case Rudp::CloseReason::HANDSHAKE_FAILED:
   case Rudp::CloseReason::REORDER_BREACH:
   case Rudp::CloseReason::PEER_RESTART:
+  case Rudp::CloseReason::SEQNO_EXHAUSTED:
     // Transport pulled out from under the stream. operation_aborted
     // matches Asio's "the operation was cancelled out from under
     // you." Application can call getCloseReason() for the cause.

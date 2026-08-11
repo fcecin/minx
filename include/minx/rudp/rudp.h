@@ -74,8 +74,12 @@ struct RudpConfig {
   size_t maxChannelsPerPeer = 1;
 
   /// Per-channel reorder buffer caps. Either bound trips first.
+  /// Keep maxReorderBytesPerChannel >= maxReorderMessagesPerChannel *
+  /// MAX_MESSAGE_SIZE. The send window is count-bounded only, so a full
+  /// window of max-size messages (~1024 * 1241 = 1.27 MB) must fit here.
+  /// A smaller byte cap trips REORDER_BREACH (a ban) on normal loss.
   size_t maxReorderMessagesPerChannel = 1024;
-  size_t maxReorderBytesPerChannel = 1024 * 1024; // 1 MB
+  size_t maxReorderBytesPerChannel = 2 * 1024 * 1024; // 2 MB
 
   /// Channel idle GC: drop stale tuples with no traffic for this long.
   std::chrono::microseconds channelInactivityTimeout = std::chrono::seconds(60);
@@ -211,6 +215,8 @@ public:
     REORDER_BREACH = 3,   // reorder buffer cap breached (resource attack)
     PEER_CLOSED = 4,      // peer sent HS_CLOSE
     PEER_RESTART = 5,     // peer reset its end (different nonce on est. ch.)
+    SEQNO_EXHAUSTED = 6,  // msg_id near the 32-bit limit; closed before
+                          // wraparound. Upper layer reopens.
   };
   // RUDP only enumerates reasons it can itself produce or represent.
   // Application-level "why am I closing" (billing eviction, abuse
@@ -744,6 +750,12 @@ private:
   Minx* minx_;         // optional, may be null
   Csprng rng_;
   uint64_t currentTimeUs_ = 0;
+
+  // > 0 while a ChannelHandler callback runs. A dispatch loop then holds a
+  // ChannelState& / map iterator, so closeChannel() and gc() must not free
+  // it: they mark it CLOSED and let the doPulseWork() sweep reap it.
+  // doPulseWork() no-ops re-entrantly so a callback cannot nest a pulse.
+  unsigned dispatchDepth_ = 0;
 };
 
 /// Stream operators for the public Rudp enums. Print the enum name

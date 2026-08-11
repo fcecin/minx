@@ -13,6 +13,25 @@ LOG_MODULE_DISABLED("rudp")
 
 namespace minx {
 
+// Bumps Rudp::dispatchDepth_ for a ChannelHandler callback so a re-entrant
+// closeChannel()/gc() defers teardown instead of freeing state a dispatch
+// loop still holds. Balanced on scope exit.
+namespace {
+struct DepthGuard {
+  unsigned& depth;
+  explicit DepthGuard(unsigned& d) : depth(d) { ++depth; }
+  ~DepthGuard() { --depth; }
+  DepthGuard(const DepthGuard&) = delete;
+  DepthGuard& operator=(const DepthGuard&) = delete;
+};
+
+// 32-bit reliable sequence numbers use plain integer compares for dedup
+// and porosity. Instead of serial-number arithmetic, close the channel
+// near the top of the space; the headroom exceeds the max in-flight
+// window, so the close completes before any id wraps. Upper layer reopens.
+constexpr uint32_t SEQNO_CLOSE_THRESHOLD = 0xFFFF0000u;
+} // namespace
+
 // ===========================================================================
 // CRC32C wire integrity
 // ===========================================================================
@@ -355,7 +374,10 @@ void Rudp::wireHandler(const SockAddr& peer, uint32_t channel_id,
   handler->cid_ = channel_id;
   cs.handler = std::move(handler);
   cs.handlerEstablished = false;
-  cs.handler->onOpened();
+  {
+    DepthGuard g(dispatchDepth_);
+    cs.handler->onOpened();
+  }
 }
 
 bool Rudp::registerChannel(const SockAddr& peer, uint32_t channel_id,
@@ -373,6 +395,13 @@ bool Rudp::registerChannel(const SockAddr& peer, uint32_t channel_id,
     return false; // per-peer channel cap
   }
   wireHandler(peer, channel_id, *cs, std::move(handler));
+  // onOpened may have closed the channel (CLOSED, not freed). Reap it
+  // rather than resurrect it into OPEN_SENT.
+  if (cs->handshakeState == HandshakeState::CLOSED) {
+    destroyChannel(peer, channel_id, *cs, cs->closeReason);
+    eraseChannelSilent(peer, channel_id);
+    return true;
+  }
   // Kick off the handshake: outbound registration is the application's
   // declaration "I want this channel," and the wire-level cost of
   // owning a channel is the OPEN. State IDLE → OPEN_SENT here so
@@ -503,7 +532,10 @@ void Rudp::destroyChannel(const SockAddr& peer, uint32_t channel_id,
   if (auto handler = std::move(cs.handler)) {
     cs.handler.reset();
     cs.handlerEstablished = false;
-    handler->onClosed(reason);
+    {
+      DepthGuard g(dispatchDepth_);
+      handler->onClosed(reason);
+    }
     // handler shared_ptr drops here when the local goes out of
     // scope, releasing Rudp's ref. App-side refs (if any) survive.
   }
@@ -519,6 +551,7 @@ std::ostream& operator<<(std::ostream& os, Rudp::CloseReason r) {
   case Rudp::CloseReason::REORDER_BREACH:   return os << "REORDER_BREACH";
   case Rudp::CloseReason::PEER_CLOSED:      return os << "PEER_CLOSED";
   case Rudp::CloseReason::PEER_RESTART:     return os << "PEER_RESTART";
+  case Rudp::CloseReason::SEQNO_EXHAUSTED:  return os << "SEQNO_EXHAUSTED";
   }
   return os << "?(" << static_cast<int>(r) << ")";
 }
@@ -587,6 +620,18 @@ void Rudp::closeChannel(const SockAddr& peer, uint32_t channel_id,
   if (cs.handshakeState == HandshakeState::ESTABLISHED) {
     emitHandshakeClose(peer, channel_id, cs); // charges bytesSent internally
   }
+
+  // Re-entrant call (inside a handler callback): a dispatch loop still
+  // holds this ChannelState& / a reorderBuf iterator, so destroy + erase
+  // here is a use-after-free. Mark CLOSED and let the doPulseWork() sweep
+  // reap it. onClosed then fires from the sweep, not nested in the handler
+  // (which could otherwise free itself mid-callback).
+  if (dispatchDepth_ > 0) {
+    cs.handshakeState = HandshakeState::CLOSED;
+    cs.closeReason = reason;
+    return;
+  }
+
   // Centralized teardown: final integral update + Listener::onClosed,
   // done before erase so the listener can call metricsFor() to read
   // final values. The reason is forwarded to the listener.
@@ -601,6 +646,10 @@ size_t Rudp::gc(std::chrono::microseconds idleThreshold) {
   const uint64_t thresholdUs = static_cast<uint64_t>(idleThreshold.count());
   size_t evicted = 0;
 
+  // Re-entrant call: mark idle channels CLOSED for the sweep instead of
+  // erasing inline, which would invalidate an outer iterator.
+  const bool reentrant = dispatchDepth_ > 0;
+
   for (auto pit = peers_.begin(); pit != peers_.end();) {
     auto& peerState = pit->second;
 
@@ -610,12 +659,20 @@ size_t Rudp::gc(std::chrono::microseconds idleThreshold) {
       const uint64_t age = (currentTimeUs_ > cs.lastActivityUs)
                              ? (currentTimeUs_ - cs.lastActivityUs)
                              : 0;
-      if (!cs.persistent && age >= thresholdUs) {
+      if (!cs.persistent && age >= thresholdUs &&
+          cs.handshakeState != HandshakeState::CLOSED) {
         LOGTRACE << "gc evict" << SVAR(pit->first) << VAR(cit->first)
                  << VAR(age);
-        destroyChannel(pit->first, cit->first, cs, CloseReason::IDLE);
-        cit = peerState.channels.erase(cit);
-        ++evicted;
+        if (reentrant) {
+          cs.handshakeState = HandshakeState::CLOSED;
+          cs.closeReason = CloseReason::IDLE;
+          ++evicted;
+          ++cit;
+        } else {
+          destroyChannel(pit->first, cit->first, cs, CloseReason::IDLE);
+          cit = peerState.channels.erase(cit);
+          ++evicted;
+        }
       } else {
         ++cit;
       }
@@ -794,6 +851,16 @@ bool Rudp::push(const SockAddr& peer, uint32_t channel_id, const Bytes& msg,
     return true;
   }
 
+  // Close before nextSeq reaches the wrap ceiling; reject this write.
+  // push() may run inside onWritable, so closeChannel may defer. Do not
+  // touch cs afterwards.
+  if (cs->nextSeq >= SEQNO_CLOSE_THRESHOLD) {
+    LOGDEBUG << "push reject: seqno near limit" << SVAR(peer)
+             << VAR(channel_id);
+    closeChannel(peer, channel_id, CloseReason::SEQNO_EXHAUSTED);
+    return false;
+  }
+
   // Already established: assign a msg_id and enqueue.
   // Soft cap: keep send buffer below the per-channel reorder cap so a
   // pathological sender doesn't run away. Same numeric ceiling for now.
@@ -878,6 +945,12 @@ void Rudp::runPulses(uint64_t now_us) {
 }
 
 void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
+  // Never pulse from inside a handler callback: it iterates and erases
+  // peers_/channels under a dispatch loop. The outer tick()/onPacket()
+  // pulses after dispatch unwinds (depth 0).
+  if (dispatchDepth_ > 0)
+    return;
+
   // 0) Advance memory integrals for every live channel up to now_us.
   //    Done before the destroy loop so channels that are about to be
   //    GC'd see their last-window integral go in (destroyChannel
@@ -1368,6 +1441,9 @@ void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
 
 void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
                                 ChannelState& cs) {
+  // Closed during onOpened: do not resurrect; the sweep reaps it.
+  if (cs.handshakeState == HandshakeState::CLOSED)
+    return;
   cs.handshakeState = HandshakeState::ESTABLISHED;
   // Stamp the metrics open-time AND start the integral clock at the
   // ESTABLISHED transition. The integral could have been ticking
@@ -1397,8 +1473,13 @@ void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
   // simultaneous open, peer restart after reset) flows through here.
   cs.handlerEstablished = true;
   if (cs.handler) {
+    DepthGuard g(dispatchDepth_);
     cs.handler->onEstablished();
   }
+  // Closed during onEstablished: stop before onWritable and the
+  // closeReason reset.
+  if (cs.handshakeState != HandshakeState::ESTABLISHED)
+    return;
 
   // Wake any stream that deferred a write during handshake. The
   // onWritable callback is safe to fire even if nothing was pending;
@@ -1406,8 +1487,12 @@ void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
   // if so retry, else no-op." Fired AFTER onEstablished so the
   // handler's "I'm ready" hook runs first.
   if (hadPending && cs.handler) {
+    DepthGuard g(dispatchDepth_);
     cs.handler->onWritable();
   }
+  // Closed during onWritable: stop before the closeReason reset.
+  if (cs.handshakeState != HandshakeState::ESTABLISHED)
+    return;
 
   // Reset the channel's stamped closeReason so a later destruction
   // doesn't accidentally inherit a stale value.
@@ -1502,8 +1587,12 @@ void Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
   // The handler is allowed (and expected) to push() more bytes back
   // into sendBuf from this callback; that's the whole point.
   if (ackedSomething && cs->handler) {
+    DepthGuard g(dispatchDepth_);
     cs->handler->onWritable();
   }
+  // Closed during onWritable (CLOSED, cs still valid): stop here.
+  if (cs->handshakeState != HandshakeState::ESTABLISHED)
+    return;
 
   // ---- 2) Process incoming reliable messages ----
 
@@ -1548,11 +1637,23 @@ void Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
 
   deliverInOrder(peer, channel_id, *cs);
 
+  // Closed during onReliableMessage (CLOSED, cs still valid): stop here.
+  if (cs->handshakeState != HandshakeState::ESTABLISHED)
+    return;
+
+  // Close before solidAck reaches the wrap ceiling; sender-side backstop.
+  if (cs->solidAck >= SEQNO_CLOSE_THRESHOLD) {
+    cs->handshakeState = HandshakeState::CLOSED;
+    cs->closeReason = CloseReason::SEQNO_EXHAUSTED;
+    return;
+  }
+
   // ---- 4) Process the unreliable tail ----
 
   if (buf.getRemainingBytesCount() > 0) {
     Bytes tail = buf.getRemainingBytes<Bytes>();
     if (cs->handler) {
+      DepthGuard g(dispatchDepth_);
       cs->handler->onUnreliableMessage(tail);
     }
   }
@@ -1563,6 +1664,10 @@ void Rudp::deliverInOrder(const SockAddr& peer, uint32_t channel_id,
   // Walk the reorder buffer from the oldest entry, delivering anything
   // that's contiguous (msg_id == solidAck + 1).
   while (true) {
+    // onReliableMessage may close the channel (CLOSED, cs still valid).
+    // Stop delivering.
+    if (cs.handshakeState != HandshakeState::ESTABLISHED)
+      break;
     auto it = cs.reorderBuf.begin();
     if (it == cs.reorderBuf.end())
       break;
@@ -1570,6 +1675,7 @@ void Rudp::deliverInOrder(const SockAddr& peer, uint32_t channel_id,
       break;
 
     if (cs.handler) {
+      DepthGuard g(dispatchDepth_);
       cs.handler->onReliableMessage(it->second);
     }
     cs.reorderBytes -= it->second.size();

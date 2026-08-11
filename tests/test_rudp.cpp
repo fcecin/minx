@@ -3939,4 +3939,91 @@ BOOST_AUTO_TEST_CASE(TestRudpCloseChannelOnDrainSecondCallEscalates) {
   BOOST_TEST(!alice.isEstablished(bA, 1));
 }
 
+// closeChannel() from inside a delivery callback is documented as
+// permitted. It must defer teardown, not free the ChannelState mid-
+// dispatch. Regression guard for the use-after-free; run under --asan.
+
+BOOST_AUTO_TEST_CASE(TestRudpReentrantCloseFromReliableMessage) {
+  struct ClosingHandler : TestChannelHandler {
+    void onReliableMessage(const Bytes& m) override {
+      TestChannelHandler::onReliableMessage(m);
+      rudp()->closeChannel(peer(), channelId());
+    }
+  };
+
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0x1234;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0x5678;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+  bobL.handlerFactory = [](const SockAddr&, uint32_t) {
+    return std::make_shared<ClosingHandler>();
+  };
+
+  SockAddr aA = makeAddr(15000), bA = makeAddr(15001);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 0;
+  // Two messages in one packet. Delivering the first closes the channel;
+  // the second must not be delivered and must not touch freed state.
+  aliceL.push(alice, bA, 7, B("aaa"), true);
+  aliceL.push(alice, bA, 7, B("bbb"), true);
+  alice.tick(now);
+  wire.deliverAll();
+
+  BOOST_REQUIRE_GE(bobL.received.size(), 1u);
+  BOOST_TEST(std::string(bobL.received[0].data.begin(),
+                         bobL.received[0].data.end()) == "aaa");
+  BOOST_TEST(bobL.received.size() == 1u); // "bbb" dropped post-close
+  BOOST_TEST(bobL.closedCount() == 1u);   // onClosed fired from the sweep
+  BOOST_TEST(bob.channelCount(bA) == 0u);
+}
+
+BOOST_AUTO_TEST_CASE(TestRudpReentrantCloseFromWritable) {
+  // onWritable runs before the rest of handleChannelPacket, so a close
+  // there must stop the continuation too.
+  struct ClosingOnWritable : TestChannelHandler {
+    void onWritable() override {
+      TestChannelHandler::onWritable();
+      rudp()->closeChannel(peer(), channelId());
+    }
+  };
+
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xABCD;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xDCBA;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+  aliceL.handlerFactory = [](const SockAddr&, uint32_t) {
+    return std::make_shared<ClosingOnWritable>();
+  };
+
+  SockAddr aA = makeAddr(15100), bA = makeAddr(15101);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 0;
+  auto h = std::make_shared<ClosingOnWritable>();
+  h->listener = &aliceL;
+  h->key = {bA, 3};
+  BOOST_REQUIRE(alice.registerChannel(bA, 3, h));
+  aliceL.handlers[{bA, 3}] = h;
+
+  alice.push(bA, 3, B("hello"), true);
+  for (int i = 0; i < 6 && alice.channelCount(bA) > 0; ++i) {
+    alice.tick(now);
+    bob.tick(now);
+    wire.deliverAll();
+    now += 1000;
+  }
+
+  BOOST_TEST(h->closed);
+  BOOST_TEST(alice.channelCount(bA) == 0u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
