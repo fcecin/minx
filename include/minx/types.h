@@ -24,6 +24,19 @@ using IOContext = boost::asio::io_context;
 using Bytes = boost::container::static_vector<char, MAX_DATA_SIZE>;
 using Hash = std::array<uint8_t, 32>;
 
+/**
+ * Check if an address is a loopback address. A v4-mapped IPv6 address
+ * (::ffff:127.x.y.z, the form a dual-stack socket reports for a v4 sender)
+ * is loopback when its IPv4 address is loopback.
+ */
+inline bool isLoopback(const IPAddr& addr) {
+  if (addr.is_v6() && addr.to_v6().is_v4_mapped())
+    return boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped,
+                                            addr.to_v6())
+      .is_loopback();
+  return addr.is_loopback();
+}
+
 inline void bytesToHash(Hash& dest, const Bytes& src) {
   if (src.size() != 64) {
     throw std::invalid_argument("src is not a 64-byte buffer");

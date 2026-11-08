@@ -505,7 +505,7 @@ uint64_t Minx::processPoW(const SockAddr& addr, const MinxProveWork& msg,
     // solution might have been altered by MitM or the sender address might
     // be spoofed, but this penalty cannot be avoided in any case.
     auto ipaddr = addr.address();
-    if (!config_.trustLoopback || !ipaddr.is_loopback()) {
+    if (!config_.trustLoopback || !isLoopback(ipaddr)) {
       // If localhost is trusted don't penalize (e.g. when testing).
       ipFilter_.reportIP(ipaddr);
     }
@@ -769,7 +769,7 @@ Minx::proveWork(const Hash& myKey, const Hash& hdata, const Hash& targetKey,
 }
 
 void Minx::banAddress(const IPAddr& addr) {
-  if (config_.trustLoopback && addr.is_loopback()) {
+  if (config_.trustLoopback && isLoopback(addr)) {
     return;
   }
   LOGTRACE << "banAddress" << VAR(addr);
@@ -777,7 +777,7 @@ void Minx::banAddress(const IPAddr& addr) {
 }
 
 bool Minx::checkSpam(const IPAddr& addr, bool alsoUpdate) {
-  if (config_.trustLoopback && addr.is_loopback()) {
+  if (config_.trustLoopback && isLoopback(addr)) {
     return false;
   }
   return spamFilter_.check(addr, alsoUpdate);
@@ -890,8 +890,7 @@ void Minx::onReceivePacket(size_t slotIndex,
     if (error || bytes_transferred < sizeof(uint8_t) ||
         bytes_transferred == MAX_UDP_BYTES ||
         (!listener_->isConnected(slot.remoteAddr_) &&
-         (!config_.trustLoopback ||
-          !slot.remoteAddr_.address().is_loopback()) &&
+         (!config_.trustLoopback || !isLoopback(slot.remoteAddr_.address())) &&
          ipFilter_.checkIP(slot.remoteAddr_.address()))) {
       LOGDEBUG << "onReceivePacket drop" << SVAR(error)
                << VAR(bytes_transferred) << SVAR(slot.remoteAddr_);
@@ -936,7 +935,7 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   const bool connected = listener_->isConnected(remoteAddr_);
   const bool loopback =
-    config_.trustLoopback && remoteAddr_.address().is_loopback();
+    config_.trustLoopback && isLoopback(remoteAddr_.address());
 
   // Sampled spam scoring for handshaked packets (skip for connected)
   if (!connected && config_.spamSampleRate > 0 && code != MINX_INIT &&

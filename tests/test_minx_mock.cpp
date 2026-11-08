@@ -147,6 +147,47 @@ BOOST_AUTO_TEST_CASE(TestBannedIP) {
   BOOST_TEST_MESSAGE("--- IP Ban Test Complete ---");
 }
 
+// A dual-stack socket reports a v4 sender as ::ffff:a.b.c.d. trustLoopback
+// must trust ::ffff:127.0.0.1 as it trusts 127.0.0.1 and ::1.
+BOOST_AUTO_TEST_CASE(TestTrustLoopbackV4MappedSender) {
+  minx::MinxConfig cfg;
+  cfg.trustLoopback = true;
+  TestNode serverNode("Server", "::", 0, cfg);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+
+  TestNode clientNode("Client", "127.0.0.1", 0);
+  registerNode(clientNode);
+  clientNode.startNetwork();
+
+  minx::SockAddr serverV4(boost::asio::ip::make_address("127.0.0.1"),
+                          serverNode.boundPort());
+  clientNode.minx->sendMessage(serverV4, {0, 0, 0, {(char)0xAB}});
+  waitForCondition(
+    [&]() { return serverNode.listener.stats.message >= 1; }, 3);
+
+  BOOST_TEST(serverNode.listener.stats.message == 1);
+}
+
+BOOST_AUTO_TEST_CASE(TestNoTrustLoopbackV4MappedSender) {
+  minx::MinxConfig cfg;
+  cfg.trustLoopback = false;
+  TestNode serverNode("Server", "::", 0, cfg);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+
+  TestNode clientNode("Client", "127.0.0.1", 0);
+  registerNode(clientNode);
+  clientNode.startNetwork();
+
+  minx::SockAddr serverV4(boost::asio::ip::make_address("127.0.0.1"),
+                          serverNode.boundPort());
+  clientNode.minx->sendMessage(serverV4, {0, 0, 0, {(char)0xAB}});
+  pollAll(20);
+
+  BOOST_TEST(serverNode.listener.stats.message == 0);
+}
+
 BOOST_AUTO_TEST_CASE(TestApplicationMessage) {
   BOOST_TEST_MESSAGE("--- Starting App Message Test ---");
 
