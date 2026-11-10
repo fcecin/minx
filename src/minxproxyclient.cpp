@@ -291,7 +291,7 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
   switch (code) {
 
   case MINX_INFO: {
-    if (len < 1 + 1 + 8 + 8 + 32 + 1)
+    if (len < 1 + MinxInfo::SIZE || len > 1 + MinxInfo::SIZE + MAX_DATA_SIZE)
       break;
     uint8_t version = data[off++];
     uint64_t gpassword, spassword;
@@ -313,7 +313,8 @@ void MinxProxyClient::dispatchMessage(const uint8_t* data, size_t len) {
   }
 
   case MINX_MESSAGE: {
-    if (len < 1 + 1 + 8 + 8)
+    if (len < 1 + MinxMessage::SIZE ||
+        len > 1 + MinxMessage::SIZE + MAX_DATA_SIZE)
       break;
     uint8_t version = data[off++];
     uint64_t gpassword, spassword;

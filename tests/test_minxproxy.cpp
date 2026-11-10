@@ -2,6 +2,7 @@
 
 #include "minx_mock.h"
 #include <minx/proxy/minxproxy.h>
+#include <minx/proxy/minxproxyclient.h>
 #include <minx/proxy/tcp_server.h>
 
 #include <boost/asio.hpp>
@@ -1147,6 +1148,44 @@ BOOST_AUTO_TEST_CASE(TestProxyMalformedMessage) {
   goodClient.close();
   proxy.stop();
   BOOST_TEST_MESSAGE("--- Proxy: Malformed message complete ---");
+}
+
+// A frame from the proxy with a payload over MAX_DATA_SIZE is dropped.
+BOOST_AUTO_TEST_CASE(TestProxyClientDropsOversizedFrame) {
+  asio::io_context io;
+  tcp::acceptor acceptor(
+    io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+  MinxMockListener listener;
+  minx::MinxProxyClient client(&listener, false);
+  BOOST_REQUIRE(client.connect(acceptor.local_endpoint()));
+  tcp::socket proxySide(io);
+  acceptor.accept(proxySide);
+
+  auto sendFrame = [&](const std::vector<uint8_t>& body) {
+    uint8_t header[2] = {static_cast<uint8_t>(body.size() >> 8),
+                         static_cast<uint8_t>(body.size() & 0xFF)};
+    asio::write(proxySide, asio::buffer(header, 2));
+    asio::write(proxySide, asio::buffer(body));
+  };
+  std::vector<uint8_t> info(1 + minx::MinxInfo::SIZE, 0);
+  info[0] = minx::MINX_INFO;
+  std::vector<uint8_t> oversizedInfo = info;
+  oversizedInfo.resize(info.size() + minx::MAX_DATA_SIZE + 1, 0x77);
+  std::vector<uint8_t> oversizedMessage(
+    1 + minx::MinxMessage::SIZE + minx::MAX_DATA_SIZE + 1, 0x77);
+  oversizedMessage[0] = minx::MINX_MESSAGE;
+  sendFrame(oversizedInfo);
+  sendFrame(oversizedMessage);
+  sendFrame(info);
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (listener.stats.info < 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  BOOST_TEST(listener.stats.info == 1);
+  BOOST_TEST(listener.stats.message == 0);
+  client.disconnect();
 }
 
 // One oversized frame must not stop the proxy io thread.
