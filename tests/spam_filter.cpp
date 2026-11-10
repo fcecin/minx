@@ -1,8 +1,11 @@
 #include <boost/asio.hpp>
 #include <boost/test/unit_test.hpp>
+#include <atomic>
 #include <chrono>
+#include <latch>
 #include <minx/filter.h>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -164,6 +167,36 @@ BOOST_AUTO_TEST_CASE(TestNoWraparoundAtCellMax) {
   }
   BOOST_TEST(guard.check(addr) == true,
              "saturated cell must stay at 0xffff, not wrap to 0");
+}
+
+// Concurrent callers share one budget of threshold * depth packets.
+BOOST_AUTO_TEST_CASE(TestConcurrentUpdatesAreCounted) {
+  constexpr uint16_t threshold = 20000;
+  constexpr int depth = 3;
+  constexpr int threads = 8;
+  constexpr int perThread = threshold * depth / threads;
+  static_assert(perThread * threads == threshold * depth);
+  SpamFilter shared(TEST_WIDTH, depth, threshold, ROTATION_SEC);
+  address addr = make_address("10.20.30.40");
+  std::atomic<int> rejected{0};
+  std::latch start(threads);
+  std::vector<std::thread> pool;
+  for (int t = 0; t < threads; ++t) {
+    pool.emplace_back([&]() {
+      start.arrive_and_wait();
+      for (int i = 0; i < perThread; ++i) {
+        if (shared.updateAndCheck(addr)) {
+          ++rejected;
+        }
+      }
+    });
+  }
+  for (auto& th : pool) {
+    th.join();
+  }
+  BOOST_TEST(rejected == 0, "no packet within the budget may be rejected");
+  BOOST_TEST(shared.updateAndCheck(addr) == true,
+             "the packet after the budget must be rejected");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

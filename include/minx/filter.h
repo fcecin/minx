@@ -140,7 +140,7 @@ public:
   bool check(const boost::asio::ip::address& addr, bool alsoUpdate = false,
              const std::chrono::steady_clock::time_point* clock = nullptr) {
     auto now = (clock) ? *clock : std::chrono::steady_clock::now();
-    std::lock_guard{mutex_};
+    std::lock_guard lock(mutex_);
     if (now - lastRotation_ > rotationInterval_) {
       currentIndex_ = !currentIndex_;
       buckets_[currentIndex_]->reset();

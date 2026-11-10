@@ -477,7 +477,7 @@ public:
    * @param key RandomX key for validating incoming PROVE_WORK messages.
    */
   void setServerKey(const Hash& key) {
-    std::lock_guard{keyMutex_};
+    std::lock_guard lock(keyMutex_);
     key_ = key;
     keySet_ = true;
   }
@@ -486,7 +486,7 @@ public:
    * Unset my server key.
    */
   void unsetServerKey() {
-    std::lock_guard{keyMutex_};
+    std::lock_guard lock(keyMutex_);
     key_ = {};
     keySet_ = false;
   }

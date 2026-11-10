@@ -675,7 +675,7 @@ bool Minx::checkPoWEngine(const Hash& key) {
 
 bool Minx::destroyPoWEngine(const Hash& key) {
   LOGTRACE << "destroyPoWEngine" << VAR(key);
-  std::lock_guard{enginesMutex_};
+  std::lock_guard lock(enginesMutex_);
   auto it = engines_.find(key);
   if (it == engines_.end()) {
     LOGTRACE << "destroyPoWEngine not found" << VAR(key);
