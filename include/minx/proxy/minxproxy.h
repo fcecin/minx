@@ -69,6 +69,9 @@ struct MinxProxyConfig {
   /** Maximum queued requests waiting for a channel (0 = unlimited). */
   size_t maxQueueSize = 0;
 
+  /** Maximum queued requests from one client connection (0 = unlimited). */
+  size_t maxQueuePerClient = 256;
+
   /** Simulated packet loss in basis points (0 = none, 10000 = 100%).
    *  For testing only. Uses evenly-spaced drops with exact math:
    *  expectedDeliveries(N, packetLossBps) gives the precise count. */
@@ -114,6 +117,7 @@ public:
   size_t clientCount() const { return server_.clientCount(); }
   bool hasCachedInfo() const { return !cachedInfo_.empty(); }
   size_t pendingCount() const { return pendingResponses_.size(); }
+  size_t queuedCount() const { return queued_.load(); }
   uint16_t port() const { return server_.port(); }
   size_t readyChannelCount() const;
 
@@ -202,6 +206,9 @@ private:
     std::vector<uint8_t> data;
   };
   std::deque<QueuedRequest> queue_;
+  std::unordered_map<const TcpSession*, size_t> queuedPerClient_;
+  std::atomic<size_t> queued_{0};
+  void dequeued(const TcpSessionPtr& client);
 
   Csprng rng_;
 

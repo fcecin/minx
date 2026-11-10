@@ -154,6 +154,7 @@ void MinxProxy::tryProcessQueue() {
       break;
     auto req = std::move(queue_.front());
     queue_.pop_front();
+    dequeued(req.client);
     if (req.client->isClosed())
       continue;
     parseAndForward(req.client, req.data.data(), req.data.size());
@@ -204,13 +205,28 @@ void MinxProxy::onMessage(const TcpSessionPtr& session, const uint8_t* data,
       LOGDEBUG << "queue full, dropping" << VAR(queue_.size());
       return;
     }
+    auto qc = queuedPerClient_.find(session.get());
+    if (config_.maxQueuePerClient > 0 && qc != queuedPerClient_.end() &&
+        qc->second >= config_.maxQueuePerClient) {
+      LOGDEBUG << "client queue full, dropping" << VAR(session->label());
+      return;
+    }
     queue_.push_back(
       {session, clientGPw, std::vector<uint8_t>(data, data + len)});
+    ++queuedPerClient_[session.get()];
+    queued_ = queue_.size();
     LOGTRACE << "no ready channel, queued" << VAR(queue_.size());
     return;
   }
 
   parseAndForward(session, data, len);
+}
+
+void MinxProxy::dequeued(const TcpSessionPtr& client) {
+  auto it = queuedPerClient_.find(client.get());
+  if (it != queuedPerClient_.end() && --it->second == 0)
+    queuedPerClient_.erase(it);
+  queued_ = queue_.size();
 }
 
 void MinxProxy::onDisconnect(const TcpSessionPtr& session) {
@@ -483,7 +499,11 @@ void MinxProxy::scheduleSweep() {
 
     queue_.erase(
       std::remove_if(queue_.begin(), queue_.end(),
-                     [](const auto& req) { return req.client->isClosed(); }),
+                     [this](const auto& req) {
+                       if (!req.client->isClosed()) return false;
+                       dequeued(req.client);
+                       return true;
+                     }),
       queue_.end());
 
     scheduleSweep();

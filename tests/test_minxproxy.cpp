@@ -1188,6 +1188,33 @@ BOOST_AUTO_TEST_CASE(TestProxyClientDropsOversizedFrame) {
   client.disconnect();
 }
 
+// One client cannot fill the request queue while no channel is ready.
+BOOST_AUTO_TEST_CASE(TestProxyQueueBoundedPerClient) {
+  asio::io_context io;
+  asio::ip::udp::socket silent(
+    io, asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+  auto proxyCfg = testProxyConfig();
+  proxyCfg.packetLossBps = 0;
+  proxyCfg.maxClients = 10;
+  minx::MinxProxy proxy(tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0),
+                        silent.local_endpoint(), proxyCfg);
+
+  ProxyTestClient client;
+  client.connect(proxy.port());
+  constexpr size_t kFrames = 400;
+  for (size_t i = 0; i < kFrames; ++i)
+    client.sendMessage(i + 1, 0, std::vector<uint8_t>(16, 0x11));
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+  while (proxy.queuedCount() < kFrames &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  BOOST_TEST(proxy.queuedCount() > 0u);
+  BOOST_TEST(proxy.queuedCount() <= proxyCfg.maxQueuePerClient);
+  client.close();
+  proxy.stop();
+}
+
 // One oversized frame must not stop the proxy io thread.
 BOOST_AUTO_TEST_CASE(TestProxyOversizedMessageDropped) {
   TestNode serverNode("Server", "127.0.0.1", 0, testServerConfig());
