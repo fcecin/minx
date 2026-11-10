@@ -99,6 +99,7 @@ private:
 
   boost::asio::io_context& io_;
   boost::asio::ip::tcp::acceptor acceptor_;
+  boost::asio::steady_timer acceptRetry_;
   TcpServerHandler& handler_;
   size_t maxClients_;
   size_t maxMsgSize_;

@@ -13,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
@@ -275,6 +279,40 @@ BOOST_AUTO_TEST_CASE(TestMaxClientsRejection) {
   c1.close();
   c2.close();
   c3.close();
+  server.stop();
+}
+
+// An accept error (here EMFILE) must not end the accept loop.
+BOOST_AUTO_TEST_CASE(TestAcceptResumesAfterError) {
+  asio::io_context io;
+  SpyHandler handler;
+  minx::TcpServer server(io, anyEp(), handler, TEST_MAX_MSG_SIZE);
+  auto port = server.port();
+  TestTcpClient c1(io), c2(io);
+  c1.socket().open(tcp::v4());
+  c2.socket().open(tcp::v4());
+
+  rlimit saved{};
+  BOOST_REQUIRE(::getrlimit(RLIMIT_NOFILE, &saved) == 0);
+  int lowest = ::open("/dev/null", O_RDONLY);
+  BOOST_REQUIRE(lowest >= 0);
+  ::close(lowest);
+  rlimit low = saved;
+  low.rlim_cur = static_cast<rlim_t>(lowest);
+  BOOST_REQUIRE(::setrlimit(RLIMIT_NOFILE, &low) == 0);
+  c1.connect(port);
+  for (int i = 0; i < 200; ++i) {
+    io.poll_one();
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  BOOST_REQUIRE(::setrlimit(RLIMIT_NOFILE, &saved) == 0);
+  BOOST_TEST(handler.connects == 0);
+
+  c2.connect(port);
+  pollUntil(io, [&]() { return handler.connects >= 2; });
+  BOOST_TEST(handler.connects == 2);
+  c1.close();
+  c2.close();
   server.stop();
 }
 

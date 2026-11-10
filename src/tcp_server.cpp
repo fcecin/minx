@@ -145,7 +145,7 @@ void TcpSession::readBody(uint16_t len) {
 TcpServer::TcpServer(asio::io_context& io, const tcp::endpoint& listenEp,
                      TcpServerHandler& handler, size_t maxMsgSize,
                      size_t maxClients)
-    : io_(io), acceptor_(io, listenEp), handler_(handler),
+    : io_(io), acceptor_(io, listenEp), acceptRetry_(io), handler_(handler),
       maxClients_(maxClients), maxMsgSize_(maxMsgSize) {
   LOGINFO << "listening on " << listenEp;
   accept();
@@ -154,6 +154,7 @@ TcpServer::TcpServer(asio::io_context& io, const tcp::endpoint& listenEp,
 void TcpServer::stop() {
   boost::system::error_code ec;
   acceptor_.close(ec);
+  acceptRetry_.cancel();
   for (auto& s : sessions_) {
     s->close();
   }
@@ -164,9 +165,13 @@ void TcpServer::accept() {
   acceptor_.async_accept(
     [this](boost::system::error_code ec, tcp::socket sock) {
       if (ec) {
-        if (ec != asio::error::operation_aborted) {
-          LOGERROR << "accept error" << SVAR(ec);
-        }
+        if (ec == asio::error::operation_aborted || !acceptor_.is_open())
+          return;
+        LOGERROR << "accept error" << SVAR(ec);
+        acceptRetry_.expires_after(std::chrono::milliseconds(100));
+        acceptRetry_.async_wait([this](boost::system::error_code tec) {
+          if (!tec) accept();
+        });
         return;
       }
 
