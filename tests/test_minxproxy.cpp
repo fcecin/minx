@@ -1149,6 +1149,60 @@ BOOST_AUTO_TEST_CASE(TestProxyMalformedMessage) {
   BOOST_TEST_MESSAGE("--- Proxy: Malformed message complete ---");
 }
 
+// One oversized frame must not stop the proxy io thread.
+BOOST_AUTO_TEST_CASE(TestProxyOversizedMessageDropped) {
+  TestNode serverNode("Server", "127.0.0.1", 0, testServerConfig());
+  registerNode(serverNode);
+  serverNode.startNetwork(1);
+
+  serverNode.listener.onGetInfo = [&](const minx::SockAddr& addr,
+                                      const minx::MinxGetInfo& msg) {
+    serverNode.minx->sendInfo(addr, {0,
+                                     serverNode.minx->generatePassword(),
+                                     msg.gpassword,
+                                     1,
+                                     serverNode.key,
+                                     {}});
+  };
+
+  auto proxyCfg = testProxyConfig();
+  proxyCfg.packetLossBps = 0;
+  proxyCfg.maxClients = 10;
+  auto proxyListenEp =
+    tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0);
+  auto proxyUpstreamEp = boost::asio::ip::udp::endpoint(
+    asio::ip::make_address("127.0.0.1"), serverNode.boundPort());
+  minx::MinxProxy proxy(proxyListenEp, proxyUpstreamEp, proxyCfg);
+
+  waitForProxy([&]() { return proxy.readyChannelCount() > 0; }, 10);
+  auto proxyPort = proxy.port();
+
+  ProxyTestClient badClient;
+  badClient.connect(proxyPort);
+  pollAllWithProxy(5);
+  badClient.sendMessage(0x1234, 0x5678,
+                        std::vector<uint8_t>(minx::MAX_DATA_SIZE + 1, 0xEE));
+  std::vector<uint8_t> work;
+  work.push_back(minx::MINX_PROVE_WORK);
+  work.resize(1 + minx::MinxProveWork::SIZE + minx::MAX_DATA_SIZE + 1, 0);
+  badClient.sendRaw(work.data(), work.size());
+  pollAllWithProxy(20);
+
+  BOOST_TEST(serverNode.listener.stats.message == 0);
+
+  ProxyTestClient goodClient;
+  goodClient.connect(proxyPort);
+  pollAllWithProxy(5);
+  goodClient.sendGetInfo(0x600D);
+  waitForProxy([&]() { return goodClient.hasData(); }, 5);
+  auto reply = goodClient.recvMsg();
+  BOOST_TEST(reply[0] == minx::MINX_INFO);
+
+  badClient.close();
+  goodClient.close();
+  proxy.stop();
+}
+
 // -----------------------------------------------------------------------
 // Burst messages from single client: rapid-fire many messages.
 // -----------------------------------------------------------------------

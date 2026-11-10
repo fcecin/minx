@@ -233,7 +233,8 @@ void MinxProxy::parseAndForward(const TcpSessionPtr& session,
 
   switch (msgType) {
   case MINX_MESSAGE: {
-    if (len < MSG_TYPE_SIZE + MinxMessage::SIZE)
+    if (len < MSG_TYPE_SIZE + MinxMessage::SIZE ||
+        len > MSG_TYPE_SIZE + MinxMessage::SIZE + MAX_DATA_SIZE)
       return;
     uint64_t clientGPw = readBE64(&data[WIRE_GPASSWORD_OFF]);
     uint64_t clientSPw = readBE64(&data[WIRE_SPASSWORD_OFF]);
@@ -247,7 +248,8 @@ void MinxProxy::parseAndForward(const TcpSessionPtr& session,
     return;
   }
   case MINX_PROVE_WORK: {
-    if (len < MSG_TYPE_SIZE + MinxProveWork::SIZE)
+    if (len < MSG_TYPE_SIZE + MinxProveWork::SIZE ||
+        len > MSG_TYPE_SIZE + MinxProveWork::SIZE + MAX_DATA_SIZE)
       return;
     uint64_t clientGPw = readBE64(&data[WIRE_GPASSWORD_OFF]);
     uint64_t clientSPw = readBE64(&data[WIRE_SPASSWORD_OFF]);
