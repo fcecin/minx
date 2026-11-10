@@ -4026,4 +4026,111 @@ BOOST_AUTO_TEST_CASE(TestRudpReentrantCloseFromWritable) {
   BOOST_TEST(alice.channelCount(bA) == 0u);
 }
 
+// An HS_OPEN that reaches a closed, unreaped channel ends that incarnation
+// and starts a fresh session.
+BOOST_AUTO_TEST_CASE(TestRudpOpenOnClosedChannelStartsFreshSession) {
+  struct ClosingHandler : TestChannelHandler {
+    void onReliableMessage(const Bytes& m) override {
+      TestChannelHandler::onReliableMessage(m);
+      rudp()->closeChannel(peer(), channelId());
+    }
+  };
+
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(100);
+  cfg.rngSeed = 0xC105ED1;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC105ED2;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+  std::shared_ptr<TestChannelHandler> firstBob;
+  bobL.handlerFactory =
+    [&](const SockAddr&, uint32_t) -> std::shared_ptr<TestChannelHandler> {
+    if (!firstBob) {
+      firstBob = std::make_shared<ClosingHandler>();
+      return firstBob;
+    }
+    return std::make_shared<TestChannelHandler>();
+  };
+
+  SockAddr aA = makeAddr(15300), bA = makeAddr(15301);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 0;
+  aliceL.push(alice, bA, 7, B("first"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 7));
+
+  now = 100'000;
+  bob.tick(now);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(firstBob);
+  BOOST_REQUIRE_EQUAL(firstBob->reliableMessages.size(), 1u);
+  BOOST_REQUIRE(alice.channelCount(bA) == 0u);
+  BOOST_REQUIRE(bob.channelCount(aA) == 1u);
+
+  aliceL.registerChannel(alice, bA, 7);
+  BOOST_REQUIRE(alice.push(bA, 7, B("second"), true));
+  alice.flush();
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 7));
+  alice.flush();
+  wire.deliverAll(now);
+
+  BOOST_TEST(firstBob->closed);
+  BOOST_TEST(bobL.closedCount() == 1u);
+  auto secondBob = bobL.handler(aA, 7);
+  BOOST_REQUIRE(secondBob);
+  BOOST_REQUIRE(secondBob != firstBob);
+  BOOST_REQUIRE_EQUAL(secondBob->reliableMessages.size(), 1u);
+  BOOST_TEST(std::string(secondBob->reliableMessages[0].begin(),
+                         secondBob->reliableMessages[0].end()) == "second");
+}
+
+// A peer restart must not carry a pending graceful close into the new session.
+BOOST_AUTO_TEST_CASE(TestRudpPeerRestartDropsPendingDrainClose) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xD7A1C1;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xD7A1C2;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(15310), bA = makeAddr(15311);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 1000;
+  aliceL.push(alice, bA, 9, B("hello"), true);
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(alice.isEstablished(bA, 9));
+  BOOST_REQUIRE(bob.isEstablished(aA, 9));
+
+  wire.dropNextBtoA = 100;
+  BOOST_REQUIRE(bob.push(aA, 9, B("pending"), true));
+  bob.tick(now);
+  wire.deliverAll(now);
+  bob.closeChannel(aA, 9, Rudp::CloseReason::APPLICATION,
+                   std::chrono::seconds(10));
+  BOOST_REQUIRE(bob.channelCount(aA) == 1u);
+
+  alice.closeChannel(bA, 9);
+  wire.clearQueue();
+  wire.dropNextBtoA = 0;
+  aliceL.registerChannel(alice, bA, 9);
+  alice.tick(now);
+  wire.deliverAll(now);
+
+  BOOST_TEST(bob.isEstablished(aA, 9));
+  BOOST_TEST(alice.isEstablished(bA, 9));
+  auto fresh = bobL.handler(aA, 9);
+  BOOST_REQUIRE(fresh);
+  BOOST_TEST(!fresh->closed);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

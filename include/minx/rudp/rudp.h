@@ -699,6 +699,9 @@ private:
   // was ever installed.
   void eraseChannelSilent(const SockAddr& peer, uint32_t channel_id);
 
+  // Return a channel to its freshly-created state.
+  void resetChannel(ChannelState& cs);
+
   // Wire a freshly-created ChannelState's handler: inject the
   // back-references (rudp_/peer_/cid_) into the handler object,
   // store it on cs.handler, and fire handler->onOpened(). Called

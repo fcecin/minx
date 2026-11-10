@@ -733,6 +733,12 @@ Rudp::ChannelState* Rudp::getOrCreateChannel(const SockAddr& peer,
     return nullptr;
   }
   auto& cs = peerState.channels[channel_id];
+  resetChannel(cs);
+  return &cs;
+}
+
+void Rudp::resetChannel(ChannelState& cs) {
+  cs = ChannelState{};
   cs.lastActivityUs = currentTimeUs_;
   // Anchor the memory-integral clock at creation so the first
   // updateMemoryIntegral on this channel computes a sensible dt.
@@ -740,7 +746,6 @@ Rudp::ChannelState* Rudp::getOrCreateChannel(const SockAddr& peer,
   // the integral effectively measures post-handshake lifetime; the
   // pre-handshake interval contributes zero to memoryByteSeconds.
   cs.metricsLastUpdateUs = currentTimeUs_;
-  return &cs;
 }
 
 // ===========================================================================
@@ -1302,39 +1307,16 @@ void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
     // Peer wants to open this channel with their nonce as N_a.
     // Our role is the receiver here: pick our N_b, derive token,
     // mark ACCEPT_SENT, emit ACCEPT in the next flush.
+    bool chargeOpen = !inboundCharged;
     switch (cs->handshakeState) {
     case HandshakeState::IDLE:
-    case HandshakeState::CLOSED: {
-      // Listener::onAccept is predicate AND handler factory in one.
-      // Returning a non-null shared_ptr accepts and supplies the
-      // handler. Returning null rejects the inbound channel
-      // silently — no events fire, channel is erased.
-      auto handler = listener_->onAccept(peer, channel_id);
-      if (!handler) {
-        LOGTRACE << "accept rejected" << VAR(channel_id);
-        eraseChannelSilent(peer, channel_id);
-        return;
-      }
-      if (!inboundCharged) {
-        cs->metrics.bytesReceived += wireBytes;
-      }
-      cs->weInitiated = false;
-      cs->nonceRemote = nonce;
-      cs->nonceLocal = rng_.next();
-      cs->sessionToken = deriveSessionToken(cs->nonceRemote, cs->nonceLocal);
-      cs->handshakeState = HandshakeState::ACCEPT_SENT;
-      cs->lastHandshakeAttemptUs = currentTimeUs_;
-      initChannelBucket(*cs, peerRate, peerBurst);
-      // Wire the handler now: rudp/peer/cid back-references are
-      // injected, handler->onOpened() fires. After this the handler
-      // can validly call rudp()->push() etc. from any subsequent
-      // event method.
-      wireHandler(peer, channel_id, *cs, std::move(handler));
-      // Emit the ACCEPT, then ESTABLISHED.
-      emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
-      promoteToEstablished(peer, channel_id, *cs);
-      return;
-    }
+      break;
+    case HandshakeState::CLOSED:
+      // Closed but not yet reaped: end that incarnation first.
+      destroyChannel(peer, channel_id, *cs, cs->closeReason);
+      resetChannel(*cs);
+      chargeOpen = true;
+      break;
     case HandshakeState::OPEN_SENT: {
       // Simultaneous open: both sides sent OPEN at roughly the same
       // time, racing. The peer's OPEN wins; we accept theirs and
@@ -1353,7 +1335,7 @@ void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
       return;
     }
     case HandshakeState::ACCEPT_SENT:
-    case HandshakeState::ESTABLISHED: {
+    case HandshakeState::ESTABLISHED:
       // Already accepted/established. The peer may not have received
       // our ACCEPT — re-emit it idempotently. The session_token
       // doesn't change. wireBytes already charged by onPacket.
@@ -1362,58 +1344,44 @@ void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
         return;
       }
       // Different N_a means a fresh OPEN attempt — likely the peer
-      // restarted. The old session is dead from any stream
-      // adapter's perspective: different session token, reset
-      // sendBuf, reset reorder state. Fire onChannelDestroyed so
-      // any pending write/read handler completes with an abort
-      // error. Then re-run the accept predicate on the NEW session
-      // — it's a new logical connection and deserves a fresh
-      // policy decision. If accepted, reset state and continue.
-      // If rejected, erase the whole channel and return (the old
-      // session already got its Destroyed fire).
+      // restarted. The old session is dead: end it, then treat the
+      // OPEN as a new logical connection that deserves a fresh
+      // accept decision. The OPEN's wire bytes were pre-charged to
+      // the old session; charge them to the new one.
       destroyChannel(peer, channel_id, *cs, CloseReason::PEER_RESTART);
-      auto newHandler = listener_->onAccept(peer, channel_id);
-      if (!newHandler) {
-        LOGTRACE << "accept rejected on peer-restart" << VAR(channel_id);
-        eraseChannelSilent(peer, channel_id);
-        return;
-      }
-      cs->weInitiated = false;
-      cs->nonceRemote = nonce;
-      cs->nonceLocal = rng_.next();
-      cs->sessionToken = deriveSessionToken(cs->nonceRemote, cs->nonceLocal);
-      cs->handshakeState = HandshakeState::ACCEPT_SENT;
-      cs->lastHandshakeAttemptUs = currentTimeUs_;
-      cs->sendBuf.clear();
-      cs->reorderBuf.clear();
-      cs->reorderBytes = 0;
-      cs->solidAck = 0;
-      cs->nextSeq = 1;
-      cs->lastSentSolidAck = 0;
-      cs->lastSentPorosity = 0;
-      cs->hasSentAnything = false;
-      // Reset metrics for the new session: counters and integral
-      // start fresh; openedAtUs is re-stamped in promoteToEstablished.
-      // The OLD session's pre-charge from onPacket was already
-      // visible to the listener inside destroyChannel above; we wipe
-      // it now for the NEW session.
-      cs->metrics = ChannelMetrics{};
-      cs->metricsLastUpdateUs = currentTimeUs_;
-      cs->metricsMemRemainderUs = 0;
-      // Re-attribute the OPEN packet's wire bytes to the new session.
-      // onPacket pre-charged them to the old session before we knew
-      // this was a peer-restart; without this re-charge they'd vanish
-      // from accounting.
-      cs->metrics.bytesReceived += wireBytes;
-      initChannelBucket(*cs, peerRate, peerBurst);
-      // Wire the new handler — fresh onOpened for the new session.
-      wireHandler(peer, channel_id, *cs, std::move(newHandler));
-      emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
-      promoteToEstablished(peer, channel_id, *cs);
+      resetChannel(*cs);
+      chargeOpen = true;
+      break;
+    }
+    // Listener::onAccept is predicate AND handler factory in one.
+    // Returning a non-null shared_ptr accepts and supplies the
+    // handler. Returning null rejects the inbound channel
+    // silently — no events fire, channel is erased.
+    auto handler = listener_->onAccept(peer, channel_id);
+    if (!handler) {
+      LOGTRACE << "accept rejected" << VAR(channel_id);
+      eraseChannelSilent(peer, channel_id);
       return;
     }
+    if (chargeOpen) {
+      cs->metrics.bytesReceived += wireBytes;
     }
-    break;
+    cs->weInitiated = false;
+    cs->nonceRemote = nonce;
+    cs->nonceLocal = rng_.next();
+    cs->sessionToken = deriveSessionToken(cs->nonceRemote, cs->nonceLocal);
+    cs->handshakeState = HandshakeState::ACCEPT_SENT;
+    cs->lastHandshakeAttemptUs = currentTimeUs_;
+    initChannelBucket(*cs, peerRate, peerBurst);
+    // Wire the handler now: rudp/peer/cid back-references are
+    // injected, handler->onOpened() fires. After this the handler
+    // can validly call rudp()->push() etc. from any subsequent
+    // event method.
+    wireHandler(peer, channel_id, *cs, std::move(handler));
+    // Emit the ACCEPT, then ESTABLISHED.
+    emitHandshake(peer, channel_id, *cs, HS_ACCEPT);
+    promoteToEstablished(peer, channel_id, *cs);
+    return;
   }
 
   case HS_ACCEPT: {
