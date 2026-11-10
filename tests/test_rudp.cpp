@@ -4133,4 +4133,58 @@ BOOST_AUTO_TEST_CASE(TestRudpPeerRestartDropsPendingDrainClose) {
   BOOST_TEST(!fresh->closed);
 }
 
+// Retransmits to a silent peer are not activity: unacked data reaches idle
+// GC. Persistent channels and unreliable-only senders stay up.
+BOOST_AUTO_TEST_CASE(TestRudpSilentPeerWithUnackedDataIsReaped) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(10);
+  cfg.channelInactivityTimeout = std::chrono::seconds(1);
+  cfg.maxChannelsPerPeer = 3;
+  cfg.rngSeed = 0x5113E1;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0x5113E2;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(15320), bA = makeAddr(15321);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  uint64_t now = 0;
+  for (uint32_t cid : {5u, 6u, 7u}) {
+    aliceL.push(alice, bA, cid, B("hello"), true);
+  }
+  for (int i = 0; i < 10; ++i) {
+    alice.tick(now);
+    bob.tick(now);
+    wire.deliverAll(now);
+    now += 10'000;
+  }
+  for (uint32_t cid : {5u, 6u, 7u}) {
+    BOOST_REQUIRE(alice.isEstablished(bA, cid));
+  }
+  BOOST_REQUIRE_EQUAL(bobL.received.size(), 3u);
+
+  alice.setChannelPersistent(bA, 6);
+  BOOST_REQUIRE(alice.push(bA, 5, B("lost"), true));
+  BOOST_REQUIRE(alice.push(bA, 6, B("lost"), true));
+  const uint64_t silentUntil = now + 3'000'000;
+  for (; now < silentUntil; now += 10'000) {
+    alice.push(bA, 7, B("datagram"), false);
+    alice.tick(now);
+    wire.clearQueue();
+  }
+
+  auto reaped = aliceL.handler(bA, 5);
+  BOOST_REQUIRE(reaped);
+  BOOST_TEST(reaped->closed);
+  BOOST_TEST(reaped->closedReason.has_value());
+  if (reaped->closedReason) {
+    BOOST_TEST(static_cast<int>(*reaped->closedReason) ==
+               static_cast<int>(Rudp::CloseReason::IDLE));
+  }
+  BOOST_TEST(alice.isEstablished(bA, 6));
+  BOOST_TEST(alice.isEstablished(bA, 7));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -873,6 +873,9 @@ bool Rudp::push(const SockAddr& peer, uint32_t channel_id, const Bytes& msg,
     LOGDEBUG << "push reject: send buffer full" << VAR(cs->sendBuf.size());
     return false;
   }
+  if (cs->sendBuf.empty()) {
+    cs->ackWaitSinceUs = currentTimeUs_;
+  }
   const uint32_t id = cs->nextSeq++;
   cs->sendBuf[id] = msg;
   return true;
@@ -986,6 +989,15 @@ void Rudp::doPulseWork(uint64_t now_us, size_t maxPacketsPerChannel) {
       if (!cs.persistent && now_us > cs.lastActivityUs &&
           (now_us - cs.lastActivityUs) >= channelInactivityUs_) {
         LOGTRACE << "GC idle channel" << SVAR(pit->first) << VAR(cit->first);
+        drop = true;
+        dropReason = CloseReason::IDLE;
+      }
+
+      // Unacked data and a peer silent for as long: the peer is gone.
+      if (!drop && !cs.persistent && !cs.closeOnDrain &&
+          !cs.sendBuf.empty() && now_us > cs.ackWaitSinceUs &&
+          (now_us - cs.ackWaitSinceUs) >= channelInactivityUs_) {
+        LOGTRACE << "GC silent peer" << SVAR(pit->first) << VAR(cit->first);
         drop = true;
         dropReason = CloseReason::IDLE;
       }
@@ -1435,6 +1447,7 @@ void Rudp::promoteToEstablished(const SockAddr& peer, uint32_t channel_id,
     cs.sendBuf[id] = std::move(msg);
   }
   cs.preEstablishedQueue.clear();
+  cs.ackWaitSinceUs = currentTimeUs_;
 
   // Single chokepoint for handler->onEstablished: every path to
   // ESTABLISHED (fresh peer accept, self-initiated-got-ACCEPT,
@@ -1521,6 +1534,7 @@ void Rudp::handleChannelPacket(const SockAddr& peer, const Bytes& payload) {
   }
 
   cs->lastActivityUs = currentTimeUs_;
+  cs->ackWaitSinceUs = currentTimeUs_;
   // bytesReceived was already charged in onPacket via the pre-CRC
   // attribution path.
 

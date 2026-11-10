@@ -612,6 +612,8 @@ private:
 
     // Bookkeeping
     uint64_t lastActivityUs = 0;
+    // Since when unacked sendBuf data has waited on a silent peer.
+    uint64_t ackWaitSinceUs = 0;
     // Exempt from idle GC (setChannelPersistent). Long-lived channels
     // (the CES server-to-server peer mesh) opt out of the inactivity
     // timeout instead of faking activity with a keepalive.
