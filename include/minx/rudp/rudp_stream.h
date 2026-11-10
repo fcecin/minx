@@ -213,13 +213,6 @@ private:
   void startRead(const MutableBufferSequence& buffers, Handler&& handler) {
     auto erased = eraseHandler(std::forward<Handler>(handler));
 
-    if (closed_) {
-      postError(std::move(erased),
-                closeReason_ ? closeReasonToError(*closeReason_)
-                             : boost::asio::error::eof);
-      return;
-    }
-
     if (!inboundBuf_.empty()) {
       const std::size_t capacity = boost::asio::buffer_size(buffers);
       std::size_t take =
@@ -229,6 +222,13 @@ private:
       boost::asio::buffer_copy(buffers,
                                boost::asio::buffer(tmp.data(), copied));
       postRead(std::move(erased), copied);
+      return;
+    }
+
+    if (closed_) {
+      postError(std::move(erased),
+                closeReason_ ? closeReasonToError(*closeReason_)
+                             : boost::asio::error::eof);
       return;
     }
 

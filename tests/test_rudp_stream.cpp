@@ -1215,4 +1215,65 @@ BOOST_AUTO_TEST_CASE(TestRudpStreamWriteAfterShutdownReturnsEof) {
   BOOST_TEST(writeN == 0u);
 }
 
+BOOST_AUTO_TEST_CASE(TestRudpStreamPeerCloseKeepsUnreadBytes) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xA22CE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC2B;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11270), bA = makeAddr(11271);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+  wire.bindStreams(aliceStream, bobStream, 1);
+
+  uint64_t now = 1000;
+  establish(io, alice, bob, wire, now, aA, 1);
+  BOOST_REQUIRE(bob.isEstablished(aA, 1));
+
+  const std::string last = "last words";
+  bool writeDone = false;
+  aliceStream->async_write_some(boost::asio::buffer(last),
+                                [&](boost::system::error_code, std::size_t) { writeDone = true; });
+  step(io, alice, bob, wire, now);
+  BOOST_REQUIRE(writeDone);
+  BOOST_REQUIRE_EQUAL(bobStream->available(), last.size());
+
+  aliceStream->shutdown(std::chrono::seconds(1));
+  now += 1000;
+  step(io, alice, bob, wire, now);
+  BOOST_REQUIRE(!bobStream->is_open());
+
+  std::array<char, 64> rdbuf{};
+  boost::system::error_code ec1, ec2;
+  std::size_t n1 = 0;
+  bool done1 = false, done2 = false;
+  bobStream->async_read_some(boost::asio::buffer(rdbuf),
+                             [&](boost::system::error_code ec, std::size_t n) {
+                               ec1 = ec;
+                               n1 = n;
+                               done1 = true;
+                             });
+  drainAsio(io);
+  BOOST_REQUIRE(done1);
+  BOOST_TEST(!ec1);
+  BOOST_REQUIRE_EQUAL(n1, last.size());
+  BOOST_TEST(std::string(rdbuf.data(), n1) == last);
+
+  bobStream->async_read_some(boost::asio::buffer(rdbuf),
+                             [&](boost::system::error_code ec, std::size_t) {
+                               ec2 = ec;
+                               done2 = true;
+                             });
+  drainAsio(io);
+  BOOST_REQUIRE(done2);
+  BOOST_TEST(ec2 == boost::asio::error::eof);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
