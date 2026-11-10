@@ -32,7 +32,7 @@ public:
 
   auto data() {
     return reinterpret_cast<std::conditional_t<IsMutable, char*, const char*>>(
-      &buf_[0]);
+      buf_.data());
   }
 
   std::span<const uint8_t> getBackingSpan() const { return buf_; }
@@ -62,7 +62,8 @@ public:
 
   template <typename V, bool M = IsMutable, typename = std::enable_if_t<M>>
   void put(const V& val) {
-    logkv::Writer writer(const_cast<uint8_t*>(&buf_[w_]), buf_.size() - w_);
+    logkv::Writer writer(const_cast<uint8_t*>(buf_.data() + w_),
+                         buf_.size() - w_);
     try {
       writer.write(val);
       w_ += writer.bytes_processed();
@@ -95,7 +96,7 @@ public:
   }
 
   template <typename V> void get(V&& val) {
-    logkv::Reader reader(&buf_[r_], s_ - r_);
+    logkv::Reader reader(buf_.data() + r_, s_ - r_);
     try {
       reader.read(val);
       r_ += reader.bytes_processed();
@@ -106,7 +107,7 @@ public:
 
   template <typename V> V get() {
     V val;
-    logkv::Reader reader(&buf_[r_], s_ - r_);
+    logkv::Reader reader(buf_.data() + r_, s_ - r_);
     try {
       reader.read(val);
       r_ += reader.bytes_processed();
@@ -144,7 +145,7 @@ public:
     R result;
     result.resize(count);
     if (count > 0) {
-      std::memcpy(result.data(), &buf_[r_], count);
+      std::memcpy(result.data(), buf_.data() + r_, count);
       r_ += count;
     }
     return result;
@@ -178,7 +179,7 @@ public:
     R result;
     result.resize(n);
     if (n > 0) {
-      std::memcpy(result.data(), &buf_[r_], n);
+      std::memcpy(result.data(), buf_.data() + r_, n);
       r_ += n;
     }
     return result;

@@ -120,4 +120,30 @@ BOOST_AUTO_TEST_CASE(ConstBufferReadsBytes) {
   BOOST_CHECK_EQUAL(cbuf.getRemainingBytesCount(), 2u);
 }
 
+// A read at the end of the data throws std::out_of_range. The read does not
+// index the backing span at its size.
+BOOST_AUTO_TEST_CASE(GetAtEndThrowsOutOfRange) {
+  std::array<uint8_t, 4> data{1, 2, 3, 4};
+  minx::ConstBuffer cbuf(data);
+  BOOST_CHECK_NO_THROW(cbuf.get<uint32_t>());
+  BOOST_CHECK_THROW(cbuf.get<uint8_t>(), std::out_of_range);
+  BOOST_CHECK_THROW((cbuf.get<std::array<uint8_t, 32>>()), std::out_of_range);
+  uint8_t b = 0;
+  BOOST_CHECK_THROW(cbuf.get(b), std::out_of_range);
+}
+
+// A write at the end of the backing span throws std::out_of_range.
+BOOST_AUTO_TEST_CASE(PutAtEndThrowsOutOfRange) {
+  std::array<uint8_t, 4> store{};
+  minx::Buffer buf(store);
+  BOOST_CHECK_NO_THROW(buf.put<uint32_t>(7));
+  BOOST_CHECK_THROW(buf.put<uint8_t>(1), std::out_of_range);
+}
+
+// An empty buffer gives a null data pointer.
+BOOST_AUTO_TEST_CASE(EmptyBufferDataIsNull) {
+  minx::Buffer buf;
+  BOOST_CHECK(buf.data() == nullptr);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
