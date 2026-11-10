@@ -790,6 +790,12 @@ public:
   bool checkSpam(const IPAddr& addr, bool alsoUpdate = true);
 };
 
+/**
+ * Run an io_context until it stops, resuming after a handler throws.
+ * @param io The io_context to run.
+ */
+void runIOContext(IOContext& io);
+
 std::ostream& operator<<(std::ostream& os, const MinxInit& m);
 std::ostream& operator<<(std::ostream& os, const MinxGetInfo& m);
 std::ostream& operator<<(std::ostream& os, const MinxMessage& m);

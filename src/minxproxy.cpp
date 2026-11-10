@@ -58,13 +58,7 @@ MinxProxy::MinxProxy(const tcp::endpoint& listenEp,
   scheduleSweep();
 
   running_ = true;
-  thread_ = std::thread([this]() {
-    try {
-      io_.run();
-    } catch (const std::exception& e) {
-      LOGERROR << "proxy io thread exception: " << e.what();
-    }
-  });
+  thread_ = std::thread([this]() { runIOContext(io_); });
 }
 
 MinxProxy::~MinxProxy() { stop(); }

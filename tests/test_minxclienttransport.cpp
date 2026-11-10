@@ -5,6 +5,7 @@
 #include "minx_mock.h"
 
 #include <atomic>
+#include <stdexcept>
 
 using namespace minx_test;
 
@@ -63,6 +64,36 @@ BOOST_AUTO_TEST_CASE(TestUdpRemoteRedirect) {
   client.stop();
 
   BOOST_TEST_MESSAGE("--- UDP Remote Redirect Test Complete ---");
+}
+
+// A listener callback that throws must not stop the transport's io threads.
+BOOST_AUTO_TEST_CASE(TestListenerThrowKeepsTransportRunning) {
+  TestNode server("Server", "::1", 0);
+  registerNode(server);
+  server.startNetwork(1);
+  server.listener.onGetInfo = [&](const minx::SockAddr& addr,
+                                  const minx::MinxGetInfo& msg) {
+    server.minx->sendInfo(addr, {0, server.minx->generatePassword(),
+                                 msg.gpassword, 1, server.key, {}});
+  };
+  minx::SockAddr serverAddr(boost::asio::ip::address_v6::loopback(),
+                            server.boundPort());
+
+  MinxMockListener clientListener;
+  std::atomic<int> infos{0};
+  clientListener.onInfo = [&](const minx::SockAddr&, const minx::MinxInfo&) {
+    if (infos.fetch_add(1) == 0)
+      throw std::runtime_error("listener failure");
+  };
+  minx::MinxClientTransport client(&clientListener, serverAddr);
+  BOOST_TEST(client.start(0));
+
+  client.sendGetInfo({0, client.generatePassword(), {}});
+  waitForCondition([&]() { return infos.load() >= 1; }, 5);
+  client.sendGetInfo({0, client.generatePassword(), {}});
+  waitForCondition([&]() { return infos.load() >= 2; }, 5);
+  BOOST_TEST(infos.load() == 2);
+  client.stop();
 }
 
 BOOST_AUTO_TEST_CASE(TestWrongModeReturnsFalse) {

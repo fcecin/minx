@@ -46,7 +46,7 @@ bool MinxProxyClient::connect(const tcp::endpoint& proxyEp) {
     io_.get_executor());
 
   startRead();
-  ioThread_ = std::thread([this]() { io_.run(); });
+  ioThread_ = std::thread([this]() { runIOContext(io_); });
 
   LOGDEBUG << "connected to proxy" << VAR(proxyEp);
   return true;

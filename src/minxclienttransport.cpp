@@ -39,8 +39,8 @@ bool MinxClientTransport::start(uint16_t localPort) {
       taskIO_.get_executor());
     SockAddr localAddr(boost::asio::ip::udp::v6(), localPort);
     udp_->openSocket(localAddr, netIO_, taskIO_);
-    netIOThread_ = std::thread([this]() { netIO_.run(); });
-    taskIOThread_ = std::thread([this]() { taskIO_.run(); });
+    netIOThread_ = std::thread([this]() { runIOContext(netIO_); });
+    taskIOThread_ = std::thread([this]() { runIOContext(taskIO_); });
     return true;
   }
   if (tcp_) {

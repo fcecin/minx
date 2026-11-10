@@ -45,22 +45,10 @@ uint16_t MinxRunner::start(const SockAddr& addr) {
 
   running_ = true;
 
-  netThreads_.emplace_back([this]() {
-    try {
-      netIO_.run();
-    } catch (const std::exception& e) {
-      LOGERROR << "MinxRunner NetIO exception: " << e.what();
-    }
-  });
+  netThreads_.emplace_back([this]() { runIOContext(netIO_); });
 
   for (size_t i = 0; i < taskThreadCount_; ++i) {
-    taskThreads_.emplace_back([this]() {
-      try {
-        taskIO_.run();
-      } catch (const std::exception& e) {
-        LOGERROR << "MinxRunner TaskIO exception: " << e.what();
-      }
-    });
+    taskThreads_.emplace_back([this]() { runIOContext(taskIO_); });
   }
 
   for (size_t i = 0; i < powThreadCount_; ++i) {

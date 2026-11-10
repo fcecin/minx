@@ -13,6 +13,19 @@ struct ScopeExit {
   ~ScopeExit() { fn_(); }
 };
 
+void runIOContext(IOContext& io) {
+  for (;;) {
+    try {
+      io.run();
+      return;
+    } catch (const std::exception& e) {
+      LOGERROR << "io handler threw" << VAR(e.what());
+    } catch (...) {
+      LOGERROR << "io handler threw";
+    }
+  }
+}
+
 std::ostream& operator<<(std::ostream& os, const MinxInit& m) {
   return os << "{MinxInit v" << static_cast<int>(m.version)
             << " gpass:" << std::hex << m.gpassword << std::dec
