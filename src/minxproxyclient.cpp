@@ -32,6 +32,9 @@ MinxProxyClient::~MinxProxyClient() { disconnect(); }
 bool MinxProxyClient::connect(const tcp::endpoint& proxyEp) {
   if (connected_)
     return true;
+  if (ioThread_.joinable() && ioThread_.get_id() == std::this_thread::get_id())
+    return false;
+  stopIoThread();
 
   boost::system::error_code ec;
   socket_.connect(proxyEp, ec);
@@ -53,28 +56,23 @@ bool MinxProxyClient::connect(const tcp::endpoint& proxyEp) {
 }
 
 void MinxProxyClient::disconnect() {
-  if (!connected_)
-    return;
-
   connected_ = false;
+  stopIoThread();
+  LOGDEBUG << "disconnected";
+}
 
-  boost::system::error_code ec;
-  socket_.shutdown(tcp::socket::shutdown_both, ec);
-  socket_.close(ec);
-
+void MinxProxyClient::stopIoThread() {
   if (workGuard_) {
     workGuard_->reset();
     workGuard_.reset();
   }
   io_.stop();
-
-  if (ioThread_.joinable())
+  if (ioThread_.joinable() && ioThread_.get_id() != std::this_thread::get_id())
     ioThread_.join();
-
-  // Reset io_context for potential reuse
-  io_.restart();
-
-  LOGDEBUG << "disconnected";
+  boost::system::error_code ec;
+  socket_.shutdown(tcp::socket::shutdown_both, ec);
+  socket_.close(ec);
+  if (!ioThread_.joinable()) io_.restart();
 }
 
 // =============================================================================
@@ -245,6 +243,7 @@ void MinxProxyClient::onReadHeader(boost::system::error_code ec, size_t) {
   if (ec) {
     if (ec != asio::error::operation_aborted) {
       LOGDEBUG << "read header error" << SVAR(ec);
+      connected_ = false;
     }
     return;
   }
@@ -271,6 +270,7 @@ void MinxProxyClient::onReadBody(boost::system::error_code ec, size_t /*bytes*/,
   if (ec) {
     if (ec != asio::error::operation_aborted) {
       LOGDEBUG << "read body error" << SVAR(ec);
+      connected_ = false;
     }
     return;
   }

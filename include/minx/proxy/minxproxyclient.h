@@ -100,6 +100,7 @@ public:
 private:
   // -- TCP framing --
   void sendRaw(const std::vector<uint8_t>& data);
+  void stopIoThread();
   void startRead();
   void onReadHeader(boost::system::error_code ec, size_t bytes);
   void onReadBody(boost::system::error_code ec, size_t bytes, uint16_t len);

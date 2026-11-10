@@ -1188,6 +1188,46 @@ BOOST_AUTO_TEST_CASE(TestProxyClientDropsOversizedFrame) {
   client.disconnect();
 }
 
+BOOST_AUTO_TEST_CASE(TestProxyClientNoticesClosedLinkAndReconnects) {
+  asio::io_context io;
+  tcp::acceptor acceptor(
+    io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+  MinxMockListener listener;
+  minx::MinxProxyClient client(&listener, false);
+  BOOST_REQUIRE(client.connect(acceptor.local_endpoint()));
+  {
+    tcp::socket proxySide(io);
+    acceptor.accept(proxySide);
+    proxySide.close();
+  }
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (client.isConnected() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  BOOST_TEST(!client.isConnected());
+
+  BOOST_REQUIRE(client.connect(acceptor.local_endpoint()));
+  tcp::socket proxySide2(io);
+  bool accepted = false;
+  acceptor.async_accept(proxySide2, [&](const boost::system::error_code& ec) {
+    accepted = !ec;
+  });
+  io.run_for(std::chrono::seconds(2));
+  BOOST_TEST(accepted);
+  if (accepted) {
+    std::vector<uint8_t> info(1 + minx::MinxInfo::SIZE, 0);
+    info[0] = minx::MINX_INFO;
+    uint8_t header[2] = {static_cast<uint8_t>(info.size() >> 8),
+                         static_cast<uint8_t>(info.size() & 0xFF)};
+    asio::write(proxySide2, asio::buffer(header, 2));
+    asio::write(proxySide2, asio::buffer(info));
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (listener.stats.info < 1 && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    BOOST_TEST(listener.stats.info == 1);
+  }
+  client.disconnect();
+}
+
 // One client cannot fill the request queue while no channel is ready.
 BOOST_AUTO_TEST_CASE(TestProxyQueueBoundedPerClient) {
   asio::io_context io;
