@@ -42,7 +42,7 @@ PoWEngine::PoWEngine(std::span<const uint8_t> key, bool full_mem, int vmsToKeep)
     : is_full_mem_(full_mem), key_(key.begin(), key.end()) {
   vmsToKeep_ = vmsToKeep;
   if (vmsToKeep_ < 1) {
-    vmsToKeep = std::thread::hardware_concurrency() * 2;
+    vmsToKeep_ = std::thread::hardware_concurrency() * 2;
   }
   if (!key_.empty()) {
     size_t len = std::min(key_.size(), size_t{4});
