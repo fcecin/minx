@@ -223,6 +223,43 @@ BOOST_AUTO_TEST_CASE(TestApplicationMessage) {
   BOOST_TEST_MESSAGE("--- App Message Test Complete ---");
 }
 
+// A payload over MAX_DATA_SIZE is dropped, not thrown out of taskIO.
+BOOST_AUTO_TEST_CASE(TestOversizedPayloadDropped) {
+  TestNode serverNode("Server", "127.0.0.1", 0);
+  registerNode(serverNode);
+  serverNode.startNetwork();
+  minx::SockAddr serverAddr(boost::asio::ip::make_address("127.0.0.1"),
+                            serverNode.boundPort());
+
+  boost::asio::io_context io;
+  boost::asio::ip::udp::socket raw(
+    io, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0));
+  const uint8_t codes[] = {0x00, minx::MINX_INIT, minx::MINX_MESSAGE,
+                           minx::MINX_GET_INFO, minx::MINX_INFO,
+                           minx::MINX_PROVE_WORK, minx::MINX_EXTENSION};
+  for (uint8_t code : codes) {
+    std::vector<uint8_t> pkt(minx::MAX_DATA_SIZE + 200, 0);
+    pkt[0] = code;
+    raw.send_to(boost::asio::buffer(pkt), serverAddr);
+  }
+  BOOST_CHECK_NO_THROW(pollAll(30));
+
+  auto& stats = serverNode.listener.stats;
+  BOOST_TEST(stats.application == 0);
+  BOOST_TEST(stats.init == 0);
+  BOOST_TEST(stats.message == 0);
+  BOOST_TEST(stats.getInfo == 0);
+  BOOST_TEST(stats.info == 0);
+  BOOST_TEST(stats.extension == 0);
+  BOOST_TEST(serverNode.minx->getVerifyPoWQueueSize() == 0u);
+
+  std::vector<uint8_t> ok(1 + minx::MAX_DATA_SIZE, 0x5A);
+  ok[0] = 0x01;
+  raw.send_to(boost::asio::buffer(ok), serverAddr);
+  waitForCondition([&]() { return stats.application >= 1; }, 3);
+  BOOST_TEST(stats.application == 1);
+}
+
 BOOST_AUTO_TEST_CASE(TestParallelPoWBurst) {
   BOOST_TEST_MESSAGE("--- Starting Parallel Burst Test (Multi-threaded) ---");
 

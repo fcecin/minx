@@ -955,8 +955,9 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
       break;
     }
     size_t bytes_expected = sizeof(code) + MinxInit::SIZE;
-    if (bytes_transferred < bytes_expected) {
-      LOGTRACE << "onProcessPacket MINX_INIT message too short"
+    if (bytes_transferred < bytes_expected ||
+        bytes_transferred > bytes_expected + MAX_DATA_SIZE) {
+      LOGTRACE << "onProcessPacket MINX_INIT bad message size"
                << VAR(bytes_transferred) << VAR(bytes_expected);
       lastError_ = MINX_ERROR_BAD_INIT;
       break;
@@ -972,8 +973,9 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   case MINX_MESSAGE: {
     size_t bytes_expected = sizeof(code) + MinxMessage::SIZE;
-    if (bytes_transferred < bytes_expected) {
-      LOGTRACE << "onProcessPacket MINX_MESSAGE message too short"
+    if (bytes_transferred < bytes_expected ||
+        bytes_transferred > bytes_expected + MAX_DATA_SIZE) {
+      LOGTRACE << "onProcessPacket MINX_MESSAGE bad message size"
                << VAR(bytes_transferred) << VAR(bytes_expected);
       lastError_ = MINX_ERROR_BAD_MESSAGE;
       break;
@@ -1004,8 +1006,9 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
       break;
     }
     size_t bytes_expected = sizeof(code) + MinxGetInfo::SIZE;
-    if (bytes_transferred < bytes_expected) {
-      LOGTRACE << "onProcessPacket MINX_GET_INFO message too short"
+    if (bytes_transferred < bytes_expected ||
+        bytes_transferred > bytes_expected + MAX_DATA_SIZE) {
+      LOGTRACE << "onProcessPacket MINX_GET_INFO bad message size"
                << VAR(bytes_transferred) << VAR(bytes_expected);
       lastError_ = MINX_ERROR_BAD_GET_INFO;
       break;
@@ -1021,8 +1024,9 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   case MINX_INFO: {
     size_t bytes_expected = sizeof(code) + MinxInfo::SIZE;
-    if (bytes_transferred < bytes_expected) {
-      LOGTRACE << "onProcessPacket MINX_INFO message too short"
+    if (bytes_transferred < bytes_expected ||
+        bytes_transferred > bytes_expected + MAX_DATA_SIZE) {
+      LOGTRACE << "onProcessPacket MINX_INFO bad message size"
                << VAR(bytes_transferred) << VAR(bytes_expected);
       lastError_ = MINX_ERROR_BAD_INFO;
       break;
@@ -1058,8 +1062,9 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   case MINX_PROVE_WORK: {
     size_t bytes_expected = sizeof(code) + MinxProveWork::SIZE;
-    if (bytes_transferred < bytes_expected) {
-      LOGTRACE << "onProcessPacket MINX_PROVE_WORK message too short"
+    if (bytes_transferred < bytes_expected ||
+        bytes_transferred > bytes_expected + MAX_DATA_SIZE) {
+      LOGTRACE << "onProcessPacket MINX_PROVE_WORK bad message size"
                << VAR(bytes_transferred) << VAR(bytes_expected);
       lastError_ = MINX_ERROR_BAD_PROVE_WORK;
       break;
@@ -1112,8 +1117,9 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
     if (extensionHandler_) {
       uint8_t version;
       size_t bytes_expected = sizeof(code) + sizeof(version);
-      if (bytes_transferred < bytes_expected) {
-        LOGTRACE << "onProcessPacket MINX_EXTENSION message too short"
+      if (bytes_transferred < bytes_expected ||
+          bytes_transferred > bytes_expected + MAX_DATA_SIZE) {
+        LOGTRACE << "onProcessPacket MINX_EXTENSION bad message size"
                  << VAR(bytes_transferred) << VAR(bytes_expected);
         lastError_ = MINX_ERROR_BAD_EXTENSION;
         break;
@@ -1127,6 +1133,12 @@ void Minx::onProcessPacket(size_t slotIndex, size_t bytes_transferred) {
 
   default: {
     // Any other code is an APPLICATION message code [0x00, 0xFB]
+    if (bytes_transferred > sizeof(code) + MAX_DATA_SIZE) {
+      LOGTRACE << "onProcessPacket MINX_APPLICATION bad message size"
+               << VAR(code) << VAR(bytes_transferred);
+      lastError_ = MINX_ERROR_BAD_APPLICATION;
+      break;
+    }
     auto data = buffer_.getRemainingBytesSpan(MAX_DATA_SIZE);
     LOGTRACE << "onProcessPacket MINX_APPLICATION message too short"
              << VAR(code) << VAR(data);
