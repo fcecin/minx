@@ -6,7 +6,7 @@ MINX is a simple cooperative-economy bootstrapping protocol for P2P applications
 
 ## Quickstart
 
-MINX is written in C++20. Most dependencies are downloaded by the build scripts. The exception is the [Boost](https://www.boost.org/) suite, which must already be installed on your system (via e.g. `sudo apt install libboost-all-dev` on Ubuntu).
+MINX is written in C++20. Most dependencies are downloaded by the build scripts. The exception is the [Boost](https://www.boost.org/) suite, which must already be installed on your system (via e.g. `sudo apt install libboost-all-dev libicu-dev` on Ubuntu, because the static Boost.Log libraries link to ICU).
 
 The provided build system is written in CMake and produces a static library in both debug and release configurations via `build.sh`.
 
