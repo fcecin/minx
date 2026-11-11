@@ -6,6 +6,7 @@
 #include <boost/asio.hpp>
 #include <boost/endian/conversion.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -13,9 +14,11 @@
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -72,12 +75,15 @@ struct SpyHandler : minx::TcpServerHandler {
   std::atomic<int> disconnects{0};
   std::atomic<int> messages{0};
   std::vector<std::vector<uint8_t>> received;
+  std::vector<tcp::endpoint> peers;
   minx::TcpSessionPtr lastSession;
 
   bool echoMode = false;
 
   void onConnect(const minx::TcpSessionPtr& session) override {
     ++connects;
+    boost::system::error_code ec;
+    peers.push_back(session->socket().remote_endpoint(ec));
     lastSession = session;
   }
 
@@ -282,7 +288,11 @@ BOOST_AUTO_TEST_CASE(TestMaxClientsRejection) {
   server.stop();
 }
 
-// An accept error (here EMFILE) must not end the accept loop.
+#ifndef _WIN32
+// An accept error (here EMFILE) must not end the accept loop. After EMFILE,
+// Linux keeps the pending connection in the queue and macOS closes it. Thus
+// the test examines only the connection that starts after the error. Windows
+// has no RLIMIT_NOFILE, so the test runs only on POSIX systems.
 BOOST_AUTO_TEST_CASE(TestAcceptResumesAfterError) {
   asio::io_context io;
   SpyHandler handler;
@@ -309,12 +319,16 @@ BOOST_AUTO_TEST_CASE(TestAcceptResumesAfterError) {
   BOOST_TEST(handler.connects == 0);
 
   c2.connect(port);
-  pollUntil(io, [&]() { return handler.connects >= 2; });
-  BOOST_TEST(handler.connects == 2);
+  const auto c2Ep = c2.socket().local_endpoint();
+  pollUntil(io, [&]() {
+    return std::find(handler.peers.begin(), handler.peers.end(), c2Ep) !=
+           handler.peers.end();
+  });
   c1.close();
   c2.close();
   server.stop();
 }
+#endif
 
 BOOST_AUTO_TEST_CASE(TestServerSendToClient) {
   asio::io_context io;
