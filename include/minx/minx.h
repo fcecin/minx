@@ -266,6 +266,11 @@ struct MinxConfig {
   static constexpr uint16_t DEFAULT_SPAM_THRESHOLD = 250;
 
   /**
+   * A spam filter for a server: about 12MB of counters.
+   */
+  static constexpr size_t DEFAULT_SPAM_FILTER_WIDTH = 1'000'000;
+
+  /**
    * Maximum spam threshold value.
    */
   static constexpr uint16_t MAX_SPAM_THRESHOLD =
@@ -327,6 +332,14 @@ struct MinxConfig {
    * Size of receive ring buffer (number of 2048 byte buffers).
    */
   size_t recvBuffersSize = DEFAULT_RECV_BUFFERS_SIZE;
+
+  /**
+   * Counters in each row of the spam filter (it has 3 rows of 16-bit
+   * counters, in two buckets). A server that hears many addresses needs a
+   * wide filter. A client that talks to a few servers needs only a narrow
+   * one.
+   */
+  size_t spamFilterWidth = DEFAULT_SPAM_FILTER_WIDTH;
 };
 
 /**

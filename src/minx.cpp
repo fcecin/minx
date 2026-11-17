@@ -61,7 +61,7 @@ std::ostream& operator<<(std::ostream& os, const MinxProveWork& m) {
 
 Minx::Minx(MinxListener* listener, const MinxConfig config)
     : config_(config), listener_(listener), passwords_(1'000'000, 60),
-      spamFilter_(1'000'000, 3, config.spamThreshold, 3600),
+      spamFilter_(config.spamFilterWidth, 3, config.spamThreshold, 3600),
       instanceName_(config.instanceName) {
   LOGTRACE << "Minx";
   if (!listener_) {
@@ -72,7 +72,6 @@ Minx::Minx(MinxListener* listener, const MinxConfig config)
   for (size_t i = 0; i < config.recvBuffersSize; ++i) {
     recvBuffers_[i].setSizeToCapacity();
   }
-  workerThread_ = std::thread(&Minx::workerLoop, this);
   updatePoWSpendCache();
   LOGTRACE << "Minx done";
 }
@@ -653,7 +652,15 @@ void Minx::createPoWEngine(const Hash& key) {
   }
   {
     std::lock_guard lock(queueMutex_);
+    if (stopWorker_) {
+      return;
+    }
     pendingInitializations_.push(key);
+    // The worker starts with the first engine. A Minx that never makes an
+    // engine (a client of RUDP only) runs no worker thread.
+    if (!workerThread_.joinable()) {
+      workerThread_ = std::thread(&Minx::workerLoop, this);
+    }
   }
   queueCondVar_.notify_one();
 };
