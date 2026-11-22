@@ -25,10 +25,22 @@ RudpStream::~RudpStream() {
 
 void RudpStream::onOpened() {
   // The handler is now wired into Rudp; rudp() / peer() / channelId()
-  // are valid. Nothing to do at this layer; subclasses or the
-  // application can override and chain if they need a "channel
-  // exists" hook before ESTABLISHED.
+  // are valid. A write that started before this point (for example in
+  // Listener::onAccept, by a server that speaks first) had no channel to
+  // push into. Push it now: Rudp queues it until the handshake ends, and
+  // fires onWritable for the rest if its queue is full.
   LOGTRACE << "onOpened" << VAR(channelId());
+  if (closed_) return;
+  drainPendingWrite();
+  // A shutdown() that came before this, with no bytes, closes now.
+  closeAfterDrain();
+}
+
+void RudpStream::onEstablished() {
+  established_ = true;
+  // A shutdown() that came before this waited, so that Rudp drains the
+  // queued bytes before its HS_CLOSE.
+  closeAfterDrain();
 }
 
 void RudpStream::onReliableMessage(const Bytes& msg) {
@@ -115,11 +127,16 @@ void RudpStream::shutdown(std::chrono::microseconds timeout) {
   // If no write is in flight, schedule the deferred close right now.
   // Otherwise drainPendingWrite's post-completion tail will schedule
   // it once the in-flight bytes have all been pushed into sendBuf.
-  if (!pendingWriteHandler_ && rudp()) {
-    rudp()->closeChannel(peer(), channelId(),
-                          Rudp::CloseReason::APPLICATION,
-                          shutdownTimeout_);
-  }
+  closeAfterDrain();
+}
+
+void RudpStream::closeAfterDrain() {
+  if (!shutdownPending_ || closed_ || pendingWriteHandler_ || !rudp())
+    return;   // a later drain calls this again
+  if (!established_ && pushedBytes_)
+    return;   // onEstablished() calls this again, so the bytes drain first
+  rudp()->closeChannel(peer(), channelId(), Rudp::CloseReason::APPLICATION,
+                       shutdownTimeout_);
 }
 
 void RudpStream::detach() {
@@ -197,6 +214,7 @@ void RudpStream::drainPendingWrite() {
       return;
     }
     pendingWriteOffset_ += take;
+    pushedBytes_ = true;
   }
 
   const std::size_t bytesWritten = total;
@@ -209,14 +227,10 @@ void RudpStream::drainPendingWrite() {
   });
 
   // If shutdown() was called while this write was in flight, all the
-  // application bytes are now in Rudp's sendBuf. Schedule the
-  // deferred close: Rudp will fire HS_CLOSE once sendBuf empties (or
+  // application bytes are now in Rudp's queue. Schedule the deferred
+  // close: Rudp will fire HS_CLOSE once sendBuf empties (or
   // shutdownTimeout_ elapses, whichever comes first).
-  if (shutdownPending_ && !closed_ && rudp()) {
-    rudp()->closeChannel(peer(), channelId(),
-                          Rudp::CloseReason::APPLICATION,
-                          shutdownTimeout_);
-  }
+  closeAfterDrain();
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@
 
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -61,12 +62,15 @@ struct CapturedPacket {
 struct StreamSideListener : public Rudp::Listener {
   std::function<void(const SockAddr&, const Bytes&)> sink;
   std::shared_ptr<RudpStream> inboundStream;
+  // Runs in onAccept, before Rudp binds the inbound stream.
+  std::function<void(const std::shared_ptr<RudpStream>&)> onAcceptHook;
 
   void onSend(const SockAddr& peer, const Bytes& bytes) override {
     if (sink) sink(peer, bytes);
   }
   std::shared_ptr<Rudp::ChannelHandler> onAccept(const SockAddr&,
                                                  uint32_t) override {
+    if (onAcceptHook && inboundStream) onAcceptHook(inboundStream);
     return inboundStream;
   }
 };
@@ -210,6 +214,155 @@ BOOST_AUTO_TEST_CASE(TestRudpStreamConstructDestroy) {
   BOOST_TEST(b->is_open());
   BOOST_TEST(a->available() == 0u);
   BOOST_TEST(!a->getCloseReason().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// A server that speaks first starts its write in onAccept, before Rudp binds
+// the stream. The write completes, and the peer reads the bytes.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpStreamWriteBeforeBind) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xA11CE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xB0B;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11102), bA = makeAddr(11103);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+
+  const std::string hello = "the server speaks first";
+  bool writeDone = false;
+  boost::system::error_code writeEc;
+  std::size_t writeBytes = 0;
+  bobL.onAcceptHook = [&](const std::shared_ptr<RudpStream>& s) {
+    s->async_write_some(
+      boost::asio::buffer(hello),
+      [&](boost::system::error_code ec, std::size_t n) {
+        writeDone = true;
+        writeEc = ec;
+        writeBytes = n;
+      });
+  };
+  wire.bindStreams(aliceStream, bobStream, /*cid=*/1);
+
+  std::array<char, 64> rdbuf{};
+  bool readDone = false;
+  boost::system::error_code readEc;
+  std::size_t readBytes = 0;
+  aliceStream->async_read_some(
+    boost::asio::buffer(rdbuf),
+    [&](boost::system::error_code ec, std::size_t n) {
+      readDone = true;
+      readEc = ec;
+      readBytes = n;
+    });
+
+  uint64_t now = 1000;
+  for (int i = 0; i < 20 && !readDone; ++i) {
+    step(io, alice, bob, wire, now);
+    now += 1000;
+  }
+
+  BOOST_TEST(writeDone);
+  BOOST_TEST(!writeEc);
+  BOOST_TEST(writeBytes == hello.size());
+  BOOST_TEST(readDone);
+  BOOST_TEST(!readEc);
+  BOOST_TEST(std::string(rdbuf.data(), readBytes) == hello);
+}
+
+// ---------------------------------------------------------------------------
+// The same server writes and then shuts down, both in onAccept. The close
+// waits for ESTABLISHED, so Rudp drains the bytes before its HS_CLOSE: the
+// peer reads all of them, and then the end of the stream.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpStreamWriteAndShutdownBeforeBind) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xA11CE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xB0B;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11104), bA = makeAddr(11105);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+
+  const std::string last = "the last words";
+  bool writeDone = false;
+  bobL.onAcceptHook = [&](const std::shared_ptr<RudpStream>& s) {
+    s->async_write_some(
+      boost::asio::buffer(last),
+      [&](boost::system::error_code ec, std::size_t) { writeDone = !ec; });
+    s->shutdown(std::chrono::seconds(1));
+  };
+  wire.bindStreams(aliceStream, bobStream, /*cid=*/1);
+
+  std::string got;
+  bool ended = false;
+  boost::system::error_code endEc;
+  std::array<char, 64> rdbuf{};
+  std::function<void()> readMore = [&] {
+    aliceStream->async_read_some(
+      boost::asio::buffer(rdbuf),
+      [&](boost::system::error_code ec, std::size_t n) {
+        if (ec) { ended = true; endEc = ec; return; }
+        got.append(rdbuf.data(), n);
+        readMore();
+      });
+  };
+  readMore();
+
+  uint64_t now = 1000;
+  for (int i = 0; i < 40 && !ended; ++i) {
+    step(io, alice, bob, wire, now);
+    now += 1000;
+  }
+
+  BOOST_TEST(writeDone);
+  BOOST_TEST(got == last);
+  BOOST_TEST(ended);
+  // A clean end: the peer's HS_CLOSE, not a reset or an idle close.
+  BOOST_TEST((endEc == boost::asio::error::eof));
+}
+
+// A shutdown before the channel is ESTABLISHED, with no bytes to drain,
+// closes at once: it does not wait for the handshake.
+BOOST_AUTO_TEST_CASE(TestRudpStreamShutdownWithNothingToDrainClosesAtOnce) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xA11CE;
+  StreamSideListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xB0B;
+  StreamSideListener bobL;
+  Rudp bob(&bobL, cfg);
+
+  SockAddr aA = makeAddr(11106), bA = makeAddr(11107);
+  StreamWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  boost::asio::io_context io;
+  auto aliceStream = std::make_shared<RudpStream>(io.get_executor());
+  auto bobStream = std::make_shared<RudpStream>(io.get_executor());
+  wire.bindStreams(aliceStream, bobStream, /*cid=*/1);   // OPEN_SENT, no reply yet
+  BOOST_REQUIRE_EQUAL(alice.channelCount(bA), 1u);
+
+  aliceStream->shutdown(std::chrono::seconds(10));
+  BOOST_TEST(alice.channelCount(bA) == 0u);
 }
 
 // ---------------------------------------------------------------------------

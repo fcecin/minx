@@ -93,7 +93,8 @@ public:
   /// channel — either via Rudp::registerChannel() (outbound) or by
   /// being returned from Listener::onAccept() (inbound). Per-channel
   /// methods on this class are safe to invoke only AFTER onOpened()
-  /// has fired.
+  /// has fired. A read or a write may start before that: a write waits,
+  /// and goes to Rudp when Rudp binds the stream.
   explicit RudpStream(executor_type ex);
   ~RudpStream() override;
 
@@ -107,6 +108,7 @@ public:
   // -----------------------------------------------------------------------
 
   void onOpened() override;
+  void onEstablished() override;
   void onReliableMessage(const Bytes& msg) override;
   void onUnreliableMessage(const Bytes& msg) override;
   void onWritable() override;
@@ -134,7 +136,10 @@ public:
   /// boost::asio::error::eof. Pending reads stay live until Rudp
   /// fires onClosed. Idempotent. Use when "the peer should see
   /// EOF *after* my final bytes" matters; for fire-and-forget
-  /// teardown, use close() instead.
+  /// teardown, use close() instead. Before the channel is ESTABLISHED:
+  /// with bytes queued, the close waits for ESTABLISHED, so `timeout`
+  /// starts there (the handshake retries bound the wait); with no bytes,
+  /// the channel closes at once.
   void shutdown(std::chrono::microseconds timeout);
 
   /// Close the stream WITHOUT tearing down the underlying RUDP
@@ -300,6 +305,18 @@ private:
   // is scheduled immediately by shutdown() itself.
   bool shutdownPending_ = false;
   std::chrono::microseconds shutdownTimeout_{0};
+
+  // True once the channel is ESTABLISHED. Rudp drains a channel before its
+  // HS_CLOSE only when it is ESTABLISHED; before that, a close drops the
+  // queued bytes. So the deferred close of shutdown() waits for this, when
+  // bytes went to Rudp before it (pushedBytes_). With no bytes, the close
+  // is at once, as before.
+  bool established_ = false;
+  bool pushedBytes_ = false;
+
+  // Ask Rudp for the deferred close of shutdown(), once the channel is
+  // ESTABLISHED and no write is in flight.
+  void closeAfterDrain();
 };
 
 } // namespace minx

@@ -569,7 +569,10 @@ public:
   size_t peerCount() const { return peers_.size(); }
   size_t channelCount(const SockAddr& peer) const;
   bool isEstablished(const SockAddr& peer, uint32_t channel_id) const;
-  /// Current session token; 0 if not ESTABLISHED. Tests only.
+  /// Current session token; 0 if not ESTABLISHED. It names one
+  /// incarnation of the channel. It is not a secret: each CHANNEL packet
+  /// carries it in clear, and the side that accepts the channel can
+  /// choose it. Do not use it as a credential.
   uint64_t sessionToken(const SockAddr& peer, uint32_t channel_id) const;
 
 private:
