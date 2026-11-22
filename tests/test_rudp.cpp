@@ -3183,6 +3183,126 @@ BOOST_AUTO_TEST_CASE(TestRudpLifecycleHookPeerRestart) {
 }
 
 // ---------------------------------------------------------------------------
+// On a peer restart, the bytes of the new OPEN count once, for the new
+// session. The closed observer gets the old session's final metrics without
+// them.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpPeerRestartCountsTheOpenOnce) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::microseconds::zero();
+  cfg.rngSeed = 0xBE8B;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xBE8C;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+  SockAddr aA = makeAddr(40560), bA = makeAddr(40561);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  std::vector<Rudp::ChannelMetrics> finals;
+  bob.setClosedObserver([&](const SockAddr&, uint32_t, const Rudp::ChannelMetrics& m) {
+    finals.push_back(m);
+  });
+
+  uint64_t now = 1000;
+  BOOST_REQUIRE(aliceL.push(alice, bA, 19, B("v1"), true));
+  alice.tick(now);
+  wire.deliverAll(now);
+  BOOST_REQUIRE(bob.isEstablished(aA, 19));
+  const uint64_t before = bob.metricsFor(aA, 19)->bytesReceived;
+
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(19);
+  fb.put<uint8_t>(Rudp::HS_OPEN);
+  fb.put<uint64_t>(0xDEADBEEFDEADBEEFULL);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, now);
+
+  BOOST_REQUIRE_EQUAL(finals.size(), 1u);
+  BOOST_TEST(finals[0].bytesReceived == before);
+  BOOST_TEST(bob.metricsFor(aA, 19)->bytesReceived ==
+             body.size() + MinxStdExtensions::KEY_SIZE);
+}
+
+// ---------------------------------------------------------------------------
+// A channel that its handler closed in a callback stays CLOSED until the next
+// pulse. A new OPEN for it in that time counts once too, for the new session.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(TestRudpOpenOnAClosedChannelCountsOnce) {
+  struct ClosingHandler : TestChannelHandler {
+    void onReliableMessage(const Bytes& m) override {
+      TestChannelHandler::onReliableMessage(m);
+      rudp()->closeChannel(peer(), channelId());
+    }
+  };
+  // A non-zero pulse interval, so a packet between two of bob's pulses runs
+  // no pulse, and nothing reaps a channel that the packet closed.
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(10);
+  cfg.rngSeed = 0xC1A1;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC1A2;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+  bobL.handlerFactory = [](const SockAddr&, uint32_t) {
+    return std::make_shared<ClosingHandler>();
+  };
+  SockAddr aA = makeAddr(40570), bA = makeAddr(40571);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  std::vector<Rudp::ChannelMetrics> finals;
+  bob.setClosedObserver([&](const SockAddr&, uint32_t, const Rudp::ChannelMetrics& m) {
+    finals.push_back(m);
+  });
+
+  uint64_t now = 0;
+  aliceL.push(alice, bA, 21, B("hi"), false);   // opens the channel; not reliable
+  for (int i = 0; i < 10; ++i) {
+    alice.tick(now);
+    bob.tick(now);
+    wire.deliverAll(now);
+    now += 10'000;
+  }
+  BOOST_REQUIRE(bob.isEstablished(aA, 21));
+  // Bob's last pulse ran 10 ms ago and the next one is due now: deliver the
+  // closing message halfway between them.
+  const uint64_t mid = now - 5'000;
+  BOOST_REQUIRE(alice.push(bA, 21, B("bye"), true));
+  alice.flush();
+  wire.deliverAll(mid);
+  // Bob's handler closed the channel inside the delivery: it is CLOSED, not
+  // reaped, so no final report yet.
+  BOOST_REQUIRE(finals.empty());
+  BOOST_REQUIRE_EQUAL(bob.channelCount(aA), 1u);
+  const uint64_t before = bob.metricsFor(aA, 21)->bytesReceived;
+
+  minx::Bytes body;
+  body.resize(body.max_size());
+  minx::Buffer fb(body);
+  fb.put<uint32_t>(21);
+  fb.put<uint8_t>(Rudp::HS_OPEN);
+  fb.put<uint64_t>(0xFEEDFACEFEEDFACEULL);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  fb.put<uint32_t>(0xFFFFFFFFu);
+  body.resize(fb.getSize());
+  appendCrcTrailer(Rudp::KEY_V0_HANDSHAKE, body);
+  bob.onPacket(aA, Rudp::KEY_V0_HANDSHAKE, body, mid);
+
+  BOOST_REQUIRE_EQUAL(finals.size(), 1u);
+  BOOST_TEST(finals[0].bytesReceived == before);
+  BOOST_TEST(bob.metricsFor(aA, 21)->bytesReceived ==
+             body.size() + MinxStdExtensions::KEY_SIZE);
+}
+
+// ---------------------------------------------------------------------------
 // Peer-restart resets per-session metrics: the new session starts with
 // zeroed bytesSent/bytesReceived, a fresh openedAtUs, and a re-anchored
 // memoryByteSeconds clock.
@@ -4185,6 +4305,73 @@ BOOST_AUTO_TEST_CASE(TestRudpSilentPeerWithUnackedDataIsReaped) {
   }
   BOOST_TEST(alice.isEstablished(bA, 6));
   BOOST_TEST(alice.isEstablished(bA, 7));
+}
+
+// The closed observer gets the final metrics of each channel that ends, once,
+// on the side that closes it and on the side whose peer closed it. An empty
+// observer gets no more calls.
+BOOST_AUTO_TEST_CASE(TestRudpClosedObserverGetsFinalMetrics) {
+  minx::RudpConfig cfg;
+  cfg.baseTickInterval = std::chrono::milliseconds(10);
+  cfg.maxChannelsPerPeer = 2;
+  cfg.rngSeed = 0xC105E1;
+  TestListener aliceL;
+  Rudp alice(&aliceL, cfg);
+  cfg.rngSeed = 0xC105E2;
+  TestListener bobL;
+  Rudp bob(&bobL, cfg);
+  SockAddr aA = makeAddr(15330), bA = makeAddr(15331);
+  FakeWire wire(alice, aliceL, bob, bobL, aA, bA);
+
+  struct Seen {
+    SockAddr peer;
+    uint32_t cid;
+    Rudp::ChannelMetrics m;
+  };
+  std::vector<Seen> aliceSeen, bobSeen;
+  alice.setClosedObserver([&](const SockAddr& p, uint32_t c, const Rudp::ChannelMetrics& m) {
+    aliceSeen.push_back({p, c, m});
+  });
+  bob.setClosedObserver([&](const SockAddr& p, uint32_t c, const Rudp::ChannelMetrics& m) {
+    bobSeen.push_back({p, c, m});
+  });
+
+  uint64_t now = 0;
+  auto run = [&]() {
+    for (int i = 0; i < 10; ++i) {
+      alice.tick(now);
+      bob.tick(now);
+      wire.deliverAll(now);
+      now += 10'000;
+    }
+  };
+  aliceL.push(alice, bA, 9, B("hello"), true);
+  aliceL.push(alice, bA, 10, B("hello"), true);
+  run();
+  BOOST_REQUIRE(alice.isEstablished(bA, 9));
+  BOOST_REQUIRE(alice.isEstablished(bA, 10));
+  const Rudp::ChannelMetrics sent = *alice.metricsFor(bA, 9);
+  const Rudp::ChannelMetrics got = *bob.metricsFor(aA, 9);
+  BOOST_REQUIRE(sent.bytesSent > 0u);
+  BOOST_REQUIRE(got.bytesReceived > 0u);
+
+  alice.closeChannel(bA, 9);
+  run();
+  BOOST_REQUIRE_EQUAL(aliceSeen.size(), 1u);
+  BOOST_TEST(aliceSeen[0].peer == bA);
+  BOOST_TEST(aliceSeen[0].cid == 9u);
+  BOOST_TEST(aliceSeen[0].m.bytesSent >= sent.bytesSent);
+  BOOST_REQUIRE_EQUAL(bobSeen.size(), 1u);
+  BOOST_TEST(bobSeen[0].peer == aA);
+  BOOST_TEST(bobSeen[0].cid == 9u);
+  BOOST_TEST(bobSeen[0].m.bytesReceived >= got.bytesReceived);
+  BOOST_TEST(!alice.metricsFor(bA, 9).has_value());
+
+  alice.setClosedObserver(nullptr);
+  alice.closeChannel(bA, 10);
+  run();
+  BOOST_TEST(aliceSeen.size() == 1u);
+  BOOST_TEST(bobSeen.size() == 2u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

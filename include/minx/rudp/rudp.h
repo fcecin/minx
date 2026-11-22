@@ -38,6 +38,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <map>
 #include <memory>
@@ -553,6 +554,14 @@ public:
   std::optional<ChannelMetrics> metricsFor(const SockAddr& peer,
                                            uint32_t channel_id) const;
 
+  /// Called when a channel ends, with its final metrics, which go away with
+  /// the channel. It runs on the thread of the Rudp, before the handler's
+  /// onClosed. It must not call into this Rudp. One observer; an empty
+  /// function removes it. Set it while no thread runs the Rudp.
+  using ClosedObserver = std::function<void(const SockAddr& peer, uint32_t channel_id,
+                                            const ChannelMetrics& final)>;
+  void setClosedObserver(ClosedObserver fn) { closedObserver_ = std::move(fn); }
+
   // -----------------------------------------------------------------------
   // Debug / test inspection (not part of the production API contract)
   // -----------------------------------------------------------------------
@@ -761,6 +770,8 @@ private:
   // it: they mark it CLOSED and let the doPulseWork() sweep reap it.
   // doPulseWork() no-ops re-entrantly so a callback cannot nest a pulse.
   unsigned dispatchDepth_ = 0;
+
+  ClosedObserver closedObserver_;
 };
 
 /// Stream operators for the public Rudp enums. Print the enum name

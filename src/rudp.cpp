@@ -522,13 +522,18 @@ void Rudp::destroyChannel(const SockAddr& peer, uint32_t channel_id,
   // 1) Final metrics integral update so the listener's onClosed sees
   //    a closed-out memoryByteSeconds when it calls metricsFor().
   updateMemoryIntegral(cs);
-  // 2) handler->onClosed fires exactly once per registered channel.
+  // 2) The observer gets the final metrics, which go away with the channel.
+  if (closedObserver_) {
+    DepthGuard g(dispatchDepth_);
+    closedObserver_(peer, channel_id, cs.metrics);
+  }
+  // 3) handler->onClosed fires exactly once per registered channel.
   //    Move the shared_ptr out before invoking so we can drop
   //    Rudp's ref AFTER the call returns (the handler can rely on
   //    being alive during onClosed) without the call site needing
-  //    to do its own ownership dance. (peer, cid) parameters are
-  //    unused here — the handler reads them via its protected
-  //    accessors, which were injected at registration.
+  //    to do its own ownership dance. The handler reads (peer, cid)
+  //    via its protected accessors, which were injected at
+  //    registration.
   if (auto handler = std::move(cs.handler)) {
     cs.handler.reset();
     cs.handlerEstablished = false;
@@ -539,8 +544,6 @@ void Rudp::destroyChannel(const SockAddr& peer, uint32_t channel_id,
     // handler shared_ptr drops here when the local goes out of
     // scope, releasing Rudp's ref. App-side refs (if any) survive.
   }
-  (void)peer;
-  (void)channel_id;
 }
 
 std::ostream& operator<<(std::ostream& os, Rudp::CloseReason r) {
@@ -1324,7 +1327,11 @@ void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
     case HandshakeState::IDLE:
       break;
     case HandshakeState::CLOSED:
-      // Closed but not yet reaped: end that incarnation first.
+      // Closed but not yet reaped: end that incarnation first. The OPEN's
+      // wire bytes were pre-charged to it; move them to the new one, before
+      // the closed observer reads the old one's final metrics.
+      if (inboundCharged && cs->metrics.bytesReceived >= wireBytes)
+        cs->metrics.bytesReceived -= wireBytes;
       destroyChannel(peer, channel_id, *cs, cs->closeReason);
       resetChannel(*cs);
       chargeOpen = true;
@@ -1359,7 +1366,10 @@ void Rudp::handleHandshakePacket(const SockAddr& peer, const Bytes& payload,
       // restarted. The old session is dead: end it, then treat the
       // OPEN as a new logical connection that deserves a fresh
       // accept decision. The OPEN's wire bytes were pre-charged to
-      // the old session; charge them to the new one.
+      // the old session; move them to the new one, before the closed
+      // observer reads the old session's final metrics.
+      if (inboundCharged && cs->metrics.bytesReceived >= wireBytes)
+        cs->metrics.bytesReceived -= wireBytes;
       destroyChannel(peer, channel_id, *cs, CloseReason::PEER_RESTART);
       resetChannel(*cs);
       chargeOpen = true;
